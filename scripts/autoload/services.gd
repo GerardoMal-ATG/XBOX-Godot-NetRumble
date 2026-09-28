@@ -80,6 +80,7 @@ func _ready() -> void:
 	_leaderboards = LeaderboardService.new()
 	_matchmaking = MatchmakingService.new()
 	_matchmaking.configure_clock(_clock)
+	bind_matchmaking_signals()
 	_achievement_tracker = AchievementTracker.new()
 	_achievement_tracker.progress_changed.connect(_on_achievement_progress)
 	_game_saves = GameSaveService.new()
@@ -848,6 +849,33 @@ func bind_party_signals() -> void:
 		return
 	if not _party.multiplayer_invalidated.is_connected(_on_multiplayer_invalidated):
 		_party.multiplayer_invalidated.connect(_on_multiplayer_invalidated)
+	# Party's cleanup debt, recovery and restart-required state feed the one online-cleanup
+	# reading entry and buffered invitations share.
+	if _party.has_signal("cleanup_state_changed") \
+			and not _party.is_connected("cleanup_state_changed", _on_party_cleanup_state_changed):
+		_party.connect("cleanup_state_changed", _on_party_cleanup_state_changed)
+
+
+func _on_party_cleanup_state_changed() -> void:
+	if NetManager != null:
+		NetManager.reconcile_online_cleanup()
+		NetManager.note_online_cleanup_changed()
+
+
+## Connects the installed MatchmakingService's cleanup-state notice here, once, so native
+## ticket cleanup that outlives its flow or its account is seen whenever it changes. Called
+## when the services are built; the harness calls it again after installing its own.
+func bind_matchmaking_signals() -> void:
+	if _matchmaking == null or not _matchmaking.has_signal("cleanup_state_changed"):
+		return
+	if not _matchmaking.is_connected("cleanup_state_changed", _on_matchmaking_cleanup_changed):
+		_matchmaking.connect("cleanup_state_changed", _on_matchmaking_cleanup_changed)
+
+
+func _on_matchmaking_cleanup_changed() -> void:
+	if NetManager != null:
+		NetManager.reconcile_online_cleanup()
+		NetManager.note_online_cleanup_changed()
 
 
 ## A confirmed Multiplayer shutdown: the lobbies and tickets of the old runtime are gone.

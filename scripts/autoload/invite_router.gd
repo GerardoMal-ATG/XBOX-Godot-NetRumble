@@ -50,9 +50,9 @@ func _ready() -> void:
 	# watched too — see _ready_to_join().
 	ScreenManager.screen_pushed.connect(_on_screen_changed)
 	ScreenManager.screen_popped.connect(_on_screen_changed)
-	# An invite kept while a matchmaking flow finished releasing gets its turn the moment
-	# the flow is gone. Deferred: the flow ends from inside a teardown that is still running.
-	NetManager.flow_changed.connect(_on_flow_changed)
+	# An invite kept while earlier online cleanup finishes gets its turn once that cleanup has
+	# settled, and is answered once, with the restart it needs, if it cannot settle.
+	NetManager.online_cleanup_changed.connect(_on_online_cleanup_changed)
 
 
 ## Every activation is buffered first and redeemed second, even when it could be acted
@@ -94,9 +94,17 @@ func _on_screen_changed(_screen: NRScreen) -> void:
 	_redeem_pending()
 
 
-func _on_flow_changed() -> void:
-	if not NetManager.has_online_flow() and not _pending_request.is_empty():
+## Redeemed on a later frame: a redemption opens screens and dialogs, which must not start
+## from inside the notice that the cleanup changed.
+func _on_online_cleanup_changed() -> void:
+	if _pending_request.is_empty():
+		return
+	if _cleanup_state() != NetManager.ONLINE_CLEANUP_PENDING:
 		_redeem_pending.call_deferred()
+
+
+func _cleanup_state() -> StringName:
+	return StringName(NetManager.online_cleanup_readiness().get("state", NetManager.ONLINE_CLEANUP_CLEAR))
 
 
 ## True when a buffered activation has an identity to join with and a front end to come
@@ -110,9 +118,13 @@ func _ready_to_join() -> bool:
 		return false
 	if Services == null or Services.is_shutting_down() or not Services.is_account_ready():
 		return false
-	# A matchmaking flow that is already ending -- its cleanup still releasing -- is waited
-	# out rather than asked about again; flow_changed redeems the invite once it is gone.
-	if NetManager.has_online_flow() and not NetManager.is_online_flow_live():
+	# Earlier online cleanup that can still settle -- a retired group's, an account teardown's,
+	# Party's own, or an old ticket's with no group left -- is waited out rather than spent on a
+	# join the entry would refuse; online_cleanup_changed redeems the invite once it has. A live
+	# matchmaking group is asked about first, since leaving it is part of what is waited for; a
+	# live session stays uninterrupted until the join could follow the answer. Cleanup that can
+	# no longer settle is answered by the join with the restart it needs.
+	if not NetManager.is_online_flow_live() and _cleanup_state() == NetManager.ONLINE_CLEANUP_PENDING:
 		return false
 	# Nothing to return to yet; the join's own screens would be the whole stack.
 	if ScreenManager.current_screen() == null:
@@ -171,7 +183,7 @@ func _clear_pending() -> void:
 ## account from being seated by a platform activation that skipped the menu.
 ##
 ## `arrived_msec` is when the activation first arrived, kept so an invite that has to wait
-## for a matchmaking flow to finish releasing is buffered again under its original TTL.
+## for earlier online cleanup to settle is buffered again under its original TTL.
 func _join(request: Dictionary, arrived_msec: int = 0) -> void:
 	if not Services.is_account_ready():
 		return
@@ -224,6 +236,18 @@ func _join(request: Dictionary, arrived_msec: int = 0) -> void:
 		_finish_join(generation)
 		return
 
+	# Online cleanup Party could not recover cannot be waited out: nothing settles it before the
+	# title restarts. The invite is answered with that reason once, not kept for a release that
+	# will not come.
+	if await _refused_for_restart(request, generation):
+		return
+	# Cleanup still settling with no live group to leave is waited out before the player is
+	# asked anything: the invite is kept, and the question comes once the join could follow it.
+	if not NetManager.is_online_flow_live() and _cleanup_state() == NetManager.ONLINE_CLEANUP_PENDING:
+		_keep_pending(request, arrived_msec)
+		_finish_join(generation)
+		return
+
 	# Accepting an invite while already playing means abandoning the current match, so
 	# it is the player's call rather than ours. A matchmaking flow counts as playing even
 	# with no transport bound -- between its staging and arranged sessions -- and it is
@@ -241,21 +265,21 @@ func _join(request: Dictionary, arrived_msec: int = 0) -> void:
 		if NetManager.has_online_flow():
 			# Accepting is the old group's binding Leave: its ticket is cancelled, its lobbies
 			# are left, and a match that overtakes the cancel does not revive it.
-			var safe: bool = await NetManager.retire_flow_for_replacement()
+			await NetManager.retire_flow_for_replacement()
 			if not Services.is_current_account(generation):
 				_finish_join(generation)
 				return
-			if not safe:
-				# The group's cleanup is still finishing. The invite is kept, under the TTL it
-				# arrived with, and redeemed once the flow is gone -- not spent on an entry
-				# refusal the player would have to repeat by hand, and not raced by a second
-				# join alongside the cleanup.
-				if _pending_request.is_empty():
-					_pending_request = request
-					_pending_since_msec = arrived_msec if arrived_msec > 0 else Time.get_ticks_msec()
-					pending_invite_changed.emit()
-				_finish_join(generation)
-				return
+
+	# Read again after every await above, immediately before the join. Cleanup still settling
+	# keeps the invite, under the time it arrived with, for online_cleanup_changed to redeem --
+	# not spent on an entry refusal the player would have to repeat by hand, and not raced by a
+	# second join alongside the cleanup. Cleanup that can no longer settle answers it once.
+	if await _refused_for_restart(request, generation):
+		return
+	if _cleanup_state() == NetManager.ONLINE_CLEANUP_PENDING:
+		_keep_pending(request, arrived_msec)
+		_finish_join(generation)
+		return
 
 	var loading := ScreenManager.push(ScreenManager.LOADING, {"message": "Joining match"})
 	var join_request := NetManager.join_by_invite(connection_string)
@@ -303,6 +327,29 @@ func _finish_join(generation: int) -> void:
 		return
 	_joining = false
 	_redeem_pending()
+
+
+## Answers `request` once with the restart online play now needs, and consumes it, when
+## Party's recovery of earlier online cleanup has failed. True when it did.
+func _refused_for_restart(request: Dictionary, generation: int) -> bool:
+	var readiness := NetManager.online_cleanup_readiness()
+	if StringName(readiness.get("state", NetManager.ONLINE_CLEANUP_CLEAR)) != NetManager.ONLINE_CLEANUP_RESTART_REQUIRED:
+		return false
+	if _same_request(_pending_request, request):
+		_clear_pending()
+	await ScreenManager.show_dialog("Cannot Join", String(readiness.get("reason", "")), "error", false)
+	_finish_join(generation)
+	return true
+
+
+## Keeps `request` for a later redemption under the time it first arrived -- unless a newer
+## activation already waits, which replaces the older one as it always has.
+func _keep_pending(request: Dictionary, arrived_msec: int) -> void:
+	if not _pending_request.is_empty():
+		return
+	_pending_request = request
+	_pending_since_msec = arrived_msec if arrived_msec > 0 else Time.get_ticks_msec()
+	pending_invite_changed.emit()
 
 
 func _same_request(left: Dictionary, right: Dictionary) -> bool:

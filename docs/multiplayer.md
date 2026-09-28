@@ -135,13 +135,26 @@ Host loss ends clients' sessions and returns them to the **main menu**; a comple
 returns to the lobby. Suspend abandons local state synchronously rather than awaiting these calls.
 See [lifecycle](architecture.md#process-lifecycle) and [terminal loss](architecture.md#how-a-match-ends-badly).
 
+An already-admitted ordinary hosted/code/invite session may continue when only that client's
+local Lobby notification connection is lost while its Party transport, session identity and
+pinned host remain unchanged. This is continuity of an established session, not fresh Lobby
+proof: a join still awaiting admission is refused, known host loss/change still ends the match,
+and scoped Matchmaking staging/arranged Lobby loss remains terminal.
+
 Scoped matchmaking calls have a separate lifetime from their screens. Each native
 create/join/prepare/transport/lock/post call has an absolute shared-clock deadline and an
 operation handle. A timed-out caller can stop waiting while the late native result remains owned;
-that result may only release its captured Lobby/network. An unexpected scoped Lobby disconnect
-or owner change reports `context_lost`, independently from Party `network_lost`. If #14's
-terminal cleanup confirms a PlayFab Multiplayer shutdown/reset, the service advances its recovery
-epoch and invalidates old ticket work before new online entry is allowed.
+that result may only release its captured Lobby/network. A failed scoped Lobby or Party leave
+returns its service error but remains cleanup-pending until confirmed multiplayer recovery; a
+failed recovery keeps online entry closed until restart. An unexpected scoped Lobby disconnect or
+owner change reports `context_lost`, independently from Party `network_lost`. If #14's terminal
+cleanup confirms a PlayFab Multiplayer shutdown/reset, the service advances its recovery epoch
+and invalidates old ticket work before new online entry is allowed.
+
+Cleanup-pending and cleanup-running are separate facts. A retained failed leave still blocks new
+online work while idle, but an available lifecycle owner starts the existing recovery immediately;
+Quit waits for cleanup that is actually executing rather than spending its budget on an inert
+obligation.
 
 Arming matchmaking handoff changes only how loss of the captured old **Party transport** is
 routed. An unexpected staging `context_lost` remains terminal before or after arming, as does any
@@ -165,6 +178,9 @@ native edit, fire-and-forget destruction or forced-exit workaround is included.
 *construction* is PlayFab-specific, and it lives entirely in
 `scripts/services/party_service.gd`.
 
+Build from the Sample addon revision pinned by this repository and record that revision with the
+validation results. See Known issues for the current package's Matchmaking cancellation behavior.
+
 ---
 
 ## PartyService details that are easy to get wrong
@@ -184,6 +200,17 @@ the network is created and passed on both sides. Getting this wrong produces:
 ```
 AuthenticateLocalUser: invalid argument specified
 ```
+
+### Matchmaking cancellation and detailed failures
+
+Ticket status, cancellation completion and detailed service cause are separate. The title keeps
+an abandoned ticket owned until native terminal truth and the cancel operation have both settled,
+or a confirmed Multiplayer reset invalidates that runtime. A Matched ticket is never relabelled
+Cancelled and never starts a match after the player has bound a leave/cancel intent.
+
+When the addon supplies a detailed HRESULT, the title can identify the fixed-four queue's
+ticket-size rejection. A generic wrapper `E_FAIL` remains a generic Matchmaking failure; the
+known full-four limitation is shown separately and is not inferred as the observed cause.
 
 ### `find_lobbies_async` resolves to `PlayFabLobbySearchResult`
 

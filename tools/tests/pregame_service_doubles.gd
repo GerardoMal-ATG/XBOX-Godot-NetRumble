@@ -6,14 +6,16 @@ class Results extends RefCounted:
 		ok: bool,
 		data: Variant = null,
 		code: String = "ok",
-		message: String = "Injected result."
+		message: String = "Injected result.",
+		hresult: int = 0x7FFFFFFFFFFFFFFF
 	) -> Dictionary:
 		return {
 			"ok": ok,
 			"data": data,
 			"code": code,
 			"message": message,
-			"hresult": 0 if ok else -1,
+			"hresult": (0 if ok else -2147467259) \
+				if hresult == 0x7FFFFFFFFFFFFFFF else hresult,
 		}
 
 
@@ -89,6 +91,14 @@ class Change extends RefCounted:
 	var network: Variant = null
 
 
+class ChangeWithoutReason extends RefCounted:
+	var kind := 0
+	var state := 0
+	var peer_id := 0
+	var result: Variant = null
+	var network: Variant = null
+
+
 class Ticket extends RefCounted:
 	signal state_changed(change: Variant)
 	signal cancel_released()
@@ -101,6 +111,9 @@ class Ticket extends RefCounted:
 	var cancel_ok := true
 	var cancel_confirms_terminal := true
 	var block_cancel := false
+	var cancel_release_result: Variant = null
+	var runtime_invalidated := false
+	var cancel_waiting := false
 
 	func is_complete() -> bool:
 		return status >= MatchmakingService.STATUS_MATCHED
@@ -114,11 +127,73 @@ class Ticket extends RefCounted:
 				"ticket_already_terminal",
 				"Injected terminal ticket cannot be cancelled.")
 		if block_cancel:
+			cancel_waiting = true
 			await cancel_released
+			cancel_waiting = false
+		if runtime_invalidated:
+			return Results.make(
+				false,
+				self,
+				"cancelled",
+				"Injected runtime invalidation.",
+				-2147467260)
+		if cancel_release_result != null:
+			var released_result: Variant = cancel_release_result
+			cancel_release_result = null
+			return released_result
+		if status == MatchmakingService.STATUS_MATCHED:
+			cancel_waiting = true
+			while not runtime_invalidated and cancel_release_result == null:
+				await cancel_released
+			cancel_waiting = false
+			if runtime_invalidated:
+				return Results.make(
+					false,
+					self,
+					"cancelled",
+					"Injected runtime invalidation.",
+					-2147467260)
+			var matched_result: Variant = cancel_release_result
+			cancel_release_result = null
+			return matched_result
 		if cancel_ok and cancel_confirms_terminal:
 			status = MatchmakingService.STATUS_CANCELLED
 			state_changed.emit(Change.new())
-		return Results.make(cancel_ok, self, "cancelled" if cancel_ok else "cancel_failed")
+		return Results.make(
+			cancel_ok,
+			self,
+			"cancelled" if cancel_ok else "match_ticket_cancel_start_failed",
+			"Injected cancel result.",
+			0 if cancel_ok else -2147467259)
+
+	func emit_status(next_status: int, result: Variant = null) -> void:
+		status = next_status
+		var change := Change.new()
+		change.result = result
+		state_changed.emit(change)
+
+	func invalidate_runtime() -> void:
+		runtime_invalidated = true
+		block_cancel = false
+		cancel_released.emit()
+
+	func release_cancel(result: Variant) -> void:
+		cancel_release_result = result
+		block_cancel = false
+		cancel_released.emit()
+
+
+class TicketWithoutProperties extends RefCounted:
+	signal state_changed(change: Variant)
+	var ticket_id := "ticket-without-properties"
+	var status := MatchmakingService.STATUS_WAITING_FOR_PLAYERS
+	var match_id := ""
+	var arranged_lobby_connection_string := ""
+
+	func cancel_async() -> Dictionary:
+		status = MatchmakingService.STATUS_CANCELLED
+		state_changed.emit(Change.new())
+		return Results.make(true, self, "cancelled")
 
 	func emit_status(next_status: int, result: Variant = null) -> void:
 		status = next_status
@@ -136,6 +211,7 @@ class MatchmakingSDK extends RefCounted:
 	var queued_join_results: Array = []
 	var block_create := false
 	var block_join := false
+	var tracked_tickets: Array[Ticket] = []
 
 	func create_match_ticket_async(user: Variant, config: Variant) -> Dictionary:
 		create_calls.append({
@@ -147,9 +223,13 @@ class MatchmakingSDK extends RefCounted:
 		})
 		if block_create:
 			await create_released
+		var result: Dictionary
 		if not queued_create_results.is_empty():
-			return queued_create_results.pop_front()
-		return Results.make(true, Ticket.new())
+			result = queued_create_results.pop_front()
+		else:
+			result = Results.make(true, Ticket.new())
+		_track_ticket(result)
+		return result
 
 	func join_match_ticket_async(
 		user: Variant,
@@ -165,12 +245,16 @@ class MatchmakingSDK extends RefCounted:
 		})
 		if block_join:
 			await join_released
+		var result: Dictionary
 		if not queued_join_results.is_empty():
-			return queued_join_results.pop_front()
-		var ticket := Ticket.new()
-		ticket.ticket_id = ticket_id
-		ticket.status = MatchmakingService.STATUS_WAITING_FOR_MATCH
-		return Results.make(true, ticket)
+			result = queued_join_results.pop_front()
+		else:
+			var ticket := Ticket.new()
+			ticket.ticket_id = ticket_id
+			ticket.status = MatchmakingService.STATUS_WAITING_FOR_MATCH
+			result = Results.make(true, ticket)
+		_track_ticket(result)
+		return result
 
 	func join_arranged_lobby_async(
 		_user: Variant,
@@ -179,8 +263,27 @@ class MatchmakingSDK extends RefCounted:
 	) -> Dictionary:
 		return Results.make(false, null, "not_used")
 
+	func invalidate_runtime() -> void:
+		for ticket: Ticket in tracked_tickets:
+			ticket.invalidate_runtime()
+		tracked_tickets.clear()
+
+	func pending_cancel_waiters() -> int:
+		var count := 0
+		for ticket: Ticket in tracked_tickets:
+			if ticket.cancel_waiting:
+				count += 1
+		return count
+
+	func _track_ticket(result: Dictionary) -> void:
+		var data: Variant = result.get("data")
+		if data is Ticket and not tracked_tickets.has(data):
+			tracked_tickets.append(data)
+
 
 class Matchmaking extends MatchmakingService:
+	static var test_instances: Array[WeakRef] = []
+
 	var sdk := MatchmakingSDK.new()
 	var fake_flow_implemented := true
 	var fake_account_current := true
@@ -189,8 +292,10 @@ class Matchmaking extends MatchmakingService:
 	var fake_playfab_present := true
 	var fake_group_support := true
 	var fake_arranged_support := true
+	var fake_warnings: Array[String] = []
 
 	func _init() -> void:
+		test_instances.append(weakref(self))
 		var config := GameModeConfig.new()
 		config.mode_type = NRTypes.GameModeType.DEATHMATCH
 		config.player_count = 4
@@ -214,6 +319,14 @@ class Matchmaking extends MatchmakingService:
 	func addon_supports_arranged_config() -> bool:
 		return fake_arranged_support
 
+	func missing_group_matchmaking_capabilities() -> PackedStringArray:
+		return PackedStringArray() if fake_group_support \
+			else PackedStringArray(["injected_group_capability"])
+
+	func missing_join_config_properties() -> PackedStringArray:
+		return PackedStringArray() if fake_arranged_support \
+			else PackedStringArray(["injected_arranged_capability"])
+
 	func _multiplayer() -> Variant:
 		return sdk
 
@@ -225,6 +338,245 @@ class Matchmaking extends MatchmakingService:
 
 	func _new_matchmaking_member() -> Variant:
 		return MatchmakingMember.new()
+
+	func _emit_warning(message: String) -> void:
+		fake_warnings.append(message)
+
+	func multiplayer_invalidated(recovery_epoch: int) -> void:
+		sdk.invalidate_runtime()
+		super.multiplayer_invalidated(recovery_epoch)
+
+	static func orphan_report() -> PackedStringArray:
+		var report := PackedStringArray()
+		for index in range(test_instances.size() - 1, -1, -1):
+			var service: Matchmaking = \
+				test_instances[index].get_ref() as Matchmaking
+			if service == null:
+				test_instances.remove_at(index)
+				continue
+			var alarms := service._clock.armed_alarm_count() \
+				if service._clock != null else 0
+			var waiters := service.sdk.pending_cancel_waiters()
+			if alarms > 0 or waiters > 0 or service.has_pending_cleanup():
+				report.append(
+					"instance=%d alarms=%d waiters=%d cleanup=%s attempts=%d" % [
+						service.get_instance_id(),
+						alarms,
+						waiters,
+						service.has_pending_cleanup(),
+						service._attempts.size(),
+					])
+		return report
+
+	static func invalidate_test_instances() -> void:
+		for reference: WeakRef in test_instances:
+			var service: Matchmaking = reference.get_ref() as Matchmaking
+			if service != null:
+				service.multiplayer_invalidated(service._multiplayer_epoch + 1)
+
+	static func clear_test_instances() -> void:
+		test_instances.clear()
+
+
+class SurfaceRuntime extends RefCounted:
+	var create_match_calls := 0
+	func is_initialized() -> bool:
+		return true
+
+	func initialize_async(_config: Variant = null, _port: int = 0) -> Dictionary:
+		return Results.make(true)
+
+	func shutdown_async() -> Dictionary:
+		return Results.make(true)
+
+	func create_lobby_async(_user: Variant, _config: Variant) -> Dictionary:
+		return Results.make(true)
+
+	func join_lobby_async(_user: Variant, _connection: String, _config: Variant) -> Dictionary:
+		return Results.make(true)
+
+	func find_lobbies_async(_user: Variant, _config: Variant) -> Dictionary:
+		return Results.make(true)
+
+	func create_match_ticket_async(_user: Variant, _config: Variant) -> Dictionary:
+		create_match_calls += 1
+		return Results.make(true)
+
+	func join_match_ticket_async(
+		_user: Variant,
+		_ticket_id: String,
+		_queue: String,
+		_members: Array
+	) -> Dictionary:
+		return Results.make(true)
+
+	func join_arranged_lobby_async(
+		_user: Variant,
+		_arrangement: String,
+		_config: Variant
+	) -> Dictionary:
+		return Results.make(true)
+
+	func create_and_join_network_async(_user: Variant, _config: Variant) -> Dictionary:
+		return Results.make(true)
+
+	func join_network_async(
+		_user: Variant,
+		_descriptor: String,
+		_config: Variant
+	) -> Dictionary:
+		return Results.make(true)
+
+
+class SurfaceMatchmaking extends MatchmakingService:
+	const OPTIONAL_SURFACE_PROPERTIES := {
+		"PlayFabLobbySearchConfig": ["filter", "max_results"],
+		"PlayFabLobbySummary": [
+			"connection_string",
+			"member_count",
+			"max_member_count",
+		],
+		"PlayFabLobbySearchResult": ["lobbies"],
+	}
+	const OPTIONAL_SEARCH_CLASSES := [
+		"PlayFabLobbySearchConfig",
+		"PlayFabLobbySummary",
+		"PlayFabLobbySearchResult",
+	]
+
+	var root := SurfaceRuntime.new()
+	var multiplayer := SurfaceRuntime.new()
+	var party := SurfaceRuntime.new()
+	var fake_mode_config: GameModeConfig = null
+	var missing_surface := ""
+	var missing_class := ""
+	var join_alias_only := false
+
+	func _init() -> void:
+		var config := GameModeConfig.new()
+		config.mode_type = NRTypes.GameModeType.DEATHMATCH
+		config.player_count = 4
+		fake_mode_config = config
+
+	func _game_mode_config(_mode: NRTypes.GameModeType) -> Variant:
+		return fake_mode_config
+
+	func _playfab() -> Variant:
+		return root
+
+	func _multiplayer() -> Variant:
+		return multiplayer
+
+	func _party_runtime() -> Variant:
+		return party
+
+	func _class_exists(class_name_value: String) -> bool:
+		if class_name_value == missing_class:
+			return false
+		return not _surface_properties(class_name_value).is_empty() \
+			or not _surface_methods(class_name_value).is_empty() \
+			or not _surface_signals(class_name_value).is_empty()
+
+	func _class_property_names(class_name_value: String) -> Dictionary:
+		var names := _names_dictionary(_surface_properties(class_name_value))
+		if join_alias_only and class_name_value == "PlayFabLobbyJoinConfig":
+			names.erase("max_member_count")
+			names["max_players"] = true
+		_remove_missing_surface(names, class_name_value)
+		return names
+
+	func _class_method_names(class_name_value: String) -> Dictionary:
+		var names := _names_dictionary(_surface_methods(class_name_value))
+		_remove_missing_surface(names, class_name_value)
+		return names
+
+	func _class_signal_names(class_name_value: String) -> Dictionary:
+		var names := _names_dictionary(_surface_signals(class_name_value))
+		_remove_missing_surface(names, class_name_value)
+		return names
+
+	func _target_has_method(target: Variant, method_name: String) -> bool:
+		var owner := ""
+		if target == root:
+			owner = "PlayFab"
+		elif target == multiplayer:
+			owner = "PlayFabMultiplayer"
+		elif target == party:
+			owner = "PlayFabParty"
+		if missing_surface == "%s.%s" % [owner, method_name]:
+			return false
+		return super._target_has_method(target, method_name)
+
+	func _remove_missing_surface(names: Dictionary, class_name_value: String) -> void:
+		var prefix := class_name_value + "."
+		if missing_surface.begins_with(prefix):
+			names.erase(missing_surface.trim_prefix(prefix))
+
+	func _names_dictionary(names: Array) -> Dictionary:
+		var result := {}
+		for name: String in names:
+			result[name] = true
+		return result
+
+	func _surface_properties(class_name_value: String) -> Array:
+		match class_name_value:
+			"PlayFabLobbyJoinConfig":
+				return MatchmakingService.REQUIRED_JOIN_CONFIG_PROPERTIES
+			"PlayFabLobbyConfig":
+				return MatchmakingService.REQUIRED_LOBBY_CONFIG_PROPERTIES
+			"PlayFabLobbyUpdateConfig":
+				return MatchmakingService.REQUIRED_LOBBY_UPDATE_PROPERTIES
+			"PlayFabLobbySearchConfig":
+				return OPTIONAL_SURFACE_PROPERTIES[class_name_value]
+			"PlayFabLobby":
+				return MatchmakingService.REQUIRED_LOBBY_PROPERTIES
+			"PlayFabLobbyMember":
+				return MatchmakingService.REQUIRED_LOBBY_MEMBER_PROPERTIES
+			"PlayFabLobbySummary":
+				return OPTIONAL_SURFACE_PROPERTIES[class_name_value]
+			"PlayFabLobbySearchResult":
+				return OPTIONAL_SURFACE_PROPERTIES[class_name_value]
+			"PlayFabLobbyStateChange":
+				return MatchmakingService.REQUIRED_LOBBY_STATE_CHANGE_PROPERTIES
+			"PlayFabPartyConfig":
+				return MatchmakingService.REQUIRED_PARTY_CONFIG_PROPERTIES
+			"PlayFabPartyNetwork":
+				return MatchmakingService.REQUIRED_PARTY_NETWORK_PROPERTIES
+			"PlayFabPartyNetworkStateChange":
+				return MatchmakingService.REQUIRED_PARTY_NETWORK_CHANGE_PROPERTIES + [
+					"reason",
+				]
+			"PlayFabMatchmakingTicketConfig":
+				return MatchmakingService.REQUIRED_TICKET_CONFIG_PROPERTIES
+			"PlayFabMatchTicket":
+				return MatchmakingService.REQUIRED_TICKET_PROPERTIES + ["properties"]
+			"PlayFabMatchTicketStateChange":
+				return MatchmakingService.REQUIRED_TICKET_STATE_CHANGE_PROPERTIES
+			"PlayFabMatchmakingMember":
+				return MatchmakingService.REQUIRED_MATCHMAKING_MEMBER_PROPERTIES
+			"PlayFabResult":
+				return MatchmakingService.REQUIRED_RESULT_PROPERTIES
+		return []
+
+	func _surface_methods(class_name_value: String) -> Array:
+		match class_name_value:
+			"PlayFabLobby":
+				return MatchmakingService.REQUIRED_LOBBY_METHODS
+			"PlayFabPartyNetwork":
+				return MatchmakingService.REQUIRED_PARTY_NETWORK_METHODS
+			"PlayFabPartyPeer":
+				return MatchmakingService.REQUIRED_PARTY_PEER_METHODS
+			"PlayFabMatchTicket":
+				return MatchmakingService.REQUIRED_TICKET_METHODS
+			"PlayFabUser":
+				return MatchmakingService.REQUIRED_USER_METHODS
+		return []
+
+	func _surface_signals(class_name_value: String) -> Array:
+		match class_name_value:
+			"PlayFabLobby", "PlayFabPartyNetwork", "PlayFabMatchTicket":
+				return ["state_changed"]
+		return []
 
 
 class Peer extends MultiplayerPeerExtension:
@@ -286,14 +638,19 @@ class Network extends RefCounted:
 	signal state_changed(change: Variant)
 	signal leave_released()
 	var descriptor := "descriptor-1"
-	var local_peer := Peer.new()
+	var local_peer: Variant = Peer.new()
 	var leaves := 0
 	var block_leave := false
+	var next_leave_result: Variant = null
 
 	func leave_async() -> Dictionary:
 		leaves += 1
 		if block_leave:
 			await leave_released
+		if next_leave_result != null:
+			var result: Variant = next_leave_result
+			next_leave_result = null
+			return result
 		if local_peer != null:
 			local_peer.connected = false
 			local_peer = null
@@ -316,6 +673,7 @@ class Lobby extends RefCounted:
 	signal post_released()
 	signal lock_released()
 	signal member_released()
+	signal properties_released()
 	var lobby_id := ""
 	var connection_string := ""
 	var owner_entity_key: Dictionary = {}
@@ -337,6 +695,8 @@ class Lobby extends RefCounted:
 	var block_post := false
 	var block_lock := false
 	var block_member := false
+	var block_properties := false
+	var next_leave_result: Variant = null
 	var next_post_result: Variant = null
 	var next_lock_result: Variant = null
 	var next_member_result: Variant = null
@@ -374,6 +734,8 @@ class Lobby extends RefCounted:
 
 	func set_properties_async(values: Dictionary) -> Dictionary:
 		property_calls += 1
+		if block_properties:
+			await properties_released
 		properties.merge(values, true)
 		return Results.make(true)
 
@@ -394,6 +756,10 @@ class Lobby extends RefCounted:
 		leaves += 1
 		if block_leave:
 			await leave_released
+		if next_leave_result != null:
+			var result: Variant = next_leave_result
+			next_leave_result = null
+			return result
 		disconnected = true
 		return Results.make(true)
 
@@ -410,6 +776,9 @@ class PartySDK extends RefCounted:
 	var block_create := false
 	var block_join := false
 	var block_initialize := false
+	var next_created_network_leave_result: Variant = null
+	var next_create_result: Variant = null
+	var next_join_result: Variant = null
 	var next_initialize_result: Variant = null
 	var next_shutdown_result: Variant = null
 	var shutdown_calls := 0
@@ -445,8 +814,13 @@ class PartySDK extends RefCounted:
 			"max_players": int(config.max_players),
 			"invitation_id": String(config.invitation_id),
 		})
+		if next_create_result != null:
+			var result: Variant = next_create_result
+			next_create_result = null
+			return result
 		var network: Network = queued_networks.pop_front() \
 			if not queued_networks.is_empty() else Network.new()
+		_apply_next_network_leave_result(network)
 		if block_create:
 			await create_released
 		network.local_peer.keys[1] = user.entity_key.duplicate()
@@ -458,14 +832,25 @@ class PartySDK extends RefCounted:
 			"descriptor": descriptor,
 			"invitation_id": String(config.invitation_id),
 		})
+		if next_join_result != null:
+			var result: Variant = next_join_result
+			next_join_result = null
+			return result
 		var network: Network = queued_networks.pop_front() \
 			if not queued_networks.is_empty() else Network.new()
+		_apply_next_network_leave_result(network)
 		if block_join:
 			await join_released
 		network.local_peer.unique_id = 7
 		network.local_peer.keys[7] = user.entity_key.duplicate()
 		networks.append(network)
 		return Results.make(true, network)
+
+	func _apply_next_network_leave_result(network: Network) -> void:
+		if network == null or next_created_network_leave_result == null:
+			return
+		network.next_leave_result = next_created_network_leave_result
+		next_created_network_leave_result = null
 
 
 class LobbySummary extends RefCounted:
@@ -485,6 +870,7 @@ class MultiplayerSDK extends RefCounted:
 	var next_create_result: Variant = null
 	var next_arranged_result: Variant = null
 	var next_join_result: Variant = null
+	var next_find_result: Variant = null
 	var find_calls: Array[Dictionary] = []
 	var join_calls: Array[String] = []
 	var arranged_calls: Array[Dictionary] = []
@@ -492,9 +878,11 @@ class MultiplayerSDK extends RefCounted:
 	var block_create := false
 	var block_arranged := false
 	var block_initialize := false
+	var next_created_lobby_leave_result: Variant = null
 	var next_initialize_result: Variant = null
 	var next_shutdown_result: Variant = null
 	var shutdown_calls := 0
+	var shutdown_hook: Callable = Callable()
 
 	func is_initialized() -> bool:
 		return initialized
@@ -511,6 +899,8 @@ class MultiplayerSDK extends RefCounted:
 
 	func shutdown_async() -> Dictionary:
 		shutdown_calls += 1
+		if shutdown_hook.is_valid():
+			shutdown_hook.call()
 		if next_shutdown_result != null:
 			var result: Variant = next_shutdown_result
 			next_shutdown_result = null
@@ -526,8 +916,10 @@ class MultiplayerSDK extends RefCounted:
 		if next_create_result != null:
 			var result: Variant = next_create_result
 			next_create_result = null
+			_apply_result_lobby_leave(result)
 			return result
 		var lobby := _lobby_from_config(user, config, "staging-%d" % (lobbies.size() + 1))
+		_apply_next_lobby_leave_result(lobby)
 		lobbies.append(lobby)
 		lobby_by_connection[lobby.connection_string] = lobby
 		return Results.make(true, lobby)
@@ -537,6 +929,10 @@ class MultiplayerSDK extends RefCounted:
 			"filter": String(config.filter),
 			"max_results": int(config.max_results),
 		})
+		if next_find_result != null:
+			var result: Variant = next_find_result
+			next_find_result = null
+			return result
 		var found := LobbySearchResult.new()
 		for connection_string: String in lobby_by_connection:
 			var summary := LobbySummary.new()
@@ -549,6 +945,7 @@ class MultiplayerSDK extends RefCounted:
 		if next_join_result != null:
 			var result: Variant = next_join_result
 			next_join_result = null
+			_apply_result_lobby_leave(result)
 			return result
 		var lobby: Lobby = lobby_by_connection.get(connection_string)
 		if lobby == null:
@@ -560,6 +957,7 @@ class MultiplayerSDK extends RefCounted:
 		if not has_local:
 			lobby.members.append(Member.new(user.entity_key))
 		lobby.local_entity_key = user.entity_key.duplicate()
+		_apply_next_lobby_leave_result(lobby)
 		return Results.make(true, lobby)
 
 	func join_arranged_lobby_async(
@@ -580,6 +978,7 @@ class MultiplayerSDK extends RefCounted:
 		if next_arranged_result != null:
 			var result: Variant = next_arranged_result
 			next_arranged_result = null
+			_apply_result_lobby_leave(result)
 			return result
 		var lobby := Lobby.new()
 		lobby.lobby_id = "arranged-%d" % (lobbies.size() + 1)
@@ -591,6 +990,7 @@ class MultiplayerSDK extends RefCounted:
 		lobby.restrict_invites_to_lobby_owner = config.restrict_invites_to_lobby_owner
 		lobby.local_entity_key = user.entity_key.duplicate()
 		lobby.members = [Member.new(user.entity_key, config.member_properties)]
+		_apply_next_lobby_leave_result(lobby)
 		lobbies.append(lobby)
 		lobby_by_connection[lobby.connection_string] = lobby
 		return Results.make(true, lobby)
@@ -610,6 +1010,19 @@ class MultiplayerSDK extends RefCounted:
 		lobby.members = [Member.new(user.entity_key, config.member_properties)]
 		return lobby
 
+	func _apply_result_lobby_leave(result: Variant) -> void:
+		if typeof(result) != TYPE_DICTIONARY:
+			return
+		var data: Variant = (result as Dictionary).get("data")
+		if data is Lobby:
+			_apply_next_lobby_leave_result(data as Lobby)
+
+	func _apply_next_lobby_leave_result(lobby: Lobby) -> void:
+		if lobby == null or next_created_lobby_leave_result == null:
+			return
+		lobby.next_leave_result = next_created_lobby_leave_result
+		next_created_lobby_leave_result = null
+
 
 class PlayFabDouble extends RefCounted:
 	var party := PartySDK.new()
@@ -623,6 +1036,7 @@ class Party extends PartyService:
 	var pf := PlayFabDouble.new()
 	var fake_account_current := true
 	var fake_clock := Clock.new()
+	var fake_warnings: Array[String] = []
 
 	func _now_msec() -> int:
 		return fake_clock.now_msec()
@@ -653,3 +1067,6 @@ class Party extends PartyService:
 
 	func _new_lobby_search_config() -> Variant:
 		return Config.new()
+
+	func _emit_warning(message: String) -> void:
+		fake_warnings.append(message)

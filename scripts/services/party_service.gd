@@ -49,6 +49,8 @@ signal network_destroyed()
 ## still be usable — so this reports the failure without ending the session.
 signal party_failed(message: String, context: Variant)
 signal cleanup_status_changed(message: String)
+## Level-triggered notice that cleanup readiness may have changed; consumers re-query.
+signal cleanup_state_changed()
 signal context_updated(context: Variant)
 signal context_lost(reason: String, context: Variant)
 signal multiplayer_invalidated(recovery_epoch: int)
@@ -77,6 +79,9 @@ const SEARCH_CONTROL_SCHEMA := 1
 const ARRANGED_PHASE_BOOTSTRAP := "bootstrap"
 const ARRANGED_PHASE_GAMEPLAY := "gameplay"
 const ARRANGED_PHASE_REMATCH := "rematch_gathering"
+const CLEANUP_CLEAR := &"clear"
+const CLEANUP_PENDING := &"pending"
+const CLEANUP_RESTART_REQUIRED := &"restart_required"
 
 ## The descriptor is finalized asynchronously after the network is created, and lobby
 ## properties replicate on their own schedule. Both are polled rather than raced.
@@ -201,11 +206,60 @@ const JOIN_FAILURE_MESSAGES := {
 	0x89236409: JOIN_FAILED_SERVICE,           # Unexpected error with a 4XX status code.
 	0x8923640A: JOIN_FAILED_SERVICE,           # Unexpected error with a 5XX status code.
 }
+const SAFE_NATIVE_CODES := [
+	"already_initialized",
+	"invalid_lobby",
+	"invalid_properties",
+	"invalid_search",
+	"invalid_update",
+	"invalid_user",
+	"party_resource_not_ready",
+	"party_network_create_failed",
+	"party_network_connect_failed",
+	"party_descriptor_invalid",
+	"party_transport_create_failed",
+	"party_peer_not_connected",
+	"party_not_initialized",
+	"party_already_initialized",
+	"party_invalid_options",
+	"party_shutting_down",
+	"party_invalid_user",
+	"party_chat_control_create_failed",
+	"party_state_start_failed",
+	"party_state_finish_failed",
+	"lobby_create_failed",
+	"lobby_join_failed",
+	"lobby_search_failed",
+	"lobby_create_start_failed",
+	"lobby_join_start_failed",
+	"lobby_search_start_failed",
+	"lobby_update_failed",
+	"lobby_update_start_failed",
+	"member_update_start_failed",
+	"lobby_leave_start_failed",
+	"lobby_disconnected",
+	"invalid_connection_string",
+	"invalid_arranged_lobby_connection_string",
+	"arranged_lobby_join_failed",
+	"arranged_lobby_join_start_failed",
+	"invalid_arranged_lobby_config",
+	"unsupported_on_gdk_edition",
+	"lobby_state_finish_failed",
+	"matchmaking_state_finish_failed",
+	"multiplayer_queue_create_failed",
+	"multiplayer_initialize_failed",
+	"multiplayer_cleanup_failed",
+	"party_cleanup_failed",
+	"not_initialized",
+	"shutting_down",
+	"cancelled",
+]
+const E_FAIL_HRESULT := 0x80004005
 
 
 class LobbyContext extends RefCounted:
-	signal lobby_leave_finished(result)
-	signal transport_leave_finished(result)
+	signal lobby_leave_finished()
+	signal transport_leave_finished()
 
 	var context_id: int = 0
 	var service_owner: WeakRef = null
@@ -231,6 +285,18 @@ class LobbyContext extends RefCounted:
 	var left_transport := false
 	var lobby_leave_running := false
 	var transport_leave_running := false
+	var lobby_leave_completed := false
+	var lobby_leave_outcome := -1
+	var lobby_leave_reason_code: StringName = &""
+	var lobby_leave_reason := ""
+	var lobby_leave_diagnostic := ""
+	var lobby_leave_cleanup_pending := false
+	var transport_leave_completed := false
+	var transport_leave_outcome := -1
+	var transport_leave_reason_code: StringName = &""
+	var transport_leave_reason := ""
+	var transport_leave_diagnostic := ""
+	var transport_leave_cleanup_pending := false
 	var retired := false
 	var cleanup_pending := false
 	var pending_operations := 0
@@ -244,6 +310,7 @@ class LobbyContext extends RefCounted:
 	var network_callback: Callable = Callable()
 	var lobby_callback: Callable = Callable()
 	var loss_emitted := false
+	var failure_logs: Dictionary = {}
 
 
 class ScopedOperation extends RefCounted:
@@ -272,6 +339,15 @@ class ScopedOperation extends RefCounted:
 	var timeout_reason_code: StringName = &""
 	var timeout_reason: String = ""
 	var deadline_alarm: Variant = null
+	var native_code := ""
+	var native_hresult := 0
+	var native_result_present := false
+	var native_detail_available := false
+	var native_party_error_available := false
+	var native_party_error := 0
+	var native_state_change_available := false
+	var native_state_change_result := 0
+	var failure_logs: Dictionary = {}
 
 
 class PartyResult extends RefCounted:
@@ -307,6 +383,7 @@ var join_code: String = ""
 var _network: Variant = null
 var _lobby: Variant = null
 var _peer: Variant = null
+var _legacy_owner_key: Dictionary = {}
 var _is_host: bool = false
 var _party_initialized: bool = false
 var _multiplayer_initialized: bool = false
@@ -334,6 +411,8 @@ var _native_sequence := 0
 var _pending_native: Dictionary = {}
 var _cleanup_failed := false
 var _recovering := false
+var _recovery_required := false
+var _recovery_required_reason: StringName = &""
 
 ## Membership-lock serialization. An SDK update cannot be recalled once posted, so a
 ## second lock request waits for the first to settle rather than posting an opposite
@@ -382,7 +461,50 @@ func _load_network_contract() -> void:
 
 
 func is_cleanup_pending() -> bool:
-	return _leaving or _recovering or not recovery_error.is_empty()
+	return _leaving or _recovering or _recovery_required \
+		or _cleanup_failed or _has_scoped_leave_pending() \
+		or not recovery_error.is_empty()
+
+
+func is_cleanup_running() -> bool:
+	return _leaving or _recovering
+
+
+func has_idle_cleanup_debt() -> bool:
+	return not is_cleanup_running() and recovery_error.is_empty() \
+		and (
+			_cleanup_failed
+			or _recovery_required
+			or _has_scoped_cleanup_debt()
+		)
+
+
+## Party-owned cleanup state for shared online-entry and invitation decisions.
+func cleanup_readiness() -> Dictionary:
+	if not recovery_error.is_empty():
+		return {
+			"state": CLEANUP_RESTART_REQUIRED,
+			"reason": recovery_error,
+		}
+	if _recovering or _recovery_required or _cleanup_failed \
+		or _has_scoped_cleanup_debt():
+		return {
+			"state": CLEANUP_PENDING,
+			"reason": cleanup_status if not cleanup_status.is_empty() \
+				else "The previous match is still being cleaned up.",
+		}
+	return {
+		"state": CLEANUP_CLEAR,
+		"reason": "",
+	}
+
+
+func require_recovery(reason: StringName) -> void:
+	if _recovery_required or not recovery_error.is_empty():
+		return
+	_recovery_required = true
+	_recovery_required_reason = reason
+	_notify_cleanup_state_changed()
 
 
 func _now_msec() -> int:
@@ -535,7 +657,7 @@ func _post_membership_lock(lobby: Variant, membership_lock: int, operation: int)
 	if result != null and result.ok:
 		_lock_result = {"ok": true, "error": ""}
 	else:
-		push_warning("[Party] Updating the lobby membership lock failed: %s" % _reason(result))
+		_log_party_result(&"legacy_lock", &"membership_lock_failed", result)
 		_lock_result = {"ok": false, "error": LOCK_FAILED_SERVICE}
 	_lock_running = false
 
@@ -586,6 +708,7 @@ func host(user: Variant, max_players: int, game_mode: String, deadline_msec: int
 		return _fail("Host cancelled.")
 	if created == null or not created.ok:
 		join_code = ""
+		_log_party_result(&"legacy_network_create", &"network_create_failed", created)
 		return _fail("Could not create the Party network: %s" % _reason(created))
 
 	_legacy_attach_succeeded = true
@@ -654,8 +777,8 @@ func join(user: Variant, code: String, deadline_msec: int = 0) -> Dictionary:
 	var members := int(lookup.member_count)
 	var capacity := int(lookup.max_member_count)
 	if _is_at_capacity(members, capacity):
-		push_warning("[Party] Not joining %s: the lobby search reported it full (%d/%d)." % [
-			normalized, members, capacity])
+		push_warning("[Party] Not joining: the lobby search reported it full (%d/%d)." % [
+			members, capacity])
 		return _fail(JOIN_FAILED_FULL)
 
 	return await _join_lobby_by_connection_string(user, connection_string, normalized, operation)
@@ -1000,7 +1123,7 @@ func _join_attached_lobby(user: Variant, code: String, operation: int) -> Dictio
 	if descriptor.is_empty():
 		# Same words as the service's "not joinable" refusal, so say in the log which one
 		# this was: the lobby admitted the player but never offered a Party network.
-		push_warning("[Party] Match %s has no Party network descriptor; the host left or never published one." % code)
+		push_warning("[Party] Joined lobby has no Party network descriptor; the host left or never published one.")
 		leave()
 		return _fail("Match %s is no longer accepting players." % code)
 
@@ -1056,6 +1179,7 @@ func leave(invalidate_pending: bool = true) -> void:
 	if not recovery_error.is_empty():
 		return
 	_leaving = true
+	_notify_cleanup_state_changed()
 	_reconcile_initialized_services()
 	var deadline := _now_msec() + int(NRConst.MATCH_CLEANUP_SECONDS * 1000.0)
 	var lobby: Variant = _lobby
@@ -1075,17 +1199,15 @@ func leave(invalidate_pending: bool = true) -> void:
 		var context := context_value as LobbyContext
 		leave_transport(context)
 		leave_lobby(context)
-	while not _pending_native.is_empty() \
-			or (_chat != null and _chat.is_control_operation_pending()) \
-			or not _captured_contexts_quiescent(scoped_contexts) \
-			or _owned_operation_count > 0:
+	while _has_cleanup_execution():
 		if _now_msec() >= deadline:
 			break
 		await _sleep(POLL_INTERVAL)
-	if _cleanup_failed or not _pending_native.is_empty() \
+	if _recovery_required or _cleanup_failed or not _pending_native.is_empty() \
 			or (_chat != null and _chat.is_control_operation_pending()) \
 			or not _captured_contexts_quiescent(scoped_contexts) \
-			or _owned_operation_count > 0:
+			or _owned_operation_count > 0 \
+			or not _scoped_operations.is_empty():
 		await _recover_services()
 	if recovery_error.is_empty():
 		_reconcile_initialized_services()
@@ -1103,24 +1225,32 @@ func leave(invalidate_pending: bool = true) -> void:
 	# join() opens with `await leave(false)`. ChatService keeps it until the chat privilege
 	# is withdrawn or the title exits. See ChatService.destroy_control().
 	_leaving = false
+	_notify_cleanup_state_changed()
 	_leave_completed.emit()
 
 
 func _clear_descriptor(lobby: Variant) -> void:
 	var result: Variant = await _native_call(lobby, &"set_properties_async", [{DESCRIPTOR_KEY: ""}])
 	if result == null or not result.ok:
-		push_warning("[Party] Could not clear the descriptor: %s" % _reason(result))
+		_log_party_result(&"clear_descriptor", &"descriptor_clear_failed", result)
 
 
 func _set_cleanup_status(message: String) -> void:
 	cleanup_status = message
 	cleanup_status_changed.emit(message)
+	cleanup_state_changed.emit()
 
 
 func _recover_services() -> void:
 	_recovering = true
+	_notify_cleanup_state_changed()
 	_native_epoch += 1
 	cancel_pending_join()
+	if _recovery_required and _recovery_required_reason != &"":
+		_log_party_result(
+			&"service_recovery",
+			_recovery_required_reason,
+			null)
 	_set_cleanup_status("Recovering multiplayer services")
 	if _chat != null:
 		_chat.begin_service_reset()
@@ -1136,12 +1266,15 @@ func _recover_services() -> void:
 			var result: Variant = await service.shutdown_async()
 			if result == null or not result.ok or service.is_initialized():
 				safe = false
-				push_warning("[Party] Scoped multiplayer shutdown failed: %s" % _reason(result))
+				_log_party_result(
+					&"service_recovery", &"scoped_shutdown_failed", result)
 	if safe:
 		_pending_native.clear()
 		_party_initialized = false
 		_multiplayer_initialized = false
 		_cleanup_failed = false
+		_recovery_required = false
+		_recovery_required_reason = &""
 		_complete_scoped_recovery()
 		multiplayer_invalidated.emit(_scoped_recovery_epoch)
 		if _chat != null:
@@ -1149,7 +1282,28 @@ func _recover_services() -> void:
 	else:
 		recovery_error = RECOVERY_FAILED
 		_set_cleanup_status(recovery_error)
+		for context_value: Variant in _contexts.values().duplicate():
+			var context := context_value as LobbyContext
+			if context == null:
+				continue
+			if context.lobby_leave_running:
+				_settle_lobby_leave(
+					context,
+					PartyResult.Outcome.SERVICE_ERROR,
+					&"multiplayer_recovery_failed",
+					recovery_error,
+					"",
+					true)
+			if context.transport_leave_running:
+				_settle_transport_leave(
+					context,
+					PartyResult.Outcome.SERVICE_ERROR,
+					&"multiplayer_recovery_failed",
+					recovery_error,
+					"",
+					true)
 	_recovering = false
+	_notify_cleanup_state_changed()
 
 
 # --- Initialization ---------------------------------------------------------
@@ -1194,7 +1348,10 @@ func _ensure_initialized(operation: int) -> String:
 			return "Session cancelled."
 		_reconcile_initialized_services()
 		if party_init == null or not party_init.ok:
-			push_warning("[Party] PlayFab Party could not start: %s" % _reason(party_init))
+			_log_party_result(
+				&"legacy_party_initialize",
+				&"party_initialize_failed",
+				party_init)
 			return MULTIPLAYER_START_FAILED
 		if not _party_initialized:
 			return "PlayFab Party stopped while the match was being prepared."
@@ -1205,7 +1362,10 @@ func _ensure_initialized(operation: int) -> String:
 			return "Session cancelled."
 		_reconcile_initialized_services()
 		if mp_init == null or not mp_init.ok:
-			push_warning("[Party] PlayFab Lobby could not start: %s" % _reason(mp_init))
+			_log_party_result(
+				&"legacy_lobby_initialize",
+				&"lobby_initialize_failed",
+				mp_init)
 			return MULTIPLAYER_START_FAILED
 
 	if not _party_initialized or not _multiplayer_initialized:
@@ -1280,6 +1440,7 @@ func _create_lobby(user: Variant, descriptor: String, max_players: int, game_mod
 			await _leave_lobby_instance(result.data)
 		return "Host cancelled."
 	if result == null or not result.ok:
+		_log_party_result(&"legacy_lobby_create", &"lobby_create_failed", result)
 		return "Could not advertise the match: %s" % _reason(result)
 	if result.data == null or result.data.is_disconnected():
 		return "The match service did not return a usable lobby."
@@ -1328,8 +1489,8 @@ func _find_lobby(user: Variant, code: String, operation: int = 0) -> Dictionary:
 	var members := _summary_count(summary, "member_count")
 	var capacity := _summary_count(summary, "max_member_count")
 	if capacity <= 0:
-		push_warning("[Party] Lobby search result for %s carries no capacity (%d/%d); joining without a capacity check." % [
-			code, members, capacity])
+		push_warning("[Party] Lobby search result carries no capacity (%d/%d); joining without a capacity check." % [
+			members, capacity])
 	lookup["connection_string"] = String(summary.connection_string)
 	lookup["member_count"] = members
 	lookup["max_member_count"] = capacity
@@ -1374,6 +1535,9 @@ func _is_at_capacity(member_count: int, max_member_count: int) -> bool:
 func _attach_lobby(lobby: Variant) -> void:
 	_detach_lobby()
 	_lobby = lobby
+	var owner_value: Variant = _object_value(lobby, &"owner_entity_key", {})
+	_legacy_owner_key = _copy_entity_key(owner_value as Dictionary) \
+		if typeof(owner_value) == TYPE_DICTIONARY else {}
 
 
 func _detach_lobby() -> void:
@@ -1383,6 +1547,7 @@ func _detach_lobby() -> void:
 	_lock_running = false
 	_lock_result = {}
 	_lobby = null
+	_legacy_owner_key = {}
 
 
 # --- Network ----------------------------------------------------------------
@@ -1438,7 +1603,10 @@ func _on_network_state_changed(change: Variant) -> void:
 	var kind := int(change.kind)
 	match _network_changes.find_key(kind):
 		&"NETWORK_CHANGE_STATE":
-			_handle_network_state(int(change.state), _change_reason(change))
+			_handle_network_state(
+				int(change.state),
+				_change_reason(change),
+				_object_value(change, &"result", null))
 		&"NETWORK_CHANGE_PEER_JOINED":
 			peer_joined.emit(int(change.peer_id))
 		&"NETWORK_CHANGE_PEER_LEFT":
@@ -1449,6 +1617,10 @@ func _on_network_state_changed(change: Variant) -> void:
 			_republish_descriptor()
 		&"NETWORK_CHANGE_DESTROYED":
 			var reason := _change_reason(change)
+			_log_party_result(
+				&"legacy_network_destroyed",
+				&"network_destroyed",
+				_object_value(change, &"result", null))
 			cancel_pending_join()
 			_detach_network()
 			var operation := _join_operation_token
@@ -1456,9 +1628,14 @@ func _on_network_state_changed(change: Variant) -> void:
 			if operation != _join_operation_token or _network != null:
 				return
 			network_lost.emit(
-				reason if not reason.is_empty() else "The match connection was closed.",
+				reason if not reason.is_empty() \
+					else "The match connection was closed.",
 				null)
 		&"NETWORK_CHANGE_ERROR":
+			_log_party_result(
+				&"legacy_network_state",
+				&"network_state_failed",
+				change.result)
 			party_failed.emit(_reason(change.result), null)
 
 
@@ -1466,24 +1643,35 @@ func _on_network_state_changed(change: Variant) -> void:
 ## (CREATING, CONNECTING, AUTHENTICATING, CONNECTED) and are left alone. DISCONNECTING is
 ## deliberately not terminal: it is the leading edge of a teardown this instance may have
 ## asked for, and DISCONNECTED or DESTROYED follows either way.
-func _handle_network_state(state: int, reason: String) -> void:
+func _handle_network_state(state: int, reason: String, result: Variant = null) -> void:
 	match state:
 		NETWORK_STATE_DISCONNECTED:
+			_log_party_result(
+				&"legacy_network_state",
+				&"network_disconnected",
+				result)
 			_retain_lost_network_for_cleanup()
 			network_lost.emit(
-				reason if not reason.is_empty() else "The match connection was lost.",
+				reason if not reason.is_empty() \
+					else "The match connection was lost.",
 				null)
 		NETWORK_STATE_FAILED:
+			_log_party_result(
+				&"legacy_network_state",
+				&"network_failed",
+				result)
 			_retain_lost_network_for_cleanup()
 			network_lost.emit(
-				reason if not reason.is_empty() else "The match connection failed.",
+				reason if not reason.is_empty() \
+					else "The match connection failed.",
 				null)
 
 
 ## The change's own reason string, falling back to its result. Party fills one or the
 ## other depending on the kind, and neither is guaranteed.
 func _change_reason(change: Variant) -> String:
-	var reason := String(_object_value(change, &"reason", "")).strip_edges()
+	var reason := String(_object_value(change, &"reason", "")).strip_edges() \
+		if _object_has_property(change, &"reason") else ""
 	if not reason.is_empty():
 		return reason
 	var result: Variant = _object_value(change, &"result", null)
@@ -1500,7 +1688,8 @@ func _republish_descriptor() -> void:
 		return
 	var result: Variant = await _native_call(_lobby, &"set_properties_async", [{DESCRIPTOR_KEY: descriptor}])
 	if result != null and not result.ok:
-		push_warning("[Party] Republishing the descriptor failed: %s" % _reason(result))
+		_log_party_result(
+			&"legacy_descriptor_publish", &"descriptor_publish_failed", result)
 
 
 ## The finalized descriptor may not exist yet when create_and_join_network_async
@@ -1525,7 +1714,8 @@ func _leave_lobby_instance(lobby: Variant) -> void:
 	var left: Variant = await _native_call(lobby, &"leave_async")
 	if epoch == _native_epoch and (left == null or not left.ok):
 		_cleanup_failed = true
-		push_warning("[Party] Leaving a cancelled lobby failed: %s" % _reason(left))
+		_notify_cleanup_state_changed()
+		_log_party_result(&"legacy_lobby_leave", &"lobby_leave_failed", left)
 
 
 func _leave_network_instance(network: Variant) -> void:
@@ -1542,29 +1732,50 @@ func _leave_network_instance(network: Variant) -> void:
 	var result: Variant = await _native_call(network, &"leave_async")
 	if epoch == _native_epoch and (result == null or not result.ok):
 		_cleanup_failed = true
-		push_warning("[Party] Leaving a cancelled Party network failed: %s" % _reason(result))
+		_notify_cleanup_state_changed()
+		_log_party_result(&"legacy_network_leave", &"network_leave_failed", result)
 
 
 func _leave_stale_lobby_instance(context: LobbyContext, lobby: Variant) -> void:
-	if context == null or context.recovery_epoch == _scoped_recovery_epoch:
+	if context == null:
 		await _leave_lobby_instance(lobby)
 		return
 	if lobby == null or lobby.is_disconnected():
 		return
 	var result: Variant = await lobby.leave_async()
 	if not _result_ok(result):
-		push_warning("[Party] Leaving an old-recovery lobby failed: %s" % _reason(result))
+		_log_party_context_failure(
+			context, &"stale_lobby_leave", &"lobby_leave_failed", result)
+		_retain_stale_leave_debt(context, false)
 
 
 func _leave_stale_network_instance(context: LobbyContext, network: Variant) -> void:
-	if context == null or context.recovery_epoch == _scoped_recovery_epoch:
+	if context == null:
 		await _leave_network_instance(network)
 		return
 	if network == null or network.local_peer == null:
 		return
 	var result: Variant = await network.leave_async()
 	if not _result_ok(result):
-		push_warning("[Party] Leaving an old-recovery Party network failed: %s" % _reason(result))
+		_log_party_context_failure(
+			context, &"stale_network_leave", &"network_leave_failed", result)
+		_retain_stale_leave_debt(context, true)
+
+
+func _retain_stale_leave_debt(
+	context: LobbyContext,
+	transport: bool
+) -> void:
+	if context == null:
+		return
+	_cleanup_failed = true
+	if transport:
+		context.transport_leave_cleanup_pending = true
+	else:
+		context.lobby_leave_cleanup_pending = true
+	if context.context_id > 0:
+		_contexts[context.context_id] = context
+	_refresh_context_cleanup(context)
 
 
 ## Lobby properties replicate to a joining member shortly after join_lobby_async
@@ -1700,6 +1911,7 @@ func _run_create_staging(
 			"Matchmaking staging was replaced.")
 		return
 	if not _result_ok(created):
+		_capture_scoped_native_result(operation, created)
 		_discard_context(context)
 		_finish_scoped_operation(
 			operation,
@@ -1778,6 +1990,7 @@ func _run_create_staging(
 			"Matchmaking staging was replaced.")
 		return
 	if not _result_ok(lobby_result):
+		_capture_scoped_native_result(operation, lobby_result)
 		_settle_scoped_operation(
 			operation,
 			PartyResult.Outcome.SERVICE_ERROR,
@@ -1963,6 +2176,7 @@ func _run_join_arranged(
 			"The arranged lobby join was replaced.")
 		return
 	if not _result_ok(result):
+		_capture_scoped_native_result(operation, result)
 		_discard_context(context)
 		_finish_scoped_operation(
 			operation,
@@ -2088,6 +2302,7 @@ func _run_prepare_transport(
 			"The arranged transport was replaced.")
 		return
 	if not _result_ok(created):
+		_capture_scoped_native_result(operation, created)
 		_finish_scoped_operation(
 			operation,
 			context,
@@ -2233,6 +2448,7 @@ func _run_join_transport(
 			"The arranged transport was replaced.")
 		return
 	if not _result_ok(joined):
+		_capture_scoped_native_result(operation, joined)
 		_finish_scoped_operation(
 			operation,
 			context,
@@ -2366,64 +2582,33 @@ func leave_lobby(context: LobbyContext) -> PartyResult:
 			PartyResult.Outcome.INVALID,
 			&"invalid_context",
 			"No scoped lobby was supplied.")
-	if context.lobby_leave_running:
-		var coalesced: Variant = await context.lobby_leave_finished
-		if coalesced is PartyResult:
-			return coalesced as PartyResult
-		return _context_failure(
-			PartyResult.Outcome.SERVICE_ERROR,
-			&"scoped_lobby_leave_missing_result",
-			"The scoped lobby leave returned no result.",
-			context)
-	_retire_context_operations(context)
-	context.operation_id += 1
-	context.active_permit = 0
-	if context.left_lobby or context.lobby == null:
-		context.left_lobby = true
-		_retire_context_if_empty(context)
-		return _context_success(context)
-	context.active_permit = 0
-	context.lock_operation += 1
-	context.post_operation += 1
-	context.lock_running = false
-	context.post_running = false
-	context.lock_result = null
-	context.post_result = null
-	var lobby: Variant = context.lobby
-	var leave_epoch := context.recovery_epoch
-	_disconnect_context_lobby(context)
-	context.lobby = null
-	context.left_lobby = true
-	context.lobby_leave_running = true
-	_refresh_context_cleanup(context)
-	if context.local_user != null and bool(lobby.is_owner(context.local_user)):
-		var properties_value: Variant = _object_value(lobby, &"properties", {})
-		if typeof(properties_value) == TYPE_DICTIONARY \
-			and not String((properties_value as Dictionary).get(DESCRIPTOR_KEY, "")).is_empty():
-			var cleared: Variant = await lobby.set_properties_async({DESCRIPTOR_KEY: ""})
-			if not _result_ok(cleared):
-				push_warning("[Party] Clearing a scoped descriptor failed: %s" % _reason(cleared))
-	var result: Variant = await lobby.leave_async()
-	if leave_epoch != _scoped_recovery_epoch:
-		return _context_success(context)
-	context.lobby_leave_running = false
-	_refresh_context_cleanup(context)
-	if not _result_ok(result):
-		_cleanup_failed = true
-		push_warning("[Party] Leaving scoped lobby failed: %s" % _reason(result))
-		_retire_context_if_empty(context)
-		var failed := _context_failure(
-			PartyResult.Outcome.SERVICE_ERROR,
-			&"scoped_lobby_leave_failed",
-			"The PlayFab lobby did not confirm that it was left.",
-			context,
-			_reason(result))
-		context.lobby_leave_finished.emit(failed)
-		return failed
-	_retire_context_if_empty(context)
-	var succeeded := _context_success(context)
-	context.lobby_leave_finished.emit(succeeded)
-	return succeeded
+	if not context.lobby_leave_running and not context.lobby_leave_completed:
+		_retire_context_operations(context)
+		context.operation_id += 1
+		context.active_permit = 0
+		context.lock_operation += 1
+		context.post_operation += 1
+		context.lock_running = false
+		context.post_running = false
+		context.lock_result = null
+		context.post_result = null
+		if context.left_lobby or context.lobby == null:
+			context.left_lobby = true
+			_settle_lobby_leave(
+				context,
+				PartyResult.Outcome.OK)
+		else:
+			var lobby: Variant = context.lobby
+			var leave_epoch := context.recovery_epoch
+			_disconnect_context_lobby(context)
+			context.lobby = null
+			context.left_lobby = true
+			context.lobby_leave_running = true
+			_refresh_context_cleanup(context)
+			_run_lobby_leave(context, lobby, leave_epoch)
+	if not context.lobby_leave_completed:
+		await context.lobby_leave_finished
+	return _lobby_leave_result(context)
 
 
 func leave_transport(context: LobbyContext) -> PartyResult:
@@ -2432,51 +2617,165 @@ func leave_transport(context: LobbyContext) -> PartyResult:
 			PartyResult.Outcome.INVALID,
 			&"invalid_context",
 			"No scoped Party transport was supplied.")
-	if context.transport_leave_running:
-		var coalesced: Variant = await context.transport_leave_finished
-		if coalesced is PartyResult:
-			return coalesced as PartyResult
-		return _context_failure(
-			PartyResult.Outcome.SERVICE_ERROR,
-			&"scoped_transport_leave_missing_result",
-			"The scoped Party transport leave returned no result.",
-			context)
-	_retire_context_operations(context)
-	context.operation_id += 1
-	context.active_permit = 0
-	if context.left_transport or context.network == null:
-		context.left_transport = true
-		_retire_context_if_empty(context)
-		return _context_success(context)
-	var network: Variant = context.network
-	var leave_epoch := context.recovery_epoch
-	_disconnect_context_transport(context)
-	context.network = null
-	context.peer = null
-	context.left_transport = true
-	context.transport_leave_running = true
-	_refresh_context_cleanup(context)
-	var result: Variant = await network.leave_async()
-	if leave_epoch != _scoped_recovery_epoch:
-		return _context_success(context)
-	context.transport_leave_running = false
-	_refresh_context_cleanup(context)
+	if not context.transport_leave_running and not context.transport_leave_completed:
+		_retire_context_operations(context)
+		context.operation_id += 1
+		context.active_permit = 0
+		if context.left_transport or context.network == null:
+			context.left_transport = true
+			_settle_transport_leave(
+				context,
+				PartyResult.Outcome.OK)
+		else:
+			var network: Variant = context.network
+			var leave_epoch := context.recovery_epoch
+			_disconnect_context_transport(context)
+			context.network = null
+			context.peer = null
+			context.left_transport = true
+			context.transport_leave_running = true
+			_refresh_context_cleanup(context)
+			_run_transport_leave(context, network, leave_epoch)
+	if not context.transport_leave_completed:
+		await context.transport_leave_finished
+	return _transport_leave_result(context)
+
+
+func _run_lobby_leave(
+	context: LobbyContext,
+	lobby: Variant,
+	leave_epoch: int
+) -> void:
+	if context.local_user != null and bool(lobby.is_owner(context.local_user)):
+		var properties_value: Variant = _object_value(lobby, &"properties", {})
+		if typeof(properties_value) == TYPE_DICTIONARY \
+			and not String((properties_value as Dictionary).get(
+				DESCRIPTOR_KEY, "")).is_empty():
+			var cleared: Variant = await lobby.set_properties_async({
+				DESCRIPTOR_KEY: "",
+			})
+			if leave_epoch != _scoped_recovery_epoch \
+				or context.lobby_leave_completed:
+				return
+			if not _result_ok(cleared):
+				_log_party_context_failure(
+					context,
+					&"scoped_descriptor_clear",
+					&"descriptor_clear_failed",
+					cleared)
+	var result: Variant = await lobby.leave_async()
+	if leave_epoch != _scoped_recovery_epoch \
+		or context.lobby_leave_completed:
+		return
 	if not _result_ok(result):
 		_cleanup_failed = true
-		push_warning("[Party] Leaving scoped Party transport failed: %s" % _reason(result))
-		_retire_context_if_empty(context)
-		var failed := _context_failure(
+		_log_party_context_failure(
+			context,
+			&"scoped_lobby_leave",
+			&"scoped_lobby_leave_failed",
+			result)
+		_settle_lobby_leave(
+			context,
+			PartyResult.Outcome.SERVICE_ERROR,
+			&"scoped_lobby_leave_failed",
+			"The PlayFab lobby did not confirm that it was left.",
+			_reason(result),
+			true)
+		return
+	_settle_lobby_leave(context, PartyResult.Outcome.OK)
+
+
+func _run_transport_leave(
+	context: LobbyContext,
+	network: Variant,
+	leave_epoch: int
+) -> void:
+	var result: Variant = await network.leave_async()
+	if leave_epoch != _scoped_recovery_epoch \
+		or context.transport_leave_completed:
+		return
+	if not _result_ok(result):
+		_cleanup_failed = true
+		_log_party_context_failure(
+			context,
+			&"scoped_transport_leave",
+			&"scoped_transport_leave_failed",
+			result)
+		_settle_transport_leave(
+			context,
 			PartyResult.Outcome.SERVICE_ERROR,
 			&"scoped_transport_leave_failed",
 			"The Party transport did not confirm that it was left.",
-			context,
-			_reason(result))
-		context.transport_leave_finished.emit(failed)
-		return failed
+			_reason(result),
+			true)
+		return
+	_settle_transport_leave(context, PartyResult.Outcome.OK)
+
+
+func _settle_lobby_leave(
+	context: LobbyContext,
+	outcome: int,
+	code: StringName = &"",
+	reason: String = "",
+	diagnostic: String = "",
+	keep_cleanup_pending: bool = false
+) -> void:
+	if context == null or context.lobby_leave_completed:
+		return
+	context.lobby_leave_outcome = outcome
+	context.lobby_leave_reason_code = code
+	context.lobby_leave_reason = reason
+	context.lobby_leave_diagnostic = diagnostic
+	context.lobby_leave_cleanup_pending = keep_cleanup_pending
+	context.lobby_leave_completed = true
+	context.lobby_leave_running = false
+	_refresh_context_cleanup(context)
 	_retire_context_if_empty(context)
-	var succeeded := _context_success(context)
-	context.transport_leave_finished.emit(succeeded)
-	return succeeded
+	context.lobby_leave_finished.emit()
+
+
+func _settle_transport_leave(
+	context: LobbyContext,
+	outcome: int,
+	code: StringName = &"",
+	reason: String = "",
+	diagnostic: String = "",
+	keep_cleanup_pending: bool = false
+) -> void:
+	if context == null or context.transport_leave_completed:
+		return
+	context.transport_leave_outcome = outcome
+	context.transport_leave_reason_code = code
+	context.transport_leave_reason = reason
+	context.transport_leave_diagnostic = diagnostic
+	context.transport_leave_cleanup_pending = keep_cleanup_pending
+	context.transport_leave_completed = true
+	context.transport_leave_running = false
+	_refresh_context_cleanup(context)
+	_retire_context_if_empty(context)
+	context.transport_leave_finished.emit()
+
+
+func _lobby_leave_result(context: LobbyContext) -> PartyResult:
+	if context.lobby_leave_outcome == PartyResult.Outcome.OK:
+		return _context_success(context)
+	return _context_failure(
+		context.lobby_leave_outcome,
+		context.lobby_leave_reason_code,
+		context.lobby_leave_reason,
+		context,
+		context.lobby_leave_diagnostic)
+
+
+func _transport_leave_result(context: LobbyContext) -> PartyResult:
+	if context.transport_leave_outcome == PartyResult.Outcome.OK:
+		return _context_success(context)
+	return _context_failure(
+		context.transport_leave_outcome,
+		context.transport_leave_reason_code,
+		context.transport_leave_reason,
+		context,
+		context.transport_leave_diagnostic)
 
 
 func snapshot(context: LobbyContext) -> Dictionary:
@@ -2605,11 +2904,186 @@ func admission_proof(context: LobbyContext, peer_id: int) -> Dictionary:
 	return proof
 
 
+func joined_owner_proof(
+	context: LobbyContext = null,
+	peer_id: int = 1
+) -> Dictionary:
+	var proof := {
+		"valid": false,
+		"pending": false,
+		"reason_code": "context_unavailable",
+		"context": context,
+		"context_id": context.context_id if context != null else 0,
+		"recovery_epoch": context.recovery_epoch if context != null else _native_epoch,
+		"peer_id": peer_id,
+		"peer_key": {},
+		"owner_key": {},
+		"captured_owner_key": {},
+		"native_present": false,
+		"native_connected": false,
+		"local_lobby_connected": false,
+		"protocol": "",
+		"kind": "",
+		"match_id": "",
+		"round": 0,
+		"phase": "",
+	}
+	var lobby: Variant = null
+	var peer: Variant = null
+	if context != null:
+		if context.service_owner == null or context.service_owner.get_ref() != self \
+			or context.recovery_epoch != _scoped_recovery_epoch \
+			or not _context_is_current(context) or context != _attached_context \
+			or context.lobby == null:
+			return proof
+		lobby = context.lobby
+		proof["kind"] = context.kind
+		proof["captured_owner_key"] = context.owner_key.duplicate()
+		proof["local_lobby_connected"] = not _lobby_is_disconnected(lobby)
+		if context.network == null or context.peer == null:
+			proof["reason_code"] = "transport_unavailable"
+			return proof
+		peer = context.peer
+	else:
+		if _attached_context != null or _lobby == null:
+			return proof
+		lobby = _lobby
+		proof["captured_owner_key"] = _legacy_owner_key.duplicate()
+		proof["local_lobby_connected"] = not _lobby_is_disconnected(lobby)
+		if _network == null or _peer == null:
+			proof["reason_code"] = "transport_unavailable"
+			return proof
+		peer = _peer
+
+	var local_lobby_connected := bool(proof["local_lobby_connected"])
+
+	if not (peer is MultiplayerPeer) \
+		or peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED \
+		or not peer.has_method("get_peer_entity_key"):
+		proof["reason_code"] = "transport_unavailable"
+		return proof
+	var peer_value: Variant = peer.get_peer_entity_key(peer_id)
+	var peer_key := _copy_entity_key(peer_value as Dictionary) \
+		if typeof(peer_value) == TYPE_DICTIONARY else {}
+	proof["peer_key"] = peer_key
+	if peer_key.is_empty():
+		proof["pending"] = true
+		proof["reason_code"] = "party_identity_pending"
+		return proof
+
+	var owner_value: Variant = _object_value(lobby, &"owner_entity_key", {})
+	var owner_key := _copy_entity_key(owner_value as Dictionary) \
+		if typeof(owner_value) == TYPE_DICTIONARY else {}
+	proof["owner_key"] = owner_key
+	if owner_key.is_empty():
+		var captured_owner: Dictionary = context.owner_key \
+			if context != null else _legacy_owner_key
+		proof["pending"] = captured_owner.is_empty()
+		proof["reason_code"] = "owner_pending" if bool(proof["pending"]) else "owner_changed"
+		return proof
+	var captured_owner: Dictionary = context.owner_key \
+		if context != null else _legacy_owner_key
+	if not captured_owner.is_empty() \
+		and not _entity_keys_match(captured_owner, owner_key):
+		proof["reason_code"] = "owner_changed"
+		return proof
+	if not _entity_keys_match(peer_key, owner_key):
+		proof["reason_code"] = "owner_peer_mismatch"
+		return proof
+
+	var members: Array[Dictionary] = []
+	var raw_members: Variant = _object_value(lobby, &"members", [])
+	if typeof(raw_members) == TYPE_ARRAY:
+		for raw_member: Variant in raw_members:
+			if raw_member == null:
+				continue
+			var key_value: Variant = _object_value(raw_member, &"entity_key", {})
+			var key := _copy_entity_key(key_value as Dictionary) \
+				if typeof(key_value) == TYPE_DICTIONARY else {}
+			if key.is_empty():
+				continue
+			var properties_value: Variant = _object_value(raw_member, &"properties", {})
+			members.append({
+				"key": key,
+				"connected": int(_object_value(raw_member, &"connection_status", 0)) == 1,
+				"properties": (properties_value as Dictionary).duplicate(true)
+					if typeof(properties_value) == TYPE_DICTIONARY else {},
+			})
+	var owner_member: Dictionary = {}
+	for member: Dictionary in members:
+		if _entity_keys_match(member.key, owner_key):
+			owner_member = member
+			break
+	if owner_member.is_empty():
+		proof["pending"] = members.is_empty()
+		proof["reason_code"] = "owner_member_pending" \
+			if bool(proof["pending"]) else "owner_member_missing"
+		return proof
+	proof["native_present"] = true
+	proof["native_connected"] = bool(owner_member.get("connected", false))
+	if not bool(proof["native_connected"]):
+		proof["reason_code"] = "owner_disconnected"
+		return proof
+
+	var search_value: Variant = _object_value(lobby, &"search_properties", {})
+	var search_properties: Dictionary = (search_value as Dictionary).duplicate(true) \
+		if typeof(search_value) == TYPE_DICTIONARY else {}
+	var properties_value: Variant = _object_value(lobby, &"properties", {})
+	var lobby_properties: Dictionary = (properties_value as Dictionary).duplicate(true) \
+		if typeof(properties_value) == TYPE_DICTIONARY else {}
+	var kind := String(search_properties.get(LOBBY_KIND_KEY, ""))
+	proof["kind"] = kind
+	var protocol := ""
+	if kind == LOBBY_KIND_ARRANGED:
+		var control := decode_arranged_control(lobby_properties)
+		if not bool(control.get("valid", false)):
+			var has_control := lobby_properties.has(MATCH_ID_MEMBER_KEY) \
+				or lobby_properties.has(ROUND_GENERATION_KEY) \
+				or lobby_properties.has(SESSION_PHASE_KEY)
+			proof["pending"] = not has_control
+			proof["reason_code"] = "arranged_control_pending" \
+				if bool(proof["pending"]) else "arranged_control_invalid"
+			return proof
+		proof["match_id"] = String(control.get("match_id", ""))
+		proof["round"] = int(control.get("round", 0))
+		proof["phase"] = String(control.get("phase", ""))
+		var owner_properties: Dictionary = owner_member.get("properties", {})
+		protocol = String(owner_properties.get(
+			MatchmakingService.PROTOCOL_MEMBER_KEY, ""))
+		var owner_match := String(owner_properties.get(MATCH_ID_MEMBER_KEY, ""))
+		if owner_match.is_empty():
+			proof["pending"] = true
+			proof["reason_code"] = "owner_match_pending"
+			return proof
+		if owner_match != String(proof["match_id"]):
+			proof["reason_code"] = "owner_match_mismatch"
+			return proof
+	else:
+		protocol = String(search_properties.get(NRProtocol.LOBBY_KEY, ""))
+	proof["protocol"] = protocol
+	if protocol.is_empty():
+		proof["pending"] = true
+		proof["reason_code"] = "owner_protocol_pending"
+		return proof
+	if not NRProtocol.is_compatible(protocol):
+		proof["reason_code"] = "owner_protocol_mismatch"
+		return proof
+	if not local_lobby_connected:
+		proof["reason_code"] = "local_lobby_disconnected"
+		return proof
+	proof["valid"] = true
+	proof["reason_code"] = ""
+	return proof
+
+
 func context_is_quiescent(context: LobbyContext) -> bool:
 	if context == null or context.service_owner == null:
 		return false
 	var owner: Variant = context.service_owner.get_ref()
 	if owner != self:
+		return false
+	if context.cleanup_pending or context.lobby_leave_cleanup_pending \
+		or context.transport_leave_cleanup_pending:
 		return false
 	if context.recovery_epoch < _scoped_recovery_epoch:
 		return true
@@ -2635,9 +3109,44 @@ func has_owned_work() -> bool:
 		or not _scoped_operations.is_empty()
 
 
+func _has_scoped_cleanup_debt() -> bool:
+	for context_value: Variant in _contexts.values():
+		var context := context_value as LobbyContext
+		if context != null and (
+			context.lobby_leave_cleanup_pending
+			or context.transport_leave_cleanup_pending):
+			return true
+	return false
+
+
+func _has_scoped_leave_pending() -> bool:
+	for context_value: Variant in _contexts.values():
+		var context := context_value as LobbyContext
+		if context != null and context.cleanup_pending:
+			return true
+	return false
+
+
 func drain_owned_work(deadline_msec: int) -> void:
-	while has_owned_work() and (deadline_msec <= 0 or _context_now_msec(_clock) < deadline_msec):
+	while _has_cleanup_execution() \
+			and (deadline_msec <= 0 or _context_now_msec(_clock) < deadline_msec):
 		await _sleep_with_clock(_clock, POLL_INTERVAL)
+
+
+func _has_cleanup_execution() -> bool:
+	if not _pending_native.is_empty() \
+			or (_chat != null and _chat.is_control_operation_pending()) \
+			or _owned_operation_count > 0 \
+			or not _scoped_operations.is_empty():
+		return true
+	for context_value: Variant in _contexts.values():
+		var context := context_value as LobbyContext
+		if context != null and (
+			context.pending_operations > 0
+			or context.lobby_leave_running
+			or context.transport_leave_running):
+			return true
+	return false
 
 
 static func encode_search_control(envelope: Dictionary) -> String:
@@ -2880,6 +3389,8 @@ func _settle_scoped_operation(
 	operation.diagnostic = diagnostic
 	operation.publication_permit = permit
 	operation.settled = true
+	if outcome != PartyResult.Outcome.OK:
+		_log_party_result(operation.kind, code, null, null, operation)
 	if operation.deadline_alarm != null:
 		if operation.deadline_alarm.has_method("cancel"):
 			operation.deadline_alarm.cancel()
@@ -2958,7 +3469,8 @@ func _discard_context(context: LobbyContext) -> void:
 	context.post_result = null
 	context.lobby_callback = Callable()
 	context.network_callback = Callable()
-	if context.pending_operations == 0 and _contexts.get(context.context_id) == context:
+	if context.pending_operations == 0 and not context.cleanup_pending \
+		and _contexts.get(context.context_id) == context:
 		_contexts.erase(context.context_id)
 		_owned_work_changed.emit()
 
@@ -2984,7 +3496,16 @@ func _retire_context_if_empty(context: LobbyContext) -> void:
 func _refresh_context_cleanup(context: LobbyContext) -> void:
 	if context == null:
 		return
-	context.cleanup_pending = context.lobby_leave_running or context.transport_leave_running
+	context.cleanup_pending = context.lobby_leave_running \
+		or context.transport_leave_running \
+		or context.lobby_leave_cleanup_pending \
+		or context.transport_leave_cleanup_pending
+	_notify_cleanup_state_changed()
+
+
+func _notify_cleanup_state_changed() -> void:
+	cleanup_state_changed.emit()
+	_owned_work_changed.emit()
 
 
 func _complete_scoped_recovery() -> void:
@@ -3012,19 +3533,20 @@ func _complete_scoped_recovery() -> void:
 		var context := context_value as LobbyContext
 		if context != null and context.recovery_epoch <= retired_epoch:
 			_invalidate_context_after_recovery(context)
-	_owned_work_changed.emit()
+	_notify_cleanup_state_changed()
 
 
 func _invalidate_context_after_recovery(context: LobbyContext) -> void:
 	if context == null:
 		return
-	var result := _context_success(context)
 	context.retired = true
 	context.operation_id += 1
 	context.active_permit = 0
 	context.left_lobby = true
 	context.left_transport = true
 	context.cleanup_pending = false
+	context.lobby_leave_cleanup_pending = false
+	context.transport_leave_cleanup_pending = false
 	context.lock_running = false
 	context.post_running = false
 	context.lock_result = null
@@ -3034,14 +3556,12 @@ func _invalidate_context_after_recovery(context: LobbyContext) -> void:
 	context.lobby = null
 	context.network = null
 	context.peer = null
+	if not context.lobby_leave_completed:
+		_settle_lobby_leave(context, PartyResult.Outcome.OK)
+	if not context.transport_leave_completed:
+		_settle_transport_leave(context, PartyResult.Outcome.OK)
 	if _contexts.get(context.context_id) == context:
 		_contexts.erase(context.context_id)
-	if context.lobby_leave_running:
-		context.lobby_leave_running = false
-		context.lobby_leave_finished.emit(result)
-	if context.transport_leave_running:
-		context.transport_leave_running = false
-		context.transport_leave_finished.emit(result)
 	context.lobby_callback = Callable()
 	context.network_callback = Callable()
 
@@ -3167,14 +3687,29 @@ func _on_context_lobby_changed(change: Variant, context: LobbyContext) -> void:
 		context.owner_key = current_owner.duplicate()
 	elif not context.owner_key.is_empty() \
 		and not _entity_keys_match(context.owner_key, current_owner):
+		var owner_reason := ""
+		if current_owner.is_empty():
+			owner_reason = "The match host left or is no longer available, so the match was closed." \
+				if context.kind == LOBBY_KIND_ARRANGED \
+				else "The group host left or is no longer available, so the group was closed."
+		else:
+			owner_reason = "The match host changed, so the match was closed." \
+				if context.kind == LOBBY_KIND_ARRANGED \
+				else "The group host changed, so the group was closed."
+		_log_party_context_failure(
+			context,
+			&"lobby_owner",
+			&"owner_unavailable" if current_owner.is_empty() else &"owner_changed",
+			_object_value(change, &"result", null))
 		_emit_context_lost(
 			context,
-			"The PlayFab lobby owner changed, so this online session can no longer continue.")
+			owner_reason)
 		return
 	if kind == LOBBY_CHANGE_DISCONNECTED:
 		var result: Variant = _object_value(change, &"result", null)
 		if not _result_ok(result):
-			push_warning("[Party] Scoped lobby disconnected: %s" % _reason(result))
+			_log_party_context_failure(
+				context, &"lobby_disconnected", &"context_disconnected", result)
 		_disconnect_context_lobby(context)
 		context.lobby = null
 		context.left_lobby = true
@@ -3205,11 +3740,17 @@ func _on_context_network_state_changed(change: Variant, context: LobbyContext) -
 			var state := int(_object_value(change, &"state", -1))
 			if state == NETWORK_STATE_DISCONNECTED or state == NETWORK_STATE_FAILED:
 				var reason := _change_reason(change)
+				_log_party_context_failure(
+					context,
+					&"scoped_network_state",
+					&"network_failed",
+					_object_value(change, &"result", null))
 				_disconnect_context_transport(context)
 				context.network = null
 				context.peer = null
 				network_lost.emit(
-					reason if not reason.is_empty() else "The match connection was lost.",
+					reason if not reason.is_empty() \
+						else "The match connection was lost.",
 					context)
 		&"NETWORK_CHANGE_PEER_JOINED":
 			peer_joined.emit(int(_object_value(change, &"peer_id", 0)))
@@ -3220,14 +3761,26 @@ func _on_context_network_state_changed(change: Variant, context: LobbyContext) -
 				_republish_context_descriptor(context)
 		&"NETWORK_CHANGE_DESTROYED":
 			var reason := _change_reason(change)
+			_log_party_context_failure(
+				context,
+				&"scoped_network_destroyed",
+				&"network_destroyed",
+				_object_value(change, &"result", null))
 			_disconnect_context_transport(context)
 			context.network = null
 			context.peer = null
 			network_lost.emit(
-				reason if not reason.is_empty() else "The match connection was closed.",
+				reason if not reason.is_empty() \
+					else "The match connection was closed.",
 				context)
 		&"NETWORK_CHANGE_ERROR":
-			party_failed.emit(_reason(_object_value(change, &"result", null)), context)
+			var result: Variant = _object_value(change, &"result", null)
+			_log_party_context_failure(
+				context,
+				&"scoped_network_state",
+				&"network_state_failed",
+				result)
+			party_failed.emit(_reason(result), context)
 
 
 func _republish_context_descriptor(context: LobbyContext) -> void:
@@ -3278,6 +3831,7 @@ func _ensure_context_initialized(
 					and not _scoped_operation_current(context, scoped_operation)):
 				return "Session cancelled."
 			if not _result_ok(party_init):
+				_capture_scoped_native_result(scoped_operation, party_init)
 				return "PlayFab Party could not start: %s" % _reason(party_init)
 			_party_initialized = true
 	if scoped_operation != null \
@@ -3297,6 +3851,7 @@ func _ensure_context_initialized(
 					and not _scoped_operation_current(context, scoped_operation)):
 				return "Session cancelled."
 			if not _result_ok(mp_init):
+				_capture_scoped_native_result(scoped_operation, mp_init)
 				return "PlayFab Lobby could not start: %s" % _reason(mp_init)
 			_multiplayer_initialized = true
 	return ""
@@ -3421,6 +3976,7 @@ func _run_context_lock(
 			"The lobby changed while its membership lock was updating.")
 		return
 	if not _result_ok(result):
+		_capture_scoped_native_result(operation, result)
 		_finish_scoped_operation(
 			operation,
 			context,
@@ -3513,6 +4069,7 @@ func _run_context_update(
 				"The lobby changed while it was being updated.")
 			return
 		if not _result_ok(shared_result):
+			_capture_scoped_native_result(operation, shared_result)
 			context.post_running = false
 			_finish_scoped_operation(
 				operation,
@@ -3561,6 +4118,7 @@ func _run_context_update(
 				"The lobby changed while it was being updated.")
 			return
 		if not _result_ok(member_result):
+			_capture_scoped_native_result(operation, member_result)
 			context.post_running = false
 			_finish_scoped_operation(
 				operation,
@@ -3655,6 +4213,144 @@ func _context_failure(
 	return result
 
 
+func _capture_scoped_native_result(
+	operation: ScopedOperation,
+	result: Variant
+) -> void:
+	if operation == null:
+		return
+	operation.native_code = _safe_result_code(result)
+	operation.native_hresult = _normalized_result_hresult(result)
+	operation.native_result_present = result != null
+	var party_error := _numeric_result_fact(result, "party_error")
+	var state_change := _numeric_result_fact(result, "state_change_result")
+	operation.native_party_error_available = bool(party_error.get("available", false))
+	operation.native_party_error = int(party_error.get("value", 0))
+	operation.native_state_change_available = bool(state_change.get("available", false))
+	operation.native_state_change_result = int(state_change.get("value", 0))
+	operation.native_detail_available = _party_cause_available(
+		result,
+		operation.native_code,
+		operation.native_hresult,
+		operation.native_party_error_available,
+		operation.native_state_change_available)
+
+
+func _log_party_context_failure(
+	context: LobbyContext,
+	stage: StringName,
+	domain_code: StringName,
+	result: Variant
+) -> void:
+	_log_party_result(stage, domain_code, result, context)
+
+
+func _log_party_result(
+	stage: StringName,
+	domain_code: StringName,
+	result: Variant,
+	context: LobbyContext = null,
+	operation: ScopedOperation = null
+) -> void:
+	var key := "%s:%s" % [String(stage), String(domain_code)]
+	if operation != null:
+		if operation.failure_logs.has(key):
+			return
+		operation.failure_logs[key] = true
+	elif context != null:
+		if context.failure_logs.has(key):
+			return
+		context.failure_logs[key] = true
+	var native_code := _safe_result_code(result)
+	var hresult := _normalized_result_hresult(result)
+	var party_error := _numeric_result_fact(result, "party_error")
+	var state_change := _numeric_result_fact(result, "state_change_result")
+	var party_error_available := bool(party_error.get("available", false))
+	var state_change_available := bool(state_change.get("available", false))
+	var party_error_value := int(party_error.get("value", 0))
+	var state_change_value := int(state_change.get("value", 0))
+	var detail := _party_cause_available(
+		result,
+		native_code,
+		hresult,
+		party_error_available,
+		state_change_available)
+	var result_present := result != null
+	if operation != null and result == null:
+		native_code = operation.native_code if not operation.native_code.is_empty() \
+			else "unavailable"
+		hresult = operation.native_hresult
+		result_present = operation.native_result_present
+		detail = operation.native_detail_available
+		party_error_available = operation.native_party_error_available
+		party_error_value = operation.native_party_error
+		state_change_available = operation.native_state_change_available
+		state_change_value = operation.native_state_change_result
+	var context_id := context.context_id if context != null else (
+		operation.context_id if operation != null else 0)
+	var operation_id := operation.id if operation != null else 0
+	var flow_epoch := context.flow_epoch if context != null else (
+		operation.flow_epoch if operation != null else 0)
+	var recovery_epoch := context.recovery_epoch if context != null else (
+		operation.recovery_epoch if operation != null else _scoped_recovery_epoch)
+	var cleanup := "pending" if (
+		(context != null and (context.cleanup_pending or context.pending_operations > 0))
+		or (operation != null and operation.cleanup_pending)) else "clear"
+	_emit_warning(
+		"[Party] failure stage=%s context=%d op=%d flow=%d recovery=%d reason=%s native_code=%s hresult=0x%08X party_error=%s state_change_result=%s cleanup=%s result_present=%s detail=%s" % [
+			String(stage),
+			context_id,
+			operation_id,
+			flow_epoch,
+			recovery_epoch,
+			String(domain_code),
+			native_code,
+			hresult,
+			str(party_error_value) if party_error_available else "unavailable",
+			str(state_change_value) if state_change_available else "unavailable",
+			cleanup,
+			result_present,
+			"available" if detail else "unavailable",
+		])
+
+
+func _safe_result_code(result: Variant) -> String:
+	var code := String(_object_value(result, &"code", "")).strip_edges().to_lower()
+	return code if code in SAFE_NATIVE_CODES else "unavailable"
+
+
+func _normalized_result_hresult(result: Variant) -> int:
+	return int(_object_value(result, &"hresult", 0)) & 0xFFFFFFFF
+
+
+func _numeric_result_fact(result: Variant, key: String) -> Dictionary:
+	var data: Variant = _object_value(result, &"data", null)
+	if typeof(data) != TYPE_DICTIONARY:
+		return {"available": false, "value": 0}
+	var value: Variant = (data as Dictionary).get(key)
+	if typeof(value) != TYPE_INT:
+		return {"available": false, "value": 0}
+	return {"available": true, "value": int(value)}
+
+
+func _party_cause_available(
+	result: Variant,
+	native_code: String,
+	hresult: int,
+	party_error_available: bool,
+	state_change_available: bool
+) -> bool:
+	if result == null:
+		return false
+	if native_code != "unavailable" or party_error_available or state_change_available:
+		return true
+	return hresult != 0 and hresult != E_FAIL_HRESULT
+
+
+func _emit_warning(message: String) -> void:
+	push_warning(message)
+
+
 func _party_sdk() -> Variant:
 	var pf: Variant = _playfab()
 	if pf == null:
@@ -3704,6 +4400,17 @@ func _object_value(value: Variant, property: StringName, fallback: Variant) -> V
 		return (value as Dictionary).get(property, fallback)
 	var resolved: Variant = value.get(property)
 	return fallback if resolved == null else resolved
+
+
+func _object_has_property(value: Variant, property: StringName) -> bool:
+	if value == null:
+		return false
+	if typeof(value) == TYPE_DICTIONARY:
+		return (value as Dictionary).has(property)
+	for property_info: Dictionary in value.get_property_list():
+		if StringName(property_info.get("name", "")) == property:
+			return true
+	return false
 
 
 func _user_entity_key(user: Variant) -> Dictionary:
@@ -3903,10 +4610,8 @@ func _join_failure(result: Variant, stage: String, fallback: String = JOIN_FAILE
 		# publishes. Masking makes both spellings land on the same key.
 		hresult = int(result.hresult) & 0xFFFFFFFF
 		message = JOIN_FAILURE_MESSAGES.get(hresult, fallback)
-	push_warning("[Party] %s failed (0x%08X, %s): %s" % [
-		stage, hresult, _code_of(result), _reason(result)])
+	_log_party_result(
+		StringName(stage.to_snake_case()),
+		&"join_failed",
+		result)
 	return message
-
-
-func _code_of(result: Variant) -> String:
-	return String(result.code) if result != null else "no result"

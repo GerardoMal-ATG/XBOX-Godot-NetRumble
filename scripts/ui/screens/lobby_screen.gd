@@ -873,13 +873,19 @@ func _flow_status_text() -> String:
 			MatchmakingFlow.Phase.ADMITTING_COHORT, MatchmakingFlow.Phase.COMMITTING_START]:
 		return "Match found. Joining\u2026"
 	if phase in [MatchmakingFlow.Phase.LEAVING, MatchmakingFlow.Phase.QUARANTINED]:
+		# The full restart-required reason is what every refused entry shows; this single
+		# line only says the cleanup will not finish on its own.
+		if not String(flow.get("cleanup_error", "")).is_empty():
+			return "Multiplayer cleanup failed. Restart the game to play online."
 		return "Leaving the group\u2026"
 	if phase == MatchmakingFlow.Phase.GATHERING:
 		if not bool(flow.get("synced", true)):
 			return "Joining the group\u2026"
 		var local := NetManager.local_player()
 		if local != null and not local.is_ready:
-			return ("%s " % reason if not reason.is_empty() else "") + "Press Ready to search for a match"
+			# The full reason -- which can carry a note about the queue's four-player limit --
+			# is shown once in its own dialog; this single line only says a search ended.
+			return ("The last search ended. " if not reason.is_empty() else "") + "Press Ready to search for a match"
 		return "Waiting for the group to ready up\u2026"
 	if phase in [MatchmakingFlow.Phase.GAMEPLAY, MatchmakingFlow.Phase.REMATCH_GATHERING] \
 			and not bool(flow.get("host_returned", true)):

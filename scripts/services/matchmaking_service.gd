@@ -1,6 +1,8 @@
 class_name MatchmakingService
 extends RefCounted
 
+signal cleanup_state_changed()
+
 ## PlayFab Matchmaking service boundary.
 ##
 ## Quick Match uses this boundary for group tickets, arranged lobbies, deadline ownership and
@@ -13,6 +15,10 @@ const EXPECTED_MATCH_COUNT := 4
 
 const FULL_PARTY_REASON_CODE := &"full_party_queue_max_rejected"
 const FULL_PARTY_REASON := "A full group of four cannot match in this four-player queue."
+const FULL_PARTY_GUIDANCE := "A full group of four also cannot match in this four-player queue. Use Host Match to play together."
+const TICKET_TOO_LARGE_HRESULT := 0x89235652
+const E_FAIL_HRESULT := 0x80004005
+const E_ABORT_HRESULT := 0x80004004
 const SEARCH_TIMEOUT_REASON_CODE := &"search_timeout"
 const SEARCH_TIMEOUT_REASON := "Matchmaking timed out before the service found a match."
 
@@ -22,11 +28,99 @@ const _JOIN_CONFIG_SENTINEL := "member_properties"
 const _TICKET_CONFIG_CLASS := "PlayFabMatchmakingTicketConfig"
 const _MEMBER_CLASS := "PlayFabMatchmakingMember"
 const _TICKET_CLASS := "PlayFabMatchTicket"
+const _LOBBY_CONFIG_CLASS := "PlayFabLobbyConfig"
+const _LOBBY_UPDATE_CONFIG_CLASS := "PlayFabLobbyUpdateConfig"
+const _LOBBY_CLASS := "PlayFabLobby"
+const _LOBBY_MEMBER_CLASS := "PlayFabLobbyMember"
+const _LOBBY_STATE_CHANGE_CLASS := "PlayFabLobbyStateChange"
+const _PARTY_CONFIG_CLASS := "PlayFabPartyConfig"
+const _PARTY_NETWORK_CLASS := "PlayFabPartyNetwork"
+const _PARTY_NETWORK_CHANGE_CLASS := "PlayFabPartyNetworkStateChange"
+const _PARTY_PEER_CLASS := "PlayFabPartyPeer"
+const _TICKET_STATE_CHANGE_CLASS := "PlayFabMatchTicketStateChange"
+const _RESULT_CLASS := "PlayFabResult"
+const _USER_CLASS := "PlayFabUser"
 
-const REQUIRED_JOIN_CONFIG_CAPABILITIES := [
-	["max_member_count", "max_players"],
-	["access_policy"],
-	["owner_migration_policy"],
+const REQUIRED_JOIN_CONFIG_PROPERTIES := [
+	"member_properties",
+	"max_member_count",
+	"access_policy",
+	"owner_migration_policy",
+	"restrict_invites_to_lobby_owner",
+]
+const REQUIRED_LOBBY_CONFIG_PROPERTIES := [
+	"max_players",
+	"access_policy",
+	"owner_migration_policy",
+	"search_properties",
+	"lobby_properties",
+	"member_properties",
+	"restrict_invites_to_lobby_owner",
+]
+const REQUIRED_LOBBY_UPDATE_PROPERTIES := [
+	"lobby_properties",
+	"search_properties",
+]
+const REQUIRED_LOBBY_PROPERTIES := [
+	"lobby_id",
+	"connection_string",
+	"owner_entity_key",
+	"max_member_count",
+	"members",
+	"properties",
+	"search_properties",
+	"access_policy",
+	"owner_migration_policy",
+	"membership_lock",
+	"restrict_invites_to_lobby_owner",
+]
+const REQUIRED_LOBBY_METHODS := [
+	"is_disconnected",
+	"is_owner",
+	"set_properties_async",
+	"set_member_properties_async",
+	"set_membership_lock_async",
+	"post_update_async",
+	"leave_async",
+]
+const REQUIRED_LOBBY_MEMBER_PROPERTIES := [
+	"entity_key",
+	"properties",
+	"connection_status",
+]
+const REQUIRED_LOBBY_STATE_CHANGE_PROPERTIES := [
+	"kind",
+	"result",
+]
+const REQUIRED_PARTY_CONFIG_PROPERTIES := [
+	"max_players",
+	"invitation_id",
+	"enable_voice_chat",
+	"enable_text_chat",
+	"enable_transcription",
+	"enable_translation",
+	"direct_peer_connectivity",
+]
+const REQUIRED_PARTY_NETWORK_PROPERTIES := [
+	"descriptor",
+	"local_peer",
+]
+const REQUIRED_PARTY_NETWORK_METHODS := ["leave_async"]
+const REQUIRED_PARTY_NETWORK_CHANGE_PROPERTIES := [
+	"kind",
+	"network",
+	"result",
+	"peer_id",
+	"state",
+]
+const REQUIRED_PARTY_PEER_METHODS := [
+	"get_peer_entity_key",
+	"get_connection_status",
+	"get_unique_id",
+]
+const REQUIRED_MATCHMAKING_MEMBER_PROPERTIES := [
+	"user",
+	"attributes",
 ]
 const REQUIRED_TICKET_CONFIG_PROPERTIES := [
 	"queue_name",
@@ -41,10 +135,52 @@ const REQUIRED_TICKET_PROPERTIES := [
 	"arranged_lobby_connection_string",
 ]
 const REQUIRED_TICKET_METHODS := ["cancel_async"]
+const REQUIRED_TICKET_STATE_CHANGE_PROPERTIES := ["result"]
+const REQUIRED_RESULT_PROPERTIES := [
+	"ok",
+	"data",
+	"hresult",
+	"code",
+	"message",
+]
+const REQUIRED_USER_METHODS := ["get_entity_key"]
 const REQUIRED_MULTIPLAYER_METHODS := [
+	"is_initialized",
+	"initialize_async",
+	"shutdown_async",
+	"create_lobby_async",
+	"join_lobby_async",
 	"create_match_ticket_async",
 	"join_match_ticket_async",
 	"join_arranged_lobby_async",
+]
+const REQUIRED_PARTY_METHODS := [
+	"is_initialized",
+	"initialize_async",
+	"shutdown_async",
+	"create_and_join_network_async",
+	"join_network_async",
+]
+const REQUIRED_PLAYFAB_METHODS := ["is_initialized"]
+const SAFE_NATIVE_CODES := [
+	"match_ticket_create_failed",
+	"match_ticket_failed",
+	"match_ticket_join_failed",
+	"match_ticket_create_start_failed",
+	"match_ticket_join_start_failed",
+	"match_ticket_cancel_start_failed",
+	"match_ticket_completed_failed",
+	"match_ticket_join_cancelled",
+	"invalid_match_ticket_config",
+	"invalid_match_ticket_member",
+	"invalid_join_match_ticket",
+	"invalid_match_ticket",
+	"invalid_user",
+	"lobby_state_finish_failed",
+	"matchmaking_state_finish_failed",
+	"not_initialized",
+	"shutting_down",
+	"cancelled",
 ]
 
 const STATUS_CREATING := 0
@@ -83,6 +219,7 @@ class TicketAttempt extends RefCounted:
 	signal progress_changed(attempt)
 	signal finished(attempt)
 	signal cleanup_changed(attempt)
+	signal native_terminal_changed(attempt)
 
 	var operation_id := 0
 	var multiplayer_epoch := 0
@@ -112,6 +249,8 @@ class TicketAttempt extends RefCounted:
 	var cancel_in_flight := false
 	var state_callback: Callable = Callable()
 	var deadline_alarm: Variant = null
+	var native_terminal_notified := false
+	var failure_logs: Dictionary = {}
 
 	func is_pending() -> bool:
 		return outcome == 0
@@ -173,9 +312,11 @@ func availability_reason() -> String:
 	if _playfab() == null:
 		return "Matchmaking needs the PlayFab extension, which this build does not have."
 	if not addon_supports_group_matchmaking():
-		return "This build's PlayFab addon cannot create group matchmaking tickets."
+		return "Quick Match needs PlayFab addon support for: %s." % \
+			", ".join(missing_group_matchmaking_capabilities())
 	if not addon_supports_arranged_config():
-		return "This build's PlayFab addon cannot configure a matched lobby, so Quick Match is unavailable."
+		return "Quick Match needs arranged-lobby support for: %s." % \
+			", ".join(missing_join_config_properties())
 	var profile := runtime_profile(NRTypes.GameModeType.DEATHMATCH)
 	if not bool(profile.get("ok", false)):
 		return String(profile.get("reason", ""))
@@ -223,19 +364,14 @@ func missing_join_config_properties() -> PackedStringArray:
 		return _missing_properties_cache.duplicate()
 
 	var missing := PackedStringArray()
-	if not ClassDB.class_exists(_JOIN_CONFIG_CLASS):
-		for capability: Array in REQUIRED_JOIN_CONFIG_CAPABILITIES:
-			missing.append(String(capability[0]))
+	if not _class_exists(_JOIN_CONFIG_CLASS):
+		for property_name: String in REQUIRED_JOIN_CONFIG_PROPERTIES:
+			missing.append("%s.%s" % [_JOIN_CONFIG_CLASS, property_name])
 	else:
 		var present := _class_property_names(_JOIN_CONFIG_CLASS)
-		for capability: Array in REQUIRED_JOIN_CONFIG_CAPABILITIES:
-			var satisfied := false
-			for name: String in capability:
-				if present.has(name):
-					satisfied = true
-					break
-			if not satisfied:
-				missing.append(String(capability[0]))
+		for property_name: String in REQUIRED_JOIN_CONFIG_PROPERTIES:
+			if not present.has(property_name):
+				missing.append("%s.%s" % [_JOIN_CONFIG_CLASS, property_name])
 
 	_missing_properties_cache = missing
 	_missing_properties_cached = true
@@ -247,22 +383,60 @@ func missing_group_matchmaking_capabilities() -> PackedStringArray:
 		return _missing_group_cache.duplicate()
 
 	var missing := PackedStringArray()
+	var playfab: Variant = _playfab()
+	if playfab == null:
+		missing.append("PlayFab")
+	else:
+		for method_name: String in REQUIRED_PLAYFAB_METHODS:
+			if not _target_has_method(playfab, method_name):
+				missing.append("PlayFab.%s" % method_name)
+
 	var multiplayer: Variant = _multiplayer()
 	if multiplayer == null:
 		missing.append("PlayFabMultiplayer")
 	else:
 		for method_name: String in REQUIRED_MULTIPLAYER_METHODS:
-			if not multiplayer.has_method(method_name):
-				missing.append(method_name)
+			if not _target_has_method(multiplayer, method_name):
+				missing.append("PlayFabMultiplayer.%s" % method_name)
 
+	var party: Variant = _party_runtime()
+	if party == null:
+		missing.append("PlayFabParty")
+	else:
+		for method_name: String in REQUIRED_PARTY_METHODS:
+			if not _target_has_method(party, method_name):
+				missing.append("PlayFabParty.%s" % method_name)
+
+	_collect_missing_class_properties(_LOBBY_CONFIG_CLASS, REQUIRED_LOBBY_CONFIG_PROPERTIES, missing)
+	_collect_missing_class_properties(_LOBBY_UPDATE_CONFIG_CLASS, REQUIRED_LOBBY_UPDATE_PROPERTIES, missing)
+	_collect_missing_class_properties(_LOBBY_CLASS, REQUIRED_LOBBY_PROPERTIES, missing)
+	_collect_missing_class_methods(_LOBBY_CLASS, REQUIRED_LOBBY_METHODS, missing)
+	_collect_missing_class_signals(_LOBBY_CLASS, ["state_changed"], missing)
+	_collect_missing_class_properties(_LOBBY_MEMBER_CLASS, REQUIRED_LOBBY_MEMBER_PROPERTIES, missing)
+	_collect_missing_class_properties(
+		_LOBBY_STATE_CHANGE_CLASS,
+		REQUIRED_LOBBY_STATE_CHANGE_PROPERTIES,
+		missing)
+	_collect_missing_class_properties(_PARTY_CONFIG_CLASS, REQUIRED_PARTY_CONFIG_PROPERTIES, missing)
+	_collect_missing_class_properties(_PARTY_NETWORK_CLASS, REQUIRED_PARTY_NETWORK_PROPERTIES, missing)
+	_collect_missing_class_methods(_PARTY_NETWORK_CLASS, REQUIRED_PARTY_NETWORK_METHODS, missing)
+	_collect_missing_class_signals(_PARTY_NETWORK_CLASS, ["state_changed"], missing)
+	_collect_missing_class_properties(
+		_PARTY_NETWORK_CHANGE_CLASS,
+		REQUIRED_PARTY_NETWORK_CHANGE_PROPERTIES,
+		missing)
+	_collect_missing_class_methods(_PARTY_PEER_CLASS, REQUIRED_PARTY_PEER_METHODS, missing)
 	_collect_missing_class_properties(_TICKET_CONFIG_CLASS, REQUIRED_TICKET_CONFIG_PROPERTIES, missing)
 	_collect_missing_class_properties(_TICKET_CLASS, REQUIRED_TICKET_PROPERTIES, missing)
 	_collect_missing_class_methods(_TICKET_CLASS, REQUIRED_TICKET_METHODS, missing)
-	if not ClassDB.class_exists(_MEMBER_CLASS):
-		missing.append(_MEMBER_CLASS)
-	elif not _class_property_names(_MEMBER_CLASS).has("user"):
-		missing.append("%s.user" % _MEMBER_CLASS)
-	if ClassDB.class_exists(_TICKET_CLASS):
+	_collect_missing_class_properties(_MEMBER_CLASS, REQUIRED_MATCHMAKING_MEMBER_PROPERTIES, missing)
+	_collect_missing_class_properties(
+		_TICKET_STATE_CHANGE_CLASS,
+		REQUIRED_TICKET_STATE_CHANGE_PROPERTIES,
+		missing)
+	_collect_missing_class_properties(_RESULT_CLASS, REQUIRED_RESULT_PROPERTIES, missing)
+	_collect_missing_class_methods(_USER_CLASS, REQUIRED_USER_METHODS, missing)
+	if _class_exists(_TICKET_CLASS):
 		var signals := _class_signal_names(_TICKET_CLASS)
 		if not signals.has("state_changed"):
 			missing.append("%s.state_changed" % _TICKET_CLASS)
@@ -274,7 +448,7 @@ func missing_group_matchmaking_capabilities() -> PackedStringArray:
 
 func blocking_dependency() -> String:
 	if not addon_supports_group_matchmaking():
-		return "The installed PlayFab addon is missing group matchmaking capabilities: %s." % \
+		return "The installed PlayFab addon is missing Quick Match capabilities: %s." % \
 			", ".join(missing_group_matchmaking_capabilities())
 	if not _join_config_recognised():
 		return "Could not inspect %s. The addon contract may have changed." % _JOIN_CONFIG_CLASS
@@ -294,6 +468,7 @@ func begin_create(spec: SearchSpec) -> TicketAttempt:
 			String(validation.get("reason", "The matchmaking request is invalid.")))
 		return attempt
 	_attempts.append(attempt)
+	cleanup_state_changed.emit()
 	_arm_deadline(attempt)
 	_create_ticket(attempt)
 	return attempt
@@ -309,6 +484,7 @@ func begin_join(spec: SearchSpec) -> TicketAttempt:
 			String(validation.get("reason", "The matchmaking request is invalid.")))
 		return attempt
 	_attempts.append(attempt)
+	cleanup_state_changed.emit()
 	_arm_deadline(attempt)
 	_join_ticket(attempt)
 	return attempt
@@ -342,6 +518,7 @@ func retire(attempt: TicketAttempt) -> void:
 			attempt,
 			attempt.create_in_flight or attempt.cancel_in_flight)
 	_prune_attempts()
+	cleanup_state_changed.emit()
 
 
 func multiplayer_invalidated(recovery_epoch: int) -> void:
@@ -366,12 +543,25 @@ func multiplayer_invalidated(recovery_epoch: int) -> void:
 		attempt.cancel_in_flight = false
 		_set_cleanup_pending(attempt, false)
 	_prune_attempts()
+	cleanup_state_changed.emit()
 
 
 func has_pending_cleanup() -> bool:
+	if has_orphaned_matched_cancel():
+		return true
 	for attempt: TicketAttempt in _attempts:
 		if attempt.create_in_flight or attempt.cancel_in_flight or attempt.cleanup_pending \
 			or (attempt.retired and attempt.ticket != null and not attempt.native_terminal):
+			return true
+	return false
+
+
+func has_orphaned_matched_cancel() -> bool:
+	for attempt: TicketAttempt in _attempts:
+		if attempt.multiplayer_epoch == _multiplayer_epoch \
+			and attempt.native_terminal \
+			and attempt.status == STATUS_MATCHED \
+			and attempt.cancel_in_flight:
 			return true
 	return false
 
@@ -391,11 +581,164 @@ static func reason_for_code(code: String) -> String:
 			return ""
 
 
+static func failure_outcome(
+	result: Variant,
+	stage: StringName,
+	owner: bool,
+	member_count: int
+) -> Dictionary:
+	var base_code := &"matchmaking_failed"
+	var base_reason := "Matchmaking failed before a match was found."
+	match stage:
+		&"create":
+			base_code = &"ticket_create_failed"
+			base_reason = "Could not create a matchmaking ticket."
+		&"join":
+			base_code = &"ticket_join_failed"
+			base_reason = "Could not join the group's matchmaking ticket."
+	var hresult := int(_failure_value(result, &"hresult", 0)) & 0xFFFFFFFF
+	if hresult == TICKET_TOO_LARGE_HRESULT:
+		if owner and member_count == EXPECTED_MATCH_COUNT:
+			return {
+				"reason_code": FULL_PARTY_REASON_CODE,
+				"reason": FULL_PARTY_REASON,
+				"confirmed_full_party": true,
+				"cause_available": true,
+				"result_present": result != null,
+			}
+		return {
+			"reason_code": &"ticket_group_too_large",
+			"reason": "The matchmaking group is too large for this queue.",
+			"confirmed_full_party": false,
+			"cause_available": true,
+			"result_present": result != null,
+		}
+	var native_code := String(_failure_value(result, &"code", "")).strip_edges()
+	var cause_available := _failure_cause_available(
+		result, hresult, native_code)
+	if not cause_available and owner and member_count == EXPECTED_MATCH_COUNT:
+		base_reason = "%s %s" % [base_reason, FULL_PARTY_GUIDANCE]
+	return {
+		"reason_code": base_code,
+		"reason": base_reason,
+		"confirmed_full_party": false,
+		"cause_available": cause_available,
+		"result_present": result != null,
+	}
+
+
+static func _failure_value(
+	result: Variant,
+	property: StringName,
+	fallback: Variant
+) -> Variant:
+	if result == null:
+		return fallback
+	if typeof(result) == TYPE_DICTIONARY:
+		return (result as Dictionary).get(property, fallback)
+	var value: Variant = result.get(property)
+	return fallback if value == null else value
+
+
+static func _failure_cause_available(
+	result: Variant,
+	hresult: int,
+	native_code: String
+) -> bool:
+	if result == null:
+		return false
+	var normalized_code := native_code.strip_edges().to_lower()
+	if hresult == TICKET_TOO_LARGE_HRESULT:
+		return true
+	if hresult == E_FAIL_HRESULT \
+			and normalized_code in [
+				"",
+				"match_ticket_create_failed",
+				"match_ticket_failed",
+				"match_ticket_join_failed",
+			]:
+		return false
+	if normalized_code in SAFE_NATIVE_CODES:
+		return true
+	return hresult != 0 and hresult != E_FAIL_HRESULT
+
+
 func _set_cleanup_pending(attempt: TicketAttempt, pending: bool) -> void:
 	if attempt == null or attempt.cleanup_pending == pending:
 		return
 	attempt.cleanup_pending = pending
 	attempt.cleanup_changed.emit(attempt)
+	cleanup_state_changed.emit()
+
+
+func _notify_native_terminal(attempt: TicketAttempt) -> void:
+	if attempt == null or attempt.native_terminal_notified:
+		return
+	attempt.native_terminal_notified = true
+	attempt.native_terminal_changed.emit(attempt)
+	cleanup_state_changed.emit()
+
+
+func _normalized_hresult(result: Variant) -> int:
+	return int(_object_value(result, &"hresult", 0)) & 0xFFFFFFFF
+
+
+func _cancel_completion_reason(result: Variant) -> StringName:
+	var code := String(_object_value(result, &"code", "")).strip_edges().to_lower()
+	var hresult := _normalized_hresult(result)
+	if code == "cancelled" and hresult == E_ABORT_HRESULT:
+		return &"cancel_released_by_reset"
+	return &"cancel_observer_aborted"
+
+
+func _log_ticket_failure(
+	attempt: TicketAttempt,
+	stage: StringName,
+	domain_code: StringName,
+	result: Variant,
+	status: int
+) -> void:
+	if attempt == null:
+		return
+	var key := "%s:%s:%d" % [String(stage), String(domain_code), status]
+	if attempt.failure_logs.has(key):
+		return
+	attempt.failure_logs[key] = true
+	var native_code := _safe_native_code(
+		String(_object_value(result, &"code", "")))
+	var hresult := _normalized_hresult(result)
+	var evidence := failure_outcome(
+		result,
+		stage,
+		attempt.owner,
+		attempt.frozen_members.size())
+	var detail := bool(evidence.get("cause_available", false))
+	var result_present := bool(evidence.get("result_present", false))
+	var cleanup := "pending" if attempt.cleanup_pending \
+		or attempt.create_in_flight or attempt.cancel_in_flight else "clear"
+	_emit_warning(
+		"[Matchmaking] failure stage=%s op=%d epoch=%d reason=%s native_code=%s hresult=0x%08X status=%d group=%d cleanup=%s result_present=%s detail=%s" % [
+			String(stage),
+			attempt.operation_id,
+			attempt.flow_epoch,
+			String(domain_code),
+			native_code,
+			hresult,
+			status,
+			attempt.frozen_members.size(),
+			cleanup,
+			result_present,
+			"available" if detail else "unavailable",
+		])
+
+
+func _safe_native_code(code: String) -> String:
+	var normalized := code.strip_edges().to_lower()
+	return normalized if normalized in SAFE_NATIVE_CODES else "unavailable"
+
+
+func _emit_warning(message: String) -> void:
+	push_warning(message)
 
 
 func _new_attempt(spec: SearchSpec, owner: bool) -> TicketAttempt:
@@ -468,6 +811,8 @@ func _capability_reason() -> String:
 		return "No matchmaking queue is configured."
 	if not addon_supports_group_matchmaking():
 		return "The installed PlayFab addon cannot create group matchmaking tickets."
+	if not addon_supports_arranged_config():
+		return blocking_dependency()
 	return ""
 
 
@@ -516,14 +861,14 @@ func _create_ticket(attempt: TicketAttempt) -> void:
 	if config == null:
 		attempt.create_in_flight = false
 		_finish_failed(attempt, &"ticket_config_unavailable",
-			"The PlayFab matchmaking ticket configuration is unavailable.", null)
+			"The PlayFab matchmaking ticket configuration is unavailable.", null, &"create")
 		return
 
 	var multiplayer: Variant = _multiplayer()
 	if multiplayer == null:
 		attempt.create_in_flight = false
 		_finish_failed(attempt, &"matchmaking_unavailable",
-			"The PlayFab matchmaking service is unavailable.", null)
+			"The PlayFab matchmaking service is unavailable.", null, &"create")
 		return
 
 	# REVIEW: Full-party submission is deliberate for xplat parity.
@@ -534,6 +879,7 @@ func _create_ticket(attempt: TicketAttempt) -> void:
 	# Until that change is approved, recover this rejection to gathering; do not silently host.
 	var result: Variant = await multiplayer.create_match_ticket_async(attempt.user, config)
 	attempt.create_in_flight = false
+	cleanup_state_changed.emit()
 	if not _attempt_epoch_current(attempt):
 		_prune_attempts()
 		return
@@ -547,7 +893,7 @@ func _create_ticket(attempt: TicketAttempt) -> void:
 	var ticket: Variant = _result_data(result)
 	if ticket == null:
 		_finish_failed(attempt, &"ticket_missing",
-			"The match service returned no matchmaking ticket.", result)
+			"The match service returned no matchmaking ticket.", result, &"create")
 		return
 	_attach_ticket(attempt, ticket)
 	_reconcile_ticket(attempt)
@@ -563,13 +909,13 @@ func _join_ticket(attempt: TicketAttempt) -> void:
 	if multiplayer == null:
 		attempt.create_in_flight = false
 		_finish_failed(attempt, &"matchmaking_unavailable",
-			"The PlayFab matchmaking service is unavailable.", null)
+			"The PlayFab matchmaking service is unavailable.", null, &"join")
 		return
 	var local_member: Variant = _make_local_member(attempt.user)
 	if local_member == null:
 		attempt.create_in_flight = false
 		_finish_failed(attempt, &"ticket_member_unavailable",
-			"The local matchmaking member could not be created.", null)
+			"The local matchmaking member could not be created.", null, &"join")
 		return
 	var result: Variant = await multiplayer.join_match_ticket_async(
 		attempt.user,
@@ -577,6 +923,7 @@ func _join_ticket(attempt: TicketAttempt) -> void:
 		_queue_name(),
 		[local_member])
 	attempt.create_in_flight = false
+	cleanup_state_changed.emit()
 	if not _attempt_epoch_current(attempt):
 		_prune_attempts()
 		return
@@ -586,12 +933,12 @@ func _join_ticket(attempt: TicketAttempt) -> void:
 		return
 	if not _result_ok(result):
 		_finish_failed(attempt, &"ticket_join_failed",
-			"Could not join the group's matchmaking ticket.", result)
+			"Could not join the group's matchmaking ticket.", result, &"join")
 		return
 	var ticket: Variant = _result_data(result)
 	if ticket == null:
 		_finish_failed(attempt, &"ticket_missing",
-			"The match service returned no matchmaking ticket.", result)
+			"The match service returned no matchmaking ticket.", result, &"join")
 		return
 	_attach_ticket(attempt, ticket)
 	_reconcile_ticket(attempt)
@@ -703,12 +1050,14 @@ func _observe_terminal_snapshot(
 				attempt.ticket, &"arranged_lobby_connection_string", ""))
 			attempt.native_terminal = true
 			_cancel_deadline_alarm(attempt)
+			_notify_native_terminal(attempt)
 			if attempt.is_pending():
 				attempt.settle(Outcome.MATCHED)
 			_complete_native_cleanup(attempt)
 		STATUS_CANCELLED:
 			attempt.native_terminal = true
 			_cancel_deadline_alarm(attempt)
+			_notify_native_terminal(attempt)
 			if attempt.is_pending():
 				attempt.settle(Outcome.CANCELLED)
 			_complete_native_cleanup(attempt)
@@ -716,19 +1065,24 @@ func _observe_terminal_snapshot(
 			var diagnostic := _ticket_diagnostic(attempt.ticket, terminal_result)
 			attempt.native_terminal = true
 			_cancel_deadline_alarm(attempt)
+			var failure := failure_outcome(
+				terminal_result,
+				&"terminal",
+				attempt.owner,
+				attempt.frozen_members.size())
+			var failure_code := StringName(failure.get(
+				"reason_code", &"matchmaking_failed"))
+			var failure_reason := String(failure.get(
+				"reason", "Matchmaking failed before a match was found."))
+			_log_ticket_failure(
+				attempt, &"terminal", failure_code, terminal_result, status)
+			_notify_native_terminal(attempt)
 			if attempt.is_pending():
-				if attempt.owner and attempt.frozen_members.size() == EXPECTED_MATCH_COUNT:
-					attempt.settle(
-						Outcome.FAILED,
-						FULL_PARTY_REASON_CODE,
-						FULL_PARTY_REASON,
-						diagnostic)
-				else:
-					attempt.settle(
-						Outcome.FAILED,
-						&"matchmaking_failed",
-						"Matchmaking failed before a match was found.",
-						diagnostic)
+				attempt.settle(
+					Outcome.FAILED,
+					failure_code,
+					failure_reason,
+					diagnostic)
 			elif not diagnostic.is_empty():
 				attempt.diagnostic = diagnostic if attempt.diagnostic.is_empty() \
 					else "%s | terminal=%s" % [attempt.diagnostic, diagnostic]
@@ -742,7 +1096,7 @@ func _complete_native_cleanup(attempt: TicketAttempt) -> void:
 	_disconnect_ticket(attempt)
 	_cancel_deadline_alarm(attempt)
 	attempt.ticket = null
-	_set_cleanup_pending(attempt, false)
+	_set_cleanup_pending(attempt, attempt.cancel_in_flight)
 	_prune_attempts()
 
 
@@ -756,16 +1110,28 @@ func _cancel_ticket(attempt: TicketAttempt) -> void:
 	_set_cleanup_pending(attempt, true)
 	var result: Variant = await attempt.ticket.cancel_async()
 	attempt.cancel_in_flight = false
+	cleanup_state_changed.emit()
 	if not _attempt_epoch_current(attempt):
 		_prune_attempts()
 		return
+	if attempt.ticket != null:
+		_observe_terminal_snapshot(attempt, result)
 	if attempt.native_terminal:
+		if not _result_ok(result) and attempt.status == STATUS_MATCHED:
+			_log_ticket_failure(
+				attempt,
+				&"cancel",
+				_cancel_completion_reason(result),
+				result,
+				attempt.status)
 		_complete_native_cleanup(attempt)
 		return
 	if not _result_ok(result):
 		var diagnostic := _diagnostic(result)
 		if attempt.is_pending():
 			_cancel_deadline_alarm(attempt)
+			_log_ticket_failure(
+				attempt, &"cancel", &"cancel_unconfirmed", result, attempt.status)
 			attempt.settle(
 				Outcome.FAILED,
 				&"cancel_unconfirmed",
@@ -779,6 +1145,8 @@ func _cancel_ticket(attempt: TicketAttempt) -> void:
 	if not attempt.native_terminal:
 		if attempt.is_pending():
 			_cancel_deadline_alarm(attempt)
+			_log_ticket_failure(
+				attempt, &"cancel", &"cancel_unconfirmed", result, attempt.status)
 			attempt.settle(
 				Outcome.FAILED,
 				&"cancel_unconfirmed",
@@ -808,6 +1176,12 @@ func _on_ticket_deadline(operation_id: int) -> void:
 	_set_cleanup_pending(
 		attempt,
 		attempt.ticket != null or attempt.create_in_flight)
+	_log_ticket_failure(
+		attempt,
+		&"timeout",
+		SEARCH_TIMEOUT_REASON_CODE,
+		null,
+		attempt.status)
 	attempt.settle(Outcome.TIMEOUT, SEARCH_TIMEOUT_REASON_CODE, SEARCH_TIMEOUT_REASON)
 	if attempt.ticket != null and not attempt.cancel_in_flight:
 		_cancel_after_timeout(attempt)
@@ -864,28 +1238,37 @@ func _cleanup_late_result(attempt: TicketAttempt, result: Variant) -> void:
 
 
 func _finish_create_failure(attempt: TicketAttempt, result: Variant) -> void:
-	if attempt.owner and attempt.frozen_members.size() == EXPECTED_MATCH_COUNT:
-		_finish_failed(attempt, FULL_PARTY_REASON_CODE, FULL_PARTY_REASON, result)
-	else:
-		_finish_failed(attempt, &"ticket_create_failed",
-			"Could not create a matchmaking ticket.", result)
+	var failure := failure_outcome(
+		result,
+		&"create",
+		attempt.owner,
+		attempt.frozen_members.size())
+	_finish_failed(
+		attempt,
+		StringName(failure.get("reason_code", &"ticket_create_failed")),
+		String(failure.get("reason", "Could not create a matchmaking ticket.")),
+		result,
+		&"create")
 
 
 func _finish_failed(
 	attempt: TicketAttempt,
 	code: StringName,
 	message: String,
-	result: Variant
+	result: Variant,
+	stage: StringName = &"failure"
 ) -> void:
 	_cancel_deadline_alarm(attempt)
 	if attempt.ticket == null and not attempt.create_in_flight and not attempt.cancel_in_flight:
 		attempt.native_terminal = true
 		_set_cleanup_pending(attempt, false)
+	_log_ticket_failure(attempt, stage, code, result, attempt.status)
 	attempt.settle(Outcome.FAILED, code, message, _diagnostic(result))
 	_prune_attempts()
 
 
 func _prune_attempts() -> void:
+	var removed := false
 	for index in range(_attempts.size() - 1, -1, -1):
 		var attempt := _attempts[index]
 		if attempt.create_in_flight or attempt.cancel_in_flight or attempt.cleanup_pending:
@@ -896,6 +1279,9 @@ func _prune_attempts() -> void:
 			continue
 		_cancel_deadline_alarm(attempt)
 		_attempts.remove_at(index)
+		removed = true
+	if removed:
+		cleanup_state_changed.emit()
 
 
 func _has_live_attempt() -> bool:
@@ -908,7 +1294,8 @@ func _has_live_attempt() -> bool:
 
 func _ticket_diagnostic(ticket: Variant, terminal_result: Variant = null) -> String:
 	var result_diagnostic := _diagnostic(terminal_result)
-	var properties: Variant = _object_value(ticket, &"properties", {})
+	var properties: Variant = _object_value(ticket, &"properties", {}) \
+		if _object_has_property(ticket, &"properties") else {}
 	var property_diagnostic := JSON.stringify(properties) \
 		if typeof(properties) == TYPE_DICTIONARY else String(properties)
 	if result_diagnostic.is_empty():
@@ -924,13 +1311,17 @@ func _account_is_current(generation: int) -> bool:
 
 
 func _join_config_recognised() -> bool:
-	return ClassDB.class_exists(_JOIN_CONFIG_CLASS) \
+	return _class_exists(_JOIN_CONFIG_CLASS) \
 		and _class_property_names(_JOIN_CONFIG_CLASS).has(_JOIN_CONFIG_SENTINEL)
+
+
+func _class_exists(class_name_value: String) -> bool:
+	return ClassDB.class_exists(class_name_value)
 
 
 func _class_property_names(class_name_value: String) -> Dictionary:
 	var names: Dictionary = {}
-	if not ClassDB.class_exists(class_name_value):
+	if not _class_exists(class_name_value):
 		return names
 	for property: Dictionary in ClassDB.class_get_property_list(class_name_value, false):
 		names[String(property.get("name", ""))] = true
@@ -939,7 +1330,7 @@ func _class_property_names(class_name_value: String) -> Dictionary:
 
 func _class_method_names(class_name_value: String) -> Dictionary:
 	var names: Dictionary = {}
-	if not ClassDB.class_exists(class_name_value):
+	if not _class_exists(class_name_value):
 		return names
 	for method: Dictionary in ClassDB.class_get_method_list(class_name_value, false):
 		names[String(method.get("name", ""))] = true
@@ -948,7 +1339,7 @@ func _class_method_names(class_name_value: String) -> Dictionary:
 
 func _class_signal_names(class_name_value: String) -> Dictionary:
 	var names: Dictionary = {}
-	if not ClassDB.class_exists(class_name_value):
+	if not _class_exists(class_name_value):
 		return names
 	for signal_info: Dictionary in ClassDB.class_get_signal_list(class_name_value, false):
 		names[String(signal_info.get("name", ""))] = true
@@ -960,7 +1351,7 @@ func _collect_missing_class_properties(
 	required: Array,
 	missing: PackedStringArray
 ) -> void:
-	if not ClassDB.class_exists(class_name_value):
+	if not _class_exists(class_name_value):
 		missing.append(class_name_value)
 		return
 	var present := _class_property_names(class_name_value)
@@ -974,7 +1365,7 @@ func _collect_missing_class_methods(
 	required: Array,
 	missing: PackedStringArray
 ) -> void:
-	if not ClassDB.class_exists(class_name_value):
+	if not _class_exists(class_name_value):
 		if not missing.has(class_name_value):
 			missing.append(class_name_value)
 		return
@@ -982,6 +1373,25 @@ func _collect_missing_class_methods(
 	for method_name: String in required:
 		if not present.has(method_name):
 			missing.append("%s.%s" % [class_name_value, method_name])
+
+
+func _collect_missing_class_signals(
+	class_name_value: String,
+	required: Array,
+	missing: PackedStringArray
+) -> void:
+	if not _class_exists(class_name_value):
+		if not missing.has(class_name_value):
+			missing.append(class_name_value)
+		return
+	var present := _class_signal_names(class_name_value)
+	for signal_name: String in required:
+		if not present.has(signal_name):
+			missing.append("%s.%s" % [class_name_value, signal_name])
+
+
+func _target_has_method(target: Variant, method_name: String) -> bool:
+	return target is Object and target.has_method(method_name)
 
 
 func _copy_member_keys(values: Array[Dictionary]) -> Array[Dictionary]:
@@ -1025,6 +1435,15 @@ func _multiplayer() -> Variant:
 	return pf.get("multiplayer")
 
 
+func _party_runtime() -> Variant:
+	var pf: Variant = _playfab()
+	if pf == null:
+		return null
+	if typeof(pf) == TYPE_DICTIONARY:
+		return (pf as Dictionary).get("party")
+	return pf.get("party")
+
+
 func _playfab() -> Variant:
 	return PlatformAccess.playfab()
 
@@ -1060,6 +1479,17 @@ func _object_value(value: Variant, property: StringName, fallback: Variant) -> V
 		return (value as Dictionary).get(property, fallback)
 	var resolved: Variant = value.get(property)
 	return fallback if resolved == null else resolved
+
+
+func _object_has_property(value: Variant, property: StringName) -> bool:
+	if value == null:
+		return false
+	if typeof(value) == TYPE_DICTIONARY:
+		return (value as Dictionary).has(property)
+	for property_info: Dictionary in value.get_property_list():
+		if StringName(property_info.get("name", "")) == property:
+			return true
+	return false
 
 
 func _now_msec(clock: OnlineFlowClock) -> int:

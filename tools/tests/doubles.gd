@@ -178,24 +178,121 @@ class PlatformIdentity extends IdentityService:
 		return sdk
 
 
+## A chat control the double holds, keyed as the addon keys it: the local control of the user
+## that created it, or a remote control a case seats in the mesh.
+class ChatControl extends RefCounted:
+	var user: Variant = null
+	var entity_key: Dictionary = {}
+	var local := false
+
+
+## PlayFabPartyChat as ChatService uses it. One local control per user that created one,
+## found by that user; remote controls only where a case seats them. A call with no local
+## control, or naming a key no control in the mesh has, fails as the addon's does.
 class ChatSDK extends RefCounted:
+	const E_NOT_VALID_STATE := -2147019873
+	const E_INVALIDARG := -2147024809
 	signal released()
+	signal destroy_released()
 	signal chat_control_added()
 	signal chat_control_removed()
-	signal audio_muted_changed()
+	signal audio_muted_changed(entity_key: Dictionary, muted: bool)
 	signal text_message_received()
 	var blocked := false
+	## Holds a destruction at the SDK boundary until destroy_released, as a native
+	## destruction still completing does.
+	var hold_destroy := false
 	var calls: Array[String] = []
+	var controls: Array[ChatControl] = []
 
 	func create_local_chat_control_async(user: Variant, _cfg: Variant) -> Dictionary:
 		calls.append("create:" + user.xuid)
 		if blocked:
 			await released
-		return {"ok": true}
+		var control: ChatControl = get_local_chat_control(user)
+		if control == null:
+			control = ChatControl.new()
+			control.user = user
+			control.local = true
+			var key: Variant = user.get("entity_key")
+			control.entity_key = (key as Dictionary).duplicate() if typeof(key) == TYPE_DICTIONARY else {}
+			controls.append(control)
+		return {"ok": true, "data": control}
 
 	func destroy_local_chat_control_async(user: Variant) -> Dictionary:
 		calls.append("destroy:" + user.xuid)
-		return {"ok": true}
+		if hold_destroy:
+			await destroy_released
+		var control: ChatControl = get_local_chat_control(user)
+		if control != null:
+			controls.erase(control)
+		return {"ok": true, "data": null}
+
+	func get_local_chat_control(user: Variant) -> ChatControl:
+		if user == null:
+			return null
+		for control: ChatControl in controls:
+			if control.local and control.user == user:
+				return control
+		return null
+
+	func get_chat_control(entity_key: Dictionary) -> ChatControl:
+		for control: ChatControl in controls:
+			if not control.entity_key.is_empty() \
+					and String(control.entity_key.get("id", "")) == String(entity_key.get("id", "")) \
+					and String(control.entity_key.get("type", "")) == String(entity_key.get("type", "")):
+				return control
+		return null
+
+	func get_remote_entity_keys() -> Array:
+		var keys: Array = []
+		for control: ChatControl in controls:
+			if not control.local:
+				keys.append(control.entity_key.duplicate())
+		return keys
+
+	## Seats a remote player's chat control in the mesh, as the addon surfaces one.
+	func add_remote_control(entity_key: Dictionary) -> void:
+		if get_chat_control(entity_key) != null:
+			return
+		var control := ChatControl.new()
+		control.entity_key = entity_key.duplicate()
+		controls.append(control)
+
+	func set_audio_muted_async(entity_key: Dictionary, muted: bool) -> Dictionary:
+		var refused := _refusal("set_audio_muted_async", [entity_key])
+		if not refused.is_empty():
+			return refused
+		audio_muted_changed.emit(entity_key, muted)
+		return {"ok": true, "data": null}
+
+	func set_text_muted_async(entity_key: Dictionary, _muted: bool) -> Dictionary:
+		var refused := _refusal("set_text_muted_async", [entity_key])
+		return refused if not refused.is_empty() else {"ok": true, "data": null}
+
+	func set_chat_permissions_async(entity_key: Dictionary, _permissions: int) -> Dictionary:
+		var refused := _refusal("set_chat_permissions_async", [entity_key])
+		return refused if not refused.is_empty() else {"ok": true, "data": null}
+
+	func send_text_async(_message: String, target_entity_keys: Array = [], _config: Variant = null) -> Dictionary:
+		var refused := _refusal("send_text_async", target_entity_keys)
+		return refused if not refused.is_empty() else {"ok": true, "data": null}
+
+	## The addon's refusals, in its order: no local control on a network, then a key naming no
+	## control in the mesh.
+	func _refusal(method: String, entity_keys: Array) -> Dictionary:
+		var local := false
+		for control: ChatControl in controls:
+			local = local or control.local
+		if not local:
+			return {"ok": false, "code": "party_peer_not_connected", "hresult": E_NOT_VALID_STATE,
+				"message": "PlayFabPartyChat.%s() requires a connected Party network with a local chat control." % method}
+		for key_value: Variant in entity_keys:
+			var key: Dictionary = key_value as Dictionary if typeof(key_value) == TYPE_DICTIONARY else {}
+			if get_chat_control(key) == null:
+				return {"ok": false, "code": "party_peer_not_connected", "hresult": E_INVALIDARG,
+					"message": "PlayFabPartyChat.%s() unknown entity key %s." % [method, String(key.get("id", ""))]}
+		return {}
 
 
 class Chat extends ChatService:

@@ -142,7 +142,7 @@ missed roster entry leaves a peer with a permanently stale view.
 | `_request_player_identity` | host → client | reliable | Host asks a newly connected client to submit its `PlayerState` |
 | `_submit_player_identity` | client → host | reliable | Client delivers its `PlayerState` dict plus its `NRProtocol.version_string()`; host overwrites `entity_id` from Party's authenticated key. In an arranged [matchmaking](matchmaking.md) session a guest sends it only once its host is proven to be the lobby's current owner -- the pinned owner's authenticated key, still the lobby's owner, with a compatible protocol and this match's id -- and a known disagreement ends the attempt instead |
 | `_reject_join` | host → client | reliable | Host refuses a peer and gives the reason; the client treats it as an end of session (match already started, or a [protocol mismatch](#protocol-version)) |
-| `_accept_join` | host → client | reliable | Host has admitted the peer and already replayed the roster and mode to it. This — not the transport attaching — is what resolves the client's pending join |
+| `_accept_join` | host → client | reliable | Host has admitted the peer and, after its identity, replayed the whole roster and mode to it again. This — not the transport attaching — is what resolves the client's pending join. It counts only from a host the client has proven to own the lobby it joined, checked again when the join is consumed; for a rematch replacement the round it was invited into must still be gathering |
 | `_receive_join_admission` | host → all | reliable | Host's admission gate opened or closed, so every member can retire or republish its own XBOX activity |
 | `_receive_roster_entry` | host → all | reliable | Host fans out one (possibly color-adjusted) `PlayerState` to every peer |
 | `_receive_player_left` | host → all | reliable | Notifies every peer that a player has disconnected |
@@ -152,6 +152,20 @@ missed roster entry leaves a peer with a permanently stale view.
 | `_receive_appearance` | host → all | reliable | Host fans out a confirmed color/style pair |
 | `_submit_player_loaded` | client → host | reliable | Client reports its gameplay scene is ready |
 | `_receive_player_loaded` | host → all | reliable | Host fans out the loaded flag; MatchDirector waits for all before unblocking |
+
+A guest acts on a host message, and answers `_request_player_identity`, only while its host is
+the current owner of the lobby the guest joined -- before admission and after it, on a hosted
+lobby or a staging lobby as on an arranged one, with or without a matchmaking group. Anything
+else from peer 1 is dropped on arrival. Admission is not a lease: a lobby whose owner changed,
+went away or is no longer connected ends the join, or the admitted session, once, with a reason.
+A lobby that shows no owner after the session has had one has lost its host. While the lobby's
+details have not arrived yet, the guest sends nothing and waits, within the join's own time. One
+exception is deliberate: when only this player's own connection to a hosted, code or invite lobby
+drops while the Party network stays up, an already admitted session carries on under the same
+host, for as long as peer 1 is still that host. A join not yet admitted is refused at once in that
+state, and a matchmaking lobby's loss still ends its group or match. The host's replay of the
+roster and mode just before `_accept_join` is what a guest that dropped the greeting relies on. It
+uses the existing RPCs and payloads, so the protocol version is the same.
 
 ### Matchmaking group
 

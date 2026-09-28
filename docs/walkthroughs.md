@@ -151,7 +151,7 @@ replacement to the round.
 **Unavailable / failure:** When the queue, the PlayFab addon's matchmaking support or the
 four-player Deathmatch profile is missing, the **Matchmaking** row still takes focus and shows
 that reason instead of starting anything. A full group of four is refused by the queue and
-restored with its reason; see [Known issues](known-issues.md). A player lost before the first
+restored with a reason and a note to use Host Match; see [Known issues](known-issues.md). A player lost before the first
 game runs cancels it with the reason. An invite into a match that is playing, or into an
 unrecognized lobby, is refused.
 

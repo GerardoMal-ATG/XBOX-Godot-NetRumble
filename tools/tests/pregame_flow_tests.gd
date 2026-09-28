@@ -19,6 +19,7 @@ extends RefCounted
 const Doubles := preload("res://tools/tests/doubles.gd")
 const Review := preload("res://tools/tests/review_lifecycle.gd")
 const TransportPeer := preload("res://tools/tests/pregame_transport_peer.gd")
+const ServiceDoubles := preload("res://tools/tests/pregame_service_doubles.gd")
 
 const STAGING_ID := "staging-lobby"
 const ARRANGED_ID := "arranged-lobby"
@@ -82,6 +83,16 @@ class FlowParty extends PartyService:
 	## Whether a context's captured work is quiescent, by context id. Quiescent otherwise.
 	var fake_quiescent: Dictionary = {}
 	var fake_fail_marker_post := false
+	## The hosted lobby's owner facts, for a guest whose joined lobby is the hosted one: its
+	## current owner, the owner it was joined under, and whether that owner is connected.
+	var fake_hosted_owner: Dictionary = {}
+	var fake_hosted_owner_baseline: Dictionary = {}
+	var fake_hosted_owner_connected := true
+	## The protocol a staging or hosted lobby advertises; empty means this build's.
+	var fake_lobby_protocol := ""
+	## Lobbies whose own local connection is gone, by context id (0 for the hosted lobby),
+	## as the service's proof reports them: its retained facts unchanged.
+	var fake_lobby_disconnected: Dictionary = {}
 
 	func fake_setup(local: Dictionary) -> void:
 		fake_local_key = local.duplicate()
@@ -200,6 +211,10 @@ class FlowParty extends PartyService:
 		fake_deadlines["join_transport"] = deadline_msec
 		var result := _fake_result(context)
 		result.peer = fake_arranged_peer
+		# The arranged network was created by the arranged lobby's owner, so that owner is peer
+		# 1 on it. A case can still say otherwise afterwards.
+		if context != null:
+			fake_peer_keys[NetManager.HOST_PEER_ID] = (fake_owners.get(context.context_id, {}) as Dictionary).duplicate()
 		return result
 
 	# The arranged join the matched handoff starts. Refused unless a case asks for it, so
@@ -339,6 +354,95 @@ class FlowParty extends PartyService:
 		proof.merge(fake_proof_override.get(peer_id, {}), true)
 		return proof
 
+	## The joined lobby's owner proof, shaped like the service's and judged in the same order
+	## with the same reason codes, over the same fakes the snapshot reads. A null context is
+	## the hosted lobby. `fake_proof_pending` and `fake_proof_override` for the peer hold a
+	## case's facts back or bend them, as they do the member proof. A unit double for
+	## NetManager's consumers only: the service's own proof is exercised against the real
+	## PartyService.
+	func joined_owner_proof(context: PartyService.LobbyContext = null, peer_id: int = 1) -> Dictionary:
+		var context_id := context.context_id if context != null else 0
+		var proof := {
+			"valid": false, "pending": false, "reason_code": "", "context": context,
+			"context_id": context_id, "recovery_epoch": 0,
+			"peer_id": peer_id, "peer_key": {}, "owner_key": {}, "native_present": false,
+			"native_connected": false, "protocol": "", "kind": context.kind if context != null else "",
+			"match_id": "", "round": 0, "phase": "",
+			"local_lobby_connected": not bool(fake_lobby_disconnected.get(context_id, false)),
+			"captured_owner_key": fake_hosted_owner_baseline.duplicate() if context == null else context.owner_key.duplicate(),
+		}
+		proof["reason_code"] = _fake_owner_verdict(context, peer_id, proof)
+		if bool(fake_proof_pending.get(peer_id, false)):
+			proof["pending"] = true
+			proof["reason_code"] = "owner_pending"
+		# A lobby whose own connection is gone is reported last, as the service does: after any
+		# contradiction or missing fact its retained facts still show.
+		if String(proof["reason_code"]).is_empty() and not bool(proof["pending"]) \
+				and not bool(proof["local_lobby_connected"]):
+			proof["reason_code"] = "local_lobby_disconnected"
+		proof["valid"] = String(proof["reason_code"]).is_empty() and not bool(proof["pending"])
+		proof.merge(fake_proof_override.get(peer_id, {}), true)
+		return proof
+
+	## Fills `proof` with what the fakes say and returns the first reason it is not valid.
+	func _fake_owner_verdict(context: PartyService.LobbyContext, peer_id: int, proof: Dictionary) -> String:
+		var peer_key: Dictionary = (fake_peer_keys.get(peer_id, {}) as Dictionary).duplicate()
+		proof["peer_key"] = peer_key
+		if peer_key.is_empty():
+			proof["pending"] = true
+			return "party_identity_pending"
+		var owner: Dictionary = fake_hosted_owner.duplicate() if context == null \
+			else (fake_owners.get(context.context_id, {}) as Dictionary).duplicate()
+		var captured: Dictionary = fake_hosted_owner_baseline.duplicate() if context == null else context.owner_key.duplicate()
+		proof["owner_key"] = owner
+		if owner.is_empty():
+			proof["pending"] = captured.is_empty()
+			return "owner_pending" if captured.is_empty() else "owner_changed"
+		if not captured.is_empty() and MatchmakingFlow.fingerprint(captured) != MatchmakingFlow.fingerprint(owner):
+			return "owner_changed"
+		if MatchmakingFlow.fingerprint(peer_key) != MatchmakingFlow.fingerprint(owner):
+			return "owner_peer_mismatch"
+		var member: Dictionary = {}
+		if context == null:
+			member = {"key": owner.duplicate(), "connected": fake_hosted_owner_connected, "properties": {}}
+		else:
+			member = _fake_member(context, owner)
+			if member.is_empty():
+				proof["pending"] = (fake_members.get(context.context_id, []) as Array).is_empty()
+				return "owner_member_pending" if bool(proof["pending"]) else "owner_member_missing"
+		proof["native_present"] = true
+		proof["native_connected"] = bool(member.get("connected", false))
+		if not bool(proof["native_connected"]):
+			return "owner_disconnected"
+		var protocol := fake_lobby_protocol if not fake_lobby_protocol.is_empty() else NRProtocol.version_string()
+		if context != null and context.kind == PartyService.LOBBY_KIND_ARRANGED:
+			var lobby_properties: Dictionary = fake_lobby_properties.get(context.context_id, {})
+			var control: Dictionary = PartyService.decode_arranged_control(lobby_properties)
+			if not bool(control.get("valid", false)):
+				var has_control := lobby_properties.has(PartyService.MATCH_ID_MEMBER_KEY) \
+					or lobby_properties.has(PartyService.ROUND_GENERATION_KEY) or lobby_properties.has(PartyService.SESSION_PHASE_KEY)
+				proof["pending"] = not has_control
+				return "arranged_control_invalid" if has_control else "arranged_control_pending"
+			proof["match_id"] = String(control.get("match_id", ""))
+			proof["round"] = int(control.get("round", 0))
+			proof["phase"] = String(control.get("phase", ""))
+			var raw_properties: Variant = member.get("properties", {})
+			var properties: Dictionary = raw_properties as Dictionary if typeof(raw_properties) == TYPE_DICTIONARY else {}
+			protocol = String(properties.get(MatchmakingService.PROTOCOL_MEMBER_KEY, ""))
+			var owner_match := String(properties.get(PartyService.MATCH_ID_MEMBER_KEY, ""))
+			if owner_match.is_empty():
+				proof["pending"] = true
+				return "owner_match_pending"
+			if owner_match != String(proof["match_id"]):
+				return "owner_match_mismatch"
+		proof["protocol"] = protocol
+		if protocol.is_empty():
+			proof["pending"] = true
+			return "owner_protocol_pending"
+		if not NRProtocol.is_compatible(protocol):
+			return "owner_protocol_mismatch"
+		return ""
+
 	func lobby_id(context: PartyService.LobbyContext) -> String:
 		if context == fake_staging:
 			return STAGING_ID
@@ -392,6 +496,12 @@ class FlowMatchmaking extends MatchmakingService:
 	## A ticket the service refuses before any exists -- the full-four rejection's
 	## immediate form: {"code": StringName, "text": String}.
 	var fake_reject_create: Dictionary = {}
+	## A result shaped the way the addon hands the service a failed creation. When set, the
+	## owner's ticket fails with whatever the service's own classifier makes of it.
+	var fake_create_result: Variant = null
+	## Whether the service starts a native cancel when a live attempt is stopped or retired:
+	## the attempt then carries that waiter, and owes native cleanup until it resolves.
+	var fake_cancel_waits := false
 	## The service's reason Quick Match is unavailable; empty while it is available. Each
 	## production reason is the service suite's case: this lets a flow case prove that the
 	## entry points repeat whichever reason the service gives.
@@ -406,23 +516,41 @@ class FlowMatchmaking extends MatchmakingService:
 		if not fake_reject_create.is_empty():
 			attempt.settle(MatchmakingService.Outcome.FAILED, fake_reject_create.get("code", &""),
 				String(fake_reject_create.get("text", "")))
+		elif fake_create_result != null:
+			fake_classify(attempt, fake_create_result, &"create")
 		return attempt
+
+	## Settles `attempt` failed the way the service classifies `result` at `stage`: its own
+	## classifier, over the same owner flag and group size.
+	func fake_classify(attempt: MatchmakingService.TicketAttempt, result: Variant, stage: StringName) -> void:
+		var outcome := MatchmakingService.failure_outcome(result, stage, attempt.owner, attempt.frozen_members.size())
+		attempt.settle(MatchmakingService.Outcome.FAILED, StringName(outcome.get("reason_code", "")),
+			String(outcome.get("reason", "")))
 
 	func begin_join(spec: MatchmakingService.SearchSpec) -> MatchmakingService.TicketAttempt:
 		fake_joins.append(spec)
 		return _fake_attempt(spec, false)
 
 	# The service side of a confirmed Multiplayer reset. Records the order it was reached
-	# in: the flow must already have been retired by then.
+	# in -- the flow must already have been retired by then -- and discharges what the old
+	# runtime owed: a cancel waiter the binding never answered goes with the runtime.
 	func multiplayer_invalidated(recovery_epoch: int) -> void:
 		var flow: MatchmakingFlow = NetManager._flow
 		fake_log.append("invalidated:%d:%s" % [recovery_epoch, "retired" if flow == null or flow.retired else "live"])
+		for attempt: MatchmakingService.TicketAttempt in fake_attempts:
+			if attempt.cancel_in_flight or attempt.cleanup_pending:
+				attempt.cancel_in_flight = false
+				attempt.native_terminal = true
+				attempt.cleanup_pending = false
+				attempt.cleanup_changed.emit(attempt)
 
 	func request_cancel(attempt: MatchmakingService.TicketAttempt) -> void:
 		fake_cancels.append(attempt)
+		_fake_start_cancel(attempt)
 
 	# Retirement as the service performs it: marked retired before a still-pending attempt
-	# settles as superseded, with native cleanup left owed when a case says so.
+	# settles as superseded, with native cleanup left owed when a case says so -- or while a
+	# native cancel it starts has not answered.
 	func retire(attempt: MatchmakingService.TicketAttempt) -> void:
 		if attempt == null:
 			return
@@ -432,14 +560,39 @@ class FlowMatchmaking extends MatchmakingService:
 			return
 		attempt.retired = true
 		if attempt.is_pending():
-			attempt.cleanup_pending = fake_retire_leaves_cleanup
+			if fake_retire_leaves_cleanup:
+				attempt.cleanup_pending = true
+			_fake_start_cancel(attempt)
 			attempt.settle(MatchmakingService.Outcome.SUPERSEDED)
 
-	func has_pending_cleanup() -> bool:
-		return fake_pending_cleanup
+	## A native cancel starting for a live ticket: the waiter the service holds until the
+	## binding answers, and the cleanup it owes meanwhile.
+	func _fake_start_cancel(attempt: MatchmakingService.TicketAttempt) -> void:
+		if not fake_cancel_waits or attempt == null or attempt.native_terminal or attempt.cancel_in_flight:
+			return
+		attempt.cancel_in_flight = true
+		attempt.cleanup_pending = true
 
-	func drain_owned_work(_deadline_msec: int) -> void:
-		pass
+	## Whether a native cancel this double started is still unanswered.
+	func fake_cancel_outstanding() -> bool:
+		for attempt: MatchmakingService.TicketAttempt in fake_attempts:
+			if attempt.cancel_in_flight:
+				return true
+		return false
+
+	## A case's own flag, or a cancel still in flight: the service's first reason for owing
+	## cleanup. The service's own bounded drain waits on it, on the case clock, until it
+	## resolves or the caller's deadline passes.
+	func has_pending_cleanup() -> bool:
+		return fake_pending_cleanup or fake_cancel_outstanding()
+
+	## A matched ticket whose cancel this double started and never answered.
+	func has_orphaned_matched_cancel() -> bool:
+		for attempt: MatchmakingService.TicketAttempt in fake_attempts:
+			if attempt.native_terminal and attempt.cancel_in_flight \
+					and attempt.status == MatchmakingService.STATUS_MATCHED:
+				return true
+		return false
 
 	func _fake_attempt(spec: MatchmakingService.SearchSpec, owner: bool) -> MatchmakingService.TicketAttempt:
 		var attempt := MatchmakingService.TicketAttempt.new()
@@ -544,11 +697,63 @@ class RecoveryParty extends PartyService:
 		return fake_clock.now_msec() if fake_clock != null else Time.get_ticks_msec()
 
 
+## The service suite's peer double, also recording what NetManager sends over it and able to
+## announce a remote peer, so a composed case can count what reaches peer 1 on the transport
+## the real PartyService joined.
+class RecordingPeer extends ServiceDoubles.Peer:
+	var sent: Array[PackedByteArray] = []
+
+	func _put_packet_script(packet: PackedByteArray) -> Error:
+		sent.append(packet)
+		return OK
+
+	func connect_remote(peer_id: int) -> void:
+		peer_connected.emit(peer_id)
+
+
+## Everything the engine logs while a case listens -- messages, errors and warnings -- so a
+## case can read the whole of what reached the log, not only what one service chose to say.
+class LogTap extends Logger:
+	var lines: PackedStringArray = PackedStringArray()
+	var _lock := Mutex.new()
+
+	func _log_message(message: String, _error: bool) -> void:
+		_lock.lock()
+		lines.append(message)
+		_lock.unlock()
+
+	func _log_error(_function: String, _file: String, _line: int, code: String, rationale: String,
+			_editor_notify: bool, _error_type: int, _script_backtraces: Array[ScriptBacktrace]) -> void:
+		_lock.lock()
+		lines.append("%s %s" % [code, rationale])
+		_lock.unlock()
+
+
+## The service suite's Party SDK with its scoped shutdown able to be held at the SDK boundary,
+## as a native shutdown still completing is. `shutdown_starts` counts shutdowns asked for,
+## held or not.
+class HeldPartySDK extends ServiceDoubles.PartySDK:
+	signal shutdown_released()
+	var hold_shutdown := false
+	var shutdown_starts := 0
+
+	func shutdown_async() -> Dictionary:
+		shutdown_starts += 1
+		if hold_shutdown:
+			await shutdown_released
+		return super.shutdown_async()
+
+
 var clock: Doubles.FakeClock = null
 var party: FlowParty = null
 var matchmaking: FlowMatchmaking = null
 var activity: Review.Activity = null
 var chat: Doubles.Chat = null
+## The composed cases' production services over the service suite's SDK doubles, on the
+## Party double's own clock.
+var real_party: ServiceDoubles.Party = null
+var real_matchmaking: ServiceDoubles.Matchmaking = null
+var real_clock: ServiceDoubles.Clock = null
 var _completed_calls := 0
 var _saved_activity: ActivityService = null
 var _probe_audio: Script = null
@@ -585,10 +790,36 @@ func run(test: Node) -> void:
 	await _f10_host_returns_to_an_arranged_rematch(test)
 	await _f10_guest_waits_for_host_return(test)
 	await _f10_rematch_invite_joins_through_netmanager(test)
+	await _r1_pending_rematch_trusts_only_the_proven_owner(test)
+	await _r1_rematch_admission_rechecks_owner_and_round(test)
+	await _r1_hosted_join_trusts_only_the_hosted_owner(test)
+	await _r1_admitted_hosted_session_proves_its_owner_at_every_message(test)
+	await _r1_pending_hosted_proof_settles_from_the_join_poll(test)
+	await _r1_admitted_scoped_sessions_prove_their_owner_without_a_loss_notice(test)
 	await _f11_guest_reducer_replays_missed_state(test)
 	await _f11_owner_answers_state_requests(test)
 	await _f11_invite_destinations_and_exact_credentials(test)
-	await _f14_full_four_rejection_restores_everyone(test)
+	await _f14_four_member_failures_restore_everyone_honestly(test)
+	await _r7_match_after_a_stopped_search_never_starts_or_wedges(test)
+	await _r7_leave_and_replacement_let_the_search_go(test)
+	await _r7_quit_is_bounded_while_a_cancel_is_unanswered(test)
+	await _r7_failed_recovery_is_terminal_and_keeps_the_lease(test)
+	await _c1_admitted_hosted_session_outlives_only_its_local_lobby_connection(test)
+	await _c1_scoped_local_lobby_loss_stays_terminal(test)
+	await _c2_scoped_leave_waiters_settle_from_recovery(test)
+	await _c3_orphaned_cancel_survives_account_removal_and_suspend(test)
+	await _c9_scoped_network_error_is_logged_once_and_safely(test)
+	await _d1_failed_native_leave_keeps_cleanup_and_the_invitation(test)
+	await _d1_flowless_cleanup_keeps_the_invitation_after_account_change(test)
+	await _d2_matched_during_the_final_teardown_await_is_recovered_first(test)
+	await _d4_flowless_practice_after_an_account_switch(test)
+	await _d7_hosted_owner_proven_after_the_join_keeps_only_local_continuity(test)
+	await _f5_late_leave_failure_without_an_owner_is_recovered_once(test)
+	await _f5_debt_raised_while_cleanup_runs_joins_that_cleanup(test)
+	await _f5_live_replacement_keeps_the_seat_until_it_leaves(test)
+	await _f5_quit_with_idle_debt_leaves_and_recovers_first(test)
+	await _f5_terminal_recovery_failure_stays_restart_required(test)
+	await _f5_invitation_waits_for_unowned_debt(test)
 	await _rb2_quit_drains_held_party_recovery(test)
 	await _rb2_quit_budget_ends_held_party_recovery(test)
 	await _rb2_quit_without_online_work_exits_at_once(test)
@@ -612,6 +843,7 @@ func _setup(test: Node, account: String) -> void:
 	# service-wide notices rather than call their handlers.
 	Services.bind_party_signals()
 	Services._matchmaking = matchmaking
+	Services.bind_matchmaking_signals()
 	Services._activity = activity
 	Services.use_clock(clock)
 	# NetManager's establishment deadlines and offline grace read its own time seam; it
@@ -639,6 +871,13 @@ func _teardown(test: Node) -> void:
 		_complete_activity()
 		clock.advance(1000.0)
 	_complete_activity()
+	# Whatever is still asleep or armed on this case's clock, a native cancel the double
+	# never answered, or a Party recovery still asked for would never be woken again: it
+	# would outlive the case, holding whatever it captured.
+	test._check(clock.pending() == 0 and clock.armed_alarm_count() == 0,
+		"flow case leaves nothing asleep or armed on its clock: %d asleep, %d armed" % [clock.pending(), clock.armed_alarm_count()])
+	test._check(not matchmaking.fake_cancel_outstanding() and not party.is_cleanup_pending(),
+		"flow case leaves no native cancel unanswered and no Party recovery asked for")
 	await test.get_tree().process_frame
 	test._check(not NetManager.has_online_flow() and not NetManager.has_session()
 		and NetManager._active_join_request == null, "flow case leaves no flow, session or join request behind")
@@ -756,6 +995,13 @@ func _arm(flow: MatchmakingFlow, arranged_owner: bool, cohort: Array = []) -> vo
 	var owner_key: Dictionary = party.fake_local_key.duplicate() if arranged_owner else _key(ARRANGED_OWNER_ID)
 	flow.arranged_owner_key = owner_key
 	party.fake_owners[party.fake_arranged.context_id] = owner_key.duplicate()
+	# The owner PartyService captured when this member joined the arranged lobby.
+	party.fake_arranged.owner_key = owner_key.duplicate()
+	# A remote owner has already published its control batch with its descriptor: this
+	# match, the first round, bootstrapping.
+	if not arranged_owner:
+		party.fake_lobby_properties[party.fake_arranged.context_id] = _arranged_control(
+			flow.match_id, 0, PartyService.ARRANGED_PHASE_BOOTSTRAP)
 	party.fake_set_member(party.fake_arranged, party.fake_local_key, true, _arranged_props(flow.match_id))
 	var pinned: Array[Dictionary] = [party.fake_local_key.duplicate()]
 	if not arranged_owner:
@@ -775,6 +1021,29 @@ func _arm(flow: MatchmakingFlow, arranged_owner: bool, cohort: Array = []) -> vo
 
 func _key(entity: String) -> Dictionary:
 	return {"id": entity, "type": "title_player_account"}
+
+
+## Makes `owner_key` the owner of the lobby a guest joins, as the join found it: the owner
+## PartyService captured on entry, the lobby's native owner and a connected member with
+## `properties` -- and peer 1 on this guest's transport. A null context is the hosted lobby.
+func _prove_owner(context: PartyService.LobbyContext, owner_key: Dictionary, properties: Dictionary = {}) -> void:
+	party.fake_peer_keys[NetManager.HOST_PEER_ID] = owner_key.duplicate()
+	if context == null:
+		party.fake_hosted_owner = owner_key.duplicate()
+		party.fake_hosted_owner_baseline = owner_key.duplicate()
+		return
+	party.fake_owners[context.context_id] = owner_key.duplicate()
+	context.owner_key = owner_key.duplicate()
+	party.fake_set_member(context, owner_key, true, properties)
+
+
+## The arranged owner's checked control batch for `match_id`, round and phase.
+func _arranged_control(match_id: String, match_round: int, phase: String) -> Dictionary:
+	return {
+		PartyService.MATCH_ID_MEMBER_KEY: match_id,
+		PartyService.ROUND_GENERATION_KEY: str(match_round),
+		PartyService.SESSION_PHASE_KEY: phase,
+	}
 
 
 ## The member properties an arranged member carries once it has joined -- and, when
@@ -850,6 +1119,7 @@ func _f1_invite_entry_into_staging(test: Node) -> void:
 	print("CASE: F1 an invite into a staging lobby is recognized by its lobby kind and joins the group")
 	await _setup(test, "flow-invitee")
 	var peer: Variant = TransportPeer.new(7)
+	_prove_owner(party.fake_staging, _key("f1-group-owner"))
 	party.fake_join_result = {
 		"ok": true, "peer": peer, "code": "", "error": "",
 		"kind": PartyService.LOBBY_KIND_STAGING, "destination": "staging_gathering", "context": party.fake_staging,
@@ -1715,6 +1985,46 @@ func _match(match_id: String) -> void:
 	attempt.settle(MatchmakingService.Outcome.MATCHED)
 
 
+## The service observing native Matched on `attempt`, in either order: the level state
+## first, then -- if the caller is still owed an outcome -- the settled match and the
+## once-only terminal notice, or the notice before the settlement. A cancel waiter already
+## in flight stays unanswered, as the pinned binding leaves it.
+func _native_match(attempt: MatchmakingService.TicketAttempt, match_id: String, notice_first: bool = false) -> void:
+	if attempt == null:
+		return
+	attempt.status = MatchmakingService.STATUS_MATCHED
+	attempt.match_id = match_id
+	attempt.arrangement = "arrangement-" + match_id
+	attempt.native_terminal = true
+	if notice_first:
+		attempt.native_terminal_changed.emit(attempt)
+	if attempt.is_pending():
+		attempt.settle(MatchmakingService.Outcome.MATCHED)
+	if not notice_first:
+		attempt.native_terminal_changed.emit(attempt)
+
+
+## The service's local search deadline on `attempt`: TIMEOUT for the caller, and the native
+## cancel it starts for the live ticket still owed.
+func _time_out(attempt: MatchmakingService.TicketAttempt) -> void:
+	if attempt == null:
+		return
+	attempt.cancel_in_flight = true
+	attempt.cleanup_pending = true
+	attempt.settle(MatchmakingService.Outcome.TIMEOUT, MatchmakingService.SEARCH_TIMEOUT_REASON_CODE,
+		MatchmakingService.SEARCH_TIMEOUT_REASON)
+
+
+## The corrected binding's answer to a cancel that lost its race to a match: the waiter
+## resolves and the service reconciles the matched ticket's cleanup.
+func _cancel_answers(attempt: MatchmakingService.TicketAttempt) -> void:
+	if attempt == null:
+		return
+	attempt.cancel_in_flight = false
+	attempt.cleanup_pending = false
+	attempt.cleanup_changed.emit(attempt)
+
+
 ## A staging guest on peer `peer_id` of the owner's staging transport, adopted into a guest
 ## flow the way an admitted invite leaves it. The staging owner is peer 1 and the lobby's
 ## native owner; whatever the staging envelope already holds is what adoption finds.
@@ -1724,11 +2034,15 @@ func _staging_guest(test: Node, peer_id: int) -> MatchmakingFlow:
 	NetManager._is_offline = false
 	var owner_key := _key("staging-owner")
 	party.fake_owners[party.fake_staging.context_id] = owner_key.duplicate()
+	party.fake_staging.owner_key = owner_key.duplicate()
 	party.fake_peer_keys[NetManager.HOST_PEER_ID] = owner_key.duplicate()
 	party.fake_members[party.fake_staging.context_id] = [
 		{"key": owner_key.duplicate(), "connected": true, "properties": {}},
 		{"key": party.fake_local_key.duplicate(), "connected": true, "properties": {}},
 	]
+	# The scope an ordinary staging join captures as it binds: peer 1 answers as the
+	# staging lobby's owner, or not at all.
+	NetManager._capture_authority_scope(&"staging", party.fake_staging, {}, "", 0)
 	staging_peer.connect_remote(NetManager.HOST_PEER_ID)
 	var host := PlayerState.new()
 	host.peer_id = NetManager.HOST_PEER_ID
@@ -2059,7 +2373,7 @@ func _f6_host_refuses_unproven_cohort_peers(test: Node) -> void:
 func _f6_guest_answers_only_the_pinned_host(test: Node) -> void:
 	print("CASE: F6-G an arranged guest sends its identity only to a proven current arranged owner; pending facts wait silently, known disagreement ends the attempt")
 	var proven_now := ["pinned"]
-	var refused_now := ["impostor", "protocol", "invalid_kept_key", "disconnected", "owner_changed", "owner_cleared", "other_match"]
+	var refused_now := ["other_peer", "protocol", "invalid_kept_key", "disconnected", "owner_changed", "owner_cleared", "other_match"]
 	var pending_first := ["pending_owner", "no_protocol", "empty_protocol", "malformed"]
 	for scenario: String in proven_now + refused_now + pending_first:
 		await _setup(test, "f6-guest-" + scenario)
@@ -2079,8 +2393,8 @@ func _f6_guest_answers_only_the_pinned_host(test: Node) -> void:
 		var owner_key := _key(ARRANGED_OWNER_ID)
 		party.fake_peer_keys[NetManager.HOST_PEER_ID] = owner_key.duplicate()
 		match scenario:
-			"impostor":
-				party.fake_peer_keys[NetManager.HOST_PEER_ID] = _key("impostor")
+			"other_peer":
+				party.fake_peer_keys[NetManager.HOST_PEER_ID] = _key("other-peer")
 			"protocol":
 				party.fake_set_member(party.fake_arranged, owner_key, true, _arranged_props(flow.match_id, true, "1.3"))
 			"invalid_kept_key":
@@ -2088,7 +2402,7 @@ func _f6_guest_answers_only_the_pinned_host(test: Node) -> void:
 			"disconnected":
 				party.fake_set_member(party.fake_arranged, owner_key, false, _arranged_props(flow.match_id))
 			"owner_changed":
-				party.fake_owners[party.fake_arranged.context_id] = _key("claimant")
+				party.fake_owners[party.fake_arranged.context_id] = _key("other-owner")
 			"owner_cleared":
 				party.fake_owners[party.fake_arranged.context_id] = {}
 			"other_match":
@@ -2102,7 +2416,7 @@ func _f6_guest_answers_only_the_pinned_host(test: Node) -> void:
 				empty[MatchmakingService.PROTOCOL_MEMBER_KEY] = ""
 				party.fake_set_member(party.fake_arranged, owner_key, true, empty)
 			"malformed":
-				party.fake_proof_override[NetManager.HOST_PEER_ID] = {"member_properties": "not a property bag"}
+				party.fake_proof_override[NetManager.HOST_PEER_ID] = {"valid": false, "pending": true, "reason_code": "owner_properties_malformed"}
 		var sent: int = arranged_peer.sent.size()
 		var calls := _rpc_calls(arranged_peer)
 		NetManager._request_player_identity()
@@ -2137,6 +2451,7 @@ func _f6_guest_answers_only_the_pinned_host(test: Node) -> void:
 					clock.advance(MatchmakingFlow.POLL_SECONDS)
 					test._check(request.succeeded(), "[%s] and the ordinary admission completes" % scenario)
 				"malformed":
+					party.fake_proof_override.erase(NetManager.HOST_PEER_ID)
 					party.fake_set_member(party.fake_arranged, owner_key, false, _arranged_props(flow.match_id))
 					NetManager._on_context_changed(party.fake_arranged)
 					test._check(arranged_peer.sent.size() == sent and flow.retired,
@@ -2253,7 +2568,7 @@ func _mutate_native_cohort(flow: MatchmakingFlow, mutation: String) -> void:
 		"disconnected":
 			party.fake_set_member(party.fake_arranged, member, false, _arranged_props(flow.match_id, true, "", true))
 		"owner_changed":
-			party.fake_owners[party.fake_arranged.context_id] = _key("claimant")
+			party.fake_owners[party.fake_arranged.context_id] = _key("other-owner")
 		"owner_cleared":
 			party.fake_owners[party.fake_arranged.context_id] = {}
 		"remapped":
@@ -2633,7 +2948,7 @@ func _f9_lobby_loss_and_recovery_routing(test: Node) -> void:
 
 	await _setup(test, "f9-staging-owner")
 	var guest := _staging_guest(test, 7)
-	party.fake_owners[party.fake_staging.context_id] = _key("claimant")
+	party.fake_owners[party.fake_staging.context_id] = _key("other-owner")
 	NetManager._on_context_changed(party.fake_staging)
 	test._check(guest.retired and NetManager.last_disconnect_reason == MatchmakingFlow.TEXT_OWNER_CHANGED,
 		"a staging lobby whose native owner is no longer the host is not silently adopted: %s" % NetManager.last_disconnect_reason)
@@ -2648,7 +2963,7 @@ func _f9_lobby_loss_and_recovery_routing(test: Node) -> void:
 	arranged_peer.connect_remote(NetManager.HOST_PEER_ID)
 	NetManager._accept_join()
 	clock.advance(MatchmakingFlow.POLL_SECONDS)
-	party.fake_owners[party.fake_arranged.context_id] = _key("claimant")
+	party.fake_owners[party.fake_arranged.context_id] = _key("other-owner")
 	NetManager._on_context_changed(party.fake_arranged)
 	test._check(player.retired and NetManager.last_disconnect_reason == MatchmakingFlow.TEXT_MATCH_HOST_CHANGED,
 		"an arranged owner change is terminal, never adopted: %s" % NetManager.last_disconnect_reason)
@@ -2906,6 +3221,8 @@ func _f10_rematch_invite_joins_through_netmanager(test: Node) -> void:
 	print("CASE: F10 an intact invite into a rematch lobby joins as a replacement with no ticket or arranged join; other arranged destinations are refused")
 	await _setup(test, "f10-replacement")
 	var peer: Variant = TransportPeer.new(8)
+	_prove_owner(party.fake_arranged, _key(ARRANGED_OWNER_ID), _arranged_props("match-r"))
+	party.fake_lobby_properties[party.fake_arranged.context_id] = _arranged_control("match-r", 2, PartyService.ARRANGED_PHASE_REMATCH)
 	party.fake_join_result = {
 		"ok": true, "peer": peer, "code": "", "error": "",
 		"kind": PartyService.LOBBY_KIND_ARRANGED, "destination": "arranged_rematch",
@@ -2953,6 +3270,634 @@ func _f10_rematch_invite_joins_through_netmanager(test: Node) -> void:
 			test._check(party.fake_calls.has("leave_lobby:%d" % party.fake_arranged.context_id),
 				"[unknown] the candidate lobby is released through its own handle")
 		await _teardown(test)
+
+
+# --- R1: whose messages a guest acts on ---------------------------------------------------
+
+## The pending join an intact rematch invitation leaves: the arranged lobby entered as a
+## replacement's candidate, bound with no flow yet, its owner pinned as `owner_key` and its
+## round 2 still gathering. `pending_proof` holds the owner's facts back from the start, as
+## a lobby whose owner has not replicated to this member yet is. Returns the transport.
+func _pending_rematch(test: Node, owner_key: Dictionary, pending_proof: bool = false) -> Variant:
+	var peer: Variant = TransportPeer.new(8)
+	_prove_owner(party.fake_arranged, owner_key, _arranged_props("match-r"))
+	party.fake_lobby_properties[party.fake_arranged.context_id] = _arranged_control("match-r", 2, PartyService.ARRANGED_PHASE_REMATCH)
+	if pending_proof:
+		party.fake_proof_pending[NetManager.HOST_PEER_ID] = true
+	party.fake_join_result = {
+		"ok": true, "peer": peer, "code": "", "error": "",
+		"kind": PartyService.LOBBY_KIND_ARRANGED, "destination": "arranged_rematch",
+		"context": party.fake_arranged, "match_id": "match-r", "round": 2,
+		"owner_key": owner_key.duplicate(), "expected_count": 4,
+	}
+	var request := NetManager.join_by_invite(ARRANGED_CONNECTION)
+	test._check(request.is_pending() and NetManager.has_session() and not NetManager.has_online_flow(),
+		"the rematch replacement is bound with no flow yet")
+	peer.connect_remote(NetManager.HOST_PEER_ID)
+	return peer
+
+
+## What an arranged host sends a newcomer it has greeted: another player's roster entry,
+## its admission state and a match state. None of it may land before peer 1 is proven.
+func _send_unproven_authority() -> void:
+	var stranger := PlayerState.new()
+	stranger.peer_id = 3
+	stranger.display_name = "R1 Stranger"
+	NetManager._receive_roster_entry(stranger.to_dict())
+	NetManager._receive_join_admission(true)
+	NetManager._receive_match_state(NRTypes.MatchState.RUNNING)
+
+
+## The host's answer to a proven newcomer's identity: the whole roster and the mode again,
+## then its acceptance -- the replay a message dropped before the proof is recovered from.
+func _host_replays_and_accepts(host_name: String) -> void:
+	var host := PlayerState.new()
+	host.peer_id = NetManager.HOST_PEER_ID
+	host.display_name = host_name
+	var other := PlayerState.new()
+	other.peer_id = 3
+	other.display_name = "R1 Other"
+	NetManager._receive_roster_entry(host.to_dict())
+	NetManager._receive_roster_entry(other.to_dict())
+	NetManager._receive_game_mode(int(NRTypes.GameModeType.DEATHMATCH))
+	NetManager._accept_join()
+
+
+## Before any flow exists, a rematch replacement's pending join trusts peer 1 only as the
+## proven current owner of the arranged lobby it joined. Until then it sends no identity and
+## lets nothing peer 1 sends land -- roster, admission state, match state or an acceptance.
+## A wrong, changed, cleared or disconnected owner, another protocol, another match or a
+## reset runtime ends the join through its own cleanup with a reason this title owns, and
+## nothing admitted, succeeded or adopted. A proof that settles later answers the host's one
+## original request, once; the host's replay then gives the whole roster and mode, and its
+## acceptance is the one admission that adopts the rematch.
+func _r1_pending_rematch_trusts_only_the_proven_owner(test: Node) -> void:
+	print("CASE: R1 a pending rematch replacement sends nothing to peer 1 and takes nothing from it until peer 1 is the joined lobby's proven owner")
+	var owner_key := _key(ARRANGED_OWNER_ID)
+	var refusals := {
+		"other_peer": NetManager._REMATCH_HOST_CHANGED,
+		"owner_changed": NetManager._REMATCH_HOST_CHANGED,
+		"owner_cleared": NetManager._REMATCH_HOST_CHANGED,
+		"disconnected": NetManager._REMATCH_HOST_LEFT,
+		"recovered": NetManager._REMATCH_HOST_LEFT,
+		"protocol": MatchmakingFlow.TEXT_MATCH_INCOMPATIBLE,
+		"other_match": MatchmakingFlow.TEXT_MATCH_INCOMPATIBLE,
+	}
+	for scenario: String in refusals.keys() + ["pending"]:
+		await _setup(test, "r1-" + scenario)
+		var peer: Variant = _pending_rematch(test, owner_key, scenario == "pending")
+		var request: JoinRequest = NetManager._active_join_request
+		match scenario:
+			"other_peer":
+				party.fake_peer_keys[NetManager.HOST_PEER_ID] = _key("other-peer")
+			"owner_changed":
+				party.fake_owners[party.fake_arranged.context_id] = _key("other-owner")
+			"owner_cleared":
+				party.fake_owners[party.fake_arranged.context_id] = {}
+			"disconnected":
+				party.fake_set_member(party.fake_arranged, owner_key, false, _arranged_props("match-r"))
+			"recovered":
+				party.fake_proof_override[NetManager.HOST_PEER_ID] = {"recovery_epoch": 7}
+			"protocol":
+				party.fake_set_member(party.fake_arranged, owner_key, true, _arranged_props("match-r", true, "1.3"))
+			"other_match":
+				party.fake_set_member(party.fake_arranged, owner_key, true, _arranged_props("another-match"))
+		var calls := _rpc_calls(peer)
+		NetManager._request_player_identity()
+		_send_unproven_authority()
+		NetManager._accept_join()
+		test._check(_rpc_calls(peer) == calls, "[%s] no identity is sent: %d calls" % [scenario, _rpc_calls(peer) - calls])
+		test._check(not NetManager.players.has(3), "[%s] peer 1's roster entry does not land" % scenario)
+		test._check(not NetManager.is_accepting_joins(), "[%s] nor its admission state" % scenario)
+		test._check(NetManager.match_state != NRTypes.MatchState.RUNNING, "[%s] nor its match state" % scenario)
+		test._check(request != null and not request.admitted, "[%s] and its acceptance admits nothing" % scenario)
+		if scenario != "pending":
+			clock.advance(MatchmakingFlow.POLL_SECONDS)
+			await test.get_tree().process_frame
+			test._check(request.outcome == JoinRequest.Outcome.FAILED,
+				"[%s] the join ends through its own cleanup: outcome %d" % [scenario, request.outcome])
+			test._check(request.reason == String(refusals[scenario]), "[%s] with this title's reason: %s" % [scenario, request.reason])
+			test._check(not NetManager.has_online_flow() and not NetManager.has_session(), "[%s] and nothing is adopted" % scenario)
+			await _teardown(test)
+			continue
+		test._check(request.is_pending() and not NetManager.has_online_flow(), "[pending] the join keeps waiting, with no flow")
+		party.fake_proof_pending.erase(NetManager.HOST_PEER_ID)
+		NetManager._on_context_changed(party.fake_arranged)
+		test._check(_rpc_calls(peer) == calls + 1,
+			"[pending] once the lobby settles the proof, the host's one request is answered: %d calls" % (_rpc_calls(peer) - calls))
+		NetManager._on_context_changed(party.fake_arranged)
+		NetManager._on_connected_to_server()
+		test._check(_rpc_calls(peer) == calls + 1, "[pending] and never a second time: %d calls" % (_rpc_calls(peer) - calls))
+		test._check(not request.admitted, "[pending] the acceptance that came before the proof still admitted nothing")
+		_host_replays_and_accepts("R1 Host")
+		test._check(request.admitted, "[pending] the proven owner's acceptance admits")
+		clock.advance(MatchmakingFlow.POLL_SECONDS)
+		var flow: MatchmakingFlow = NetManager._flow
+		test._check(request.succeeded() and flow != null and flow.entry_kind == MatchmakingFlow.ENTRY_ARRANGED_REMATCH,
+			"[pending] and that one admission adopts the rematch")
+		test._check(NetManager.players.has(NetManager.HOST_PEER_ID) and NetManager.players.has(3),
+			"[pending] holding the whole current roster from the replay: %s" % str(NetManager.players.keys()))
+		await _teardown(test)
+
+
+## An acceptance is taken on the owner and round of the moment it is consumed, not on an
+## earlier proof: an owner that changes, or a round that begins, between the host's
+## acceptance and its consumption ends the join with nothing adopted. A request from a
+## session that has already ended sends nothing.
+func _r1_rematch_admission_rechecks_owner_and_round(test: Node) -> void:
+	print("CASE: R1 a rematch replacement's admission is re-proven at consumption; an ended session's request sends nothing")
+	var owner_key := _key(ARRANGED_OWNER_ID)
+	for scenario: String in ["owner_moved", "round_began"]:
+		await _setup(test, "r1-late-" + scenario)
+		var peer: Variant = _pending_rematch(test, owner_key)
+		var request: JoinRequest = NetManager._active_join_request
+		var calls := _rpc_calls(peer)
+		NetManager._request_player_identity()
+		test._check(_rpc_calls(peer) == calls + 1, "[%s] the proven owner is answered once" % scenario)
+		_host_replays_and_accepts("R1 Host")
+		test._check(request.admitted, "[%s] and its acceptance is recorded" % scenario)
+		if scenario == "owner_moved":
+			party.fake_owners[party.fake_arranged.context_id] = _key("other-owner")
+		else:
+			party.fake_lobby_properties[party.fake_arranged.context_id] = _arranged_control("match-r", 2, PartyService.ARRANGED_PHASE_GAMEPLAY)
+		clock.advance(MatchmakingFlow.POLL_SECONDS)
+		clock.advance(MatchmakingFlow.POLL_SECONDS)
+		await test.get_tree().process_frame
+		var expected: String = NetManager._REMATCH_HOST_CHANGED if scenario == "owner_moved" else NetManager._REMATCH_MOVED
+		test._check(request.outcome == JoinRequest.Outcome.FAILED and request.reason == expected,
+			"[%s] consuming it proves the owner and round again: %s" % [scenario, request.reason])
+		test._check(not NetManager.has_online_flow(), "[%s] and no rematch is adopted" % scenario)
+		await _teardown(test)
+
+	await _setup(test, "r1-ended")
+	var ended: Variant = _pending_rematch(test, owner_key)
+	NetManager.leave_match()
+	await test.get_tree().process_frame
+	var before: int = ended.sent.size()
+	NetManager._request_player_identity()
+	NetManager._accept_join()
+	test._check(ended.sent.size() == before and not NetManager.has_session() and not NetManager.has_online_flow(),
+		"a request from a session that already ended sends nothing and adopts nothing: %d packets" % (ended.sent.size() - before))
+	await _teardown(test)
+
+
+## The ordinary online entry follows the same rule: a hosted lobby's guest answers and is
+## admitted only by the lobby's own owner.
+func _r1_hosted_join_trusts_only_the_hosted_owner(test: Node) -> void:
+	print("CASE: R1 a hosted guest answers and is admitted only by the proven owner of the lobby it joined")
+	for scenario: String in ["proven", "other_peer"]:
+		await _setup(test, "r1-hosted-" + scenario)
+		_prove_owner(null, _key("r1-host"))
+		if scenario == "other_peer":
+			party.fake_peer_keys[NetManager.HOST_PEER_ID] = _key("r1-other-peer")
+		var peer: Variant = TransportPeer.new(6)
+		party.fake_join_result = {"ok": true, "peer": peer, "code": "ABCDE", "error": "", "kind": "", "context": null}
+		var request := NetManager.join_by_invite("r1-hosted-connection")
+		peer.connect_remote(NetManager.HOST_PEER_ID)
+		var calls := _rpc_calls(peer)
+		NetManager._request_player_identity()
+		if scenario == "proven":
+			test._check(_rpc_calls(peer) == calls + 1, "[proven] the hosted owner is answered once")
+			_host_replays_and_accepts("R1 Hosted Owner")
+			clock.advance(MatchmakingFlow.POLL_SECONDS)
+			test._check(request.succeeded() and not NetManager.has_online_flow(), "[proven] and admits this player")
+		else:
+			NetManager._accept_join()
+			clock.advance(MatchmakingFlow.POLL_SECONDS)
+			await test.get_tree().process_frame
+			test._check(_rpc_calls(peer) == calls, "[other_peer] another peer 1 is sent nothing")
+			test._check(request.outcome == JoinRequest.Outcome.FAILED and request.reason == NetManager._HOST_CHANGED_BEFORE_JOIN,
+				"[other_peer] and the join ends with its reason: %s" % request.reason)
+		await _teardown(test)
+
+
+## What only a host may send an admitted guest -- a new player's roster entry, then a running
+## match, twice over -- with a watch on it. Reports whether any of it was applied and how
+## many times the session ended while it arrived.
+func _send_host_state(peer_id: int) -> Dictionary:
+	var seen := {"applied": false, "ends": 0}
+	var on_roster := func() -> void:
+		if NetManager.players.has(peer_id):
+			seen["applied"] = true
+	var on_state := func(state: int) -> void:
+		if state == NRTypes.MatchState.RUNNING:
+			seen["applied"] = true
+	var on_end := func() -> void:
+		seen["ends"] = int(seen["ends"]) + 1
+	NetManager.roster_changed.connect(on_roster)
+	NetManager.match_state_changed.connect(on_state)
+	NetManager.server_disconnected.connect(on_end)
+	for _repeat in 2:
+		var stranger := PlayerState.new()
+		stranger.peer_id = peer_id
+		stranger.display_name = "R1 Late Stranger"
+		NetManager._receive_roster_entry(stranger.to_dict())
+		NetManager._receive_match_state(NRTypes.MatchState.RUNNING)
+	NetManager.roster_changed.disconnect(on_roster)
+	NetManager.match_state_changed.disconnect(on_state)
+	NetManager.server_disconnected.disconnect(on_end)
+	if NetManager.players.has(peer_id) or NetManager.match_state == NRTypes.MatchState.RUNNING:
+		seen["applied"] = true
+	return seen
+
+
+## Admission is not a lease on the host's authority. With the Party transport, the roster and
+## the session all unchanged, a hosted lobby whose owner moved on, went away or is no longer
+## connected has no host this guest answers to: peer 1's next message is not applied, and the
+## session ends once with this title's reason. Before that, the proven owner's own messages
+## still land. An owner PartyService never captured -- not replicated when the lobby was
+## joined -- is held to the owner this session proved.
+func _r1_admitted_hosted_session_proves_its_owner_at_every_message(test: Node) -> void:
+	print("CASE: R1 an admitted hosted guest proves its lobby's owner at every message; a changed, cleared or disconnected owner ends the session once")
+	var outcomes := {
+		"owner_changed": NetManager._HOST_CHANGED,
+		"owner_cleared": NetManager._HOST_CHANGED,
+		"owner_cleared_uncaptured": NetManager._HOST_CHANGED,
+		"owner_disconnected": NetManager._HOST_LEFT_BEFORE_JOIN,
+	}
+	for mutation: String in outcomes.keys():
+		await _setup(test, "r1-admitted-" + mutation)
+		var owner := _key("r1-host")
+		_prove_owner(null, owner)
+		if mutation == "owner_cleared_uncaptured":
+			party.fake_hosted_owner_baseline = {}
+		var peer: Variant = TransportPeer.new(6)
+		party.fake_join_result = {"ok": true, "peer": peer, "code": "ABCDE", "error": "", "kind": "", "context": null}
+		var request := NetManager.join_by_invite("r1-admitted-connection")
+		peer.connect_remote(NetManager.HOST_PEER_ID)
+		NetManager._request_player_identity()
+		_host_replays_and_accepts("R1 Hosted Owner")
+		clock.advance(MatchmakingFlow.POLL_SECONDS)
+		test._check(request.succeeded() and NetManager.has_session(), "[%s] the hosted guest is admitted" % mutation)
+		var ally := PlayerState.new()
+		ally.peer_id = 4
+		ally.display_name = "R1 Ally"
+		NetManager._receive_roster_entry(ally.to_dict())
+		test._check(NetManager.players.has(4), "[%s] the proven owner's messages still land after admission" % mutation)
+		match mutation:
+			"owner_changed":
+				party.fake_hosted_owner = _key("r1-other-owner")
+			"owner_cleared", "owner_cleared_uncaptured":
+				party.fake_hosted_owner = {}
+			"owner_disconnected":
+				party.fake_hosted_owner_connected = false
+		var seen := _send_host_state(5)
+		test._check(not bool(seen["applied"]), "[%s] peer 1's roster entry and match state are not applied" % mutation)
+		test._check(int(seen["ends"]) == 1 and not NetManager.has_session(),
+			"[%s] and the session ends once: %d ends" % [mutation, int(seen["ends"])])
+		test._check(NetManager.last_disconnect_reason == String(outcomes[mutation]),
+			"[%s] with this title's reason: %s" % [mutation, NetManager.last_disconnect_reason])
+		await _teardown(test)
+
+
+## A hosted lobby's facts can replicate with no notice this title receives. A legitimate host
+## whose owner facts are not there yet is sent nothing; once only those facts arrive -- no
+## lobby notice, no transport event, no second request -- the join's own poll answers the one
+## request, once, and the host's replay and acceptance complete exactly one admission.
+func _r1_pending_hosted_proof_settles_from_the_join_poll(test: Node) -> void:
+	print("CASE: R1 a pending hosted owner proof is retried by the join's own poll and completes one identity, replay and admission")
+	await _setup(test, "r1-hosted-pending")
+	var owner := _key("r1-host")
+	party.fake_peer_keys[NetManager.HOST_PEER_ID] = owner.duplicate()
+	party.fake_hosted_owner = {}
+	party.fake_hosted_owner_baseline = {}
+	var peer: Variant = TransportPeer.new(6)
+	party.fake_join_result = {"ok": true, "peer": peer, "code": "ABCDE", "error": "", "kind": "", "context": null}
+	var request := NetManager.join_by_invite("r1-pending-connection")
+	peer.connect_remote(NetManager.HOST_PEER_ID)
+	var calls := _rpc_calls(peer)
+	NetManager._request_player_identity()
+	clock.advance(MatchmakingFlow.POLL_SECONDS * 3.0)
+	test._check(_rpc_calls(peer) == calls and request.is_pending(),
+		"an owner not replicated yet is sent nothing, and the join keeps waiting: %d calls" % (_rpc_calls(peer) - calls))
+	party.fake_hosted_owner = owner.duplicate()
+	clock.advance(MatchmakingFlow.POLL_SECONDS)
+	test._check(_rpc_calls(peer) == calls + 1,
+		"once only the owner facts arrive, the join's poll answers the one request: %d calls" % (_rpc_calls(peer) - calls))
+	clock.advance(MatchmakingFlow.POLL_SECONDS * 3.0)
+	NetManager._on_connected_to_server()
+	test._check(_rpc_calls(peer) == calls + 1, "and never a second time: %d calls" % (_rpc_calls(peer) - calls))
+	_host_replays_and_accepts("R1 Hosted Owner")
+	clock.advance(MatchmakingFlow.POLL_SECONDS)
+	test._check(request.succeeded() and not NetManager.has_online_flow(), "the host's acceptance is one admission")
+	test._check(NetManager.players.has(NetManager.HOST_PEER_ID) and NetManager.players.has(3),
+		"holding the roster the host replayed: %s" % str(NetManager.players.keys()))
+	await _teardown(test)
+
+
+## A scoped session is held to the same rule without waiting for any loss notice. A staging
+## guest whose lobby's owner changed takes nothing more from peer 1 at its next message; one
+## whose owner is no longer connected is ended by the next notice about that lobby, which the
+## flow's own owner check would not; an adopted rematch replacement ends at peer 1's next
+## message when its arranged lobby's owner changes. Each ends once, with its reason.
+func _r1_admitted_scoped_sessions_prove_their_owner_without_a_loss_notice(test: Node) -> void:
+	print("CASE: R1 admitted staging and rematch sessions prove their lobby's owner at every message and notice, with no loss notice needed")
+	for path: String in ["staging_message", "staging_notice", "rematch_message"]:
+		await _setup(test, "r1-scoped-" + path)
+		var flow: MatchmakingFlow = null
+		var context: PartyService.LobbyContext = null
+		var expected := ""
+		if path == "rematch_message":
+			_pending_rematch(test, _key(ARRANGED_OWNER_ID))
+			var request: JoinRequest = NetManager._active_join_request
+			NetManager._request_player_identity()
+			_host_replays_and_accepts("R1 Host")
+			clock.advance(MatchmakingFlow.POLL_SECONDS)
+			flow = NetManager._flow
+			context = party.fake_arranged
+			expected = NetManager._MATCH_HOST_CHANGED
+			test._check(request != null and request.succeeded() and flow != null,
+				"[%s] the replacement is admitted and its rematch adopted" % path)
+		else:
+			flow = _staging_guest(test, 7)
+			context = party.fake_staging
+			expected = MatchmakingFlow.TEXT_OWNER_CHANGED if path == "staging_message" else MatchmakingFlow.TEXT_GROUP_HOST_LEFT
+		if flow == null:
+			await _teardown(test)
+			continue
+		var ally := PlayerState.new()
+		ally.peer_id = 4
+		ally.display_name = "R1 Ally"
+		NetManager._receive_roster_entry(ally.to_dict())
+		test._check(NetManager.players.has(4) and flow.is_current(), "[%s] the proven owner's messages land" % path)
+		var seen: Dictionary = {}
+		if path == "staging_notice":
+			party.fake_set_member(context, _key("staging-owner"), false)
+			NetManager._on_context_changed(context)
+			test._check(flow.retired and NetManager.last_disconnect_reason == expected,
+				"[%s] the notice ends the flow: %s" % [path, NetManager.last_disconnect_reason])
+			seen = _send_host_state(5)
+			test._check(int(seen["ends"]) == 0, "[%s] and nothing after it ends it again" % path)
+		else:
+			party.fake_owners[context.context_id] = _key("r1-other-owner")
+			seen = _send_host_state(5)
+			test._check(int(seen["ends"]) == 1 and flow.retired,
+				"[%s] peer 1's next message ends the flow once: %d ends" % [path, int(seen["ends"])])
+			test._check(NetManager.last_disconnect_reason == expected,
+				"[%s] with its reason: %s" % [path, NetManager.last_disconnect_reason])
+		test._check(not bool(seen["applied"]), "[%s] and peer 1's roster entry and match state are not applied" % path)
+		await _teardown(test)
+
+
+# --- R7: a match that lands on a search already let go of -------------------------------
+
+## A stopped search whose ticket the service matches anyway, in each order the events can
+## arrive: the owner's Cancel before the match and its notice before the settlement, a
+## local timeout before a late match, and a binding that does answer the cancel once the
+## match has won. The old group joins nothing,
+## restores nothing and requeues nothing; it ends with its reason and keeps the lease while
+## the ticket's native cleanup is owed. A cancel the pinned binding never answers is
+## recovered through Party's bounded leave, whose confirmed reset discharges it; the account
+## and its saves are untouched, and the next Quick Match starts without a restart. A match
+## that lands before any stop is simply the group's match.
+func _r7_match_after_a_stopped_search_never_starts_or_wedges(test: Node) -> void:
+	print("CASE: R7 a match that overtakes a cancel or a timeout ends the old group without joining, reopening or wedging it")
+	test._check(NetManager._flow_end_code(MatchmakingFlow.TEXT_MATCH_ABANDONED) == "match_abandoned",
+		"a flow's end is logged under a stable key for this title's own reason")
+	test._check(NetManager._flow_end_code("Injected transport words 0x80004005 for entity A1B2") == "other",
+		"and never with a service's or transport's own words")
+	for order: String in ["cancel_then_match", "notice_first", "timeout_then_match", "corrected_binding", "match_then_cancel"]:
+		await _setup(test, "r7-" + order)
+		matchmaking.fake_cancel_waits = true
+		var flow := await _searching_owner(test)
+		var attempt := _attempt()
+		if flow == null or attempt == null:
+			await _teardown(test)
+			continue
+		if order == "match_then_cancel":
+			party.fake_arranged_join_ok = true
+			party.fake_arranged_owner = party.fake_local_key.duplicate()
+			party.fake_owners[party.fake_arranged.context_id] = party.fake_local_key.duplicate()
+			_native_match(attempt, "r7-first")
+			flow.cancel_search()
+			test._check(matchmaking.fake_cancels.is_empty() and not attempt.cancel_in_flight,
+				"[%s] a ticket matched before any stop is never cancelled" % order)
+			test._check(flow.is_current() and party.fake_calls.has("join_arranged:arrangement-r7-first"),
+				"[%s] it is the group's match, and its arrangement is joined" % order)
+			await _teardown(test)
+			continue
+		if order == "timeout_then_match":
+			_time_out(attempt)
+			test._check(flow.is_current() and flow.phase == MatchmakingFlow.Phase.CANCELLING,
+				"[%s] a timed-out ticket whose cancel is owed holds the group closed (phase %d)" % [order, flow.phase])
+			_native_match(attempt, "r7-late")
+		else:
+			flow.cancel_search()
+			test._check(attempt.cancel_in_flight and flow.phase == MatchmakingFlow.Phase.CANCELLING,
+				"[%s] the owner's Cancel starts a native cancel (phase %d)" % [order, flow.phase])
+			_native_match(attempt, "r7-won", order == "notice_first")
+		test._check(flow.retired and NetManager.last_disconnect_reason == MatchmakingFlow.TEXT_MATCH_ABANDONED,
+			"[%s] the old group ends with its reason: %s" % [order, NetManager.last_disconnect_reason])
+		test._check(party.fake_join_arranged_calls.is_empty(), "[%s] the match it let go of is never joined" % order)
+		var control: Dictionary = party.fake_search_control.get(party.fake_staging.context_id, {})
+		test._check(String(control.get("phase", "")) != MatchmakingFlow.ENVELOPE_GATHERING and matchmaking.fake_creates.size() == 1,
+			"[%s] nor is the group reopened or searched again" % order)
+		test._check(NetManager.has_online_flow() and NetManager.has_pending_online_work(),
+			"[%s] while the ticket's native cleanup is owed, the lease is held" % order)
+		var leaves := party.fake_calls.count("leave")
+		if order == "corrected_binding":
+			_cancel_answers(attempt)
+			clock.advance(MatchmakingFlow.POLL_SECONDS)
+			await test.get_tree().process_frame
+			test._check(not NetManager.has_online_flow(), "[%s] a cancel that answers releases the lease" % order)
+			clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS * 2.0)
+			test._check(party.fake_calls.count("leave") == leaves, "[%s] with no recovery at all" % order)
+		else:
+			clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS + MatchmakingFlow.POLL_SECONDS * 3.0)
+			test._check(party.fake_calls.count("leave") > leaves and party.is_cleanup_pending(),
+				"[%s] a cancel the binding never answers is handed to Party's bounded recovery" % order)
+			test._check(NetManager.has_online_flow(), "[%s] and the lease stays held until that recovery is confirmed" % order)
+			party.set("_recovery_required", false)
+			party.multiplayer_invalidated.emit(1)
+			clock.advance(MatchmakingFlow.POLL_SECONDS)
+			await test.get_tree().process_frame
+			test._check(not NetManager.has_online_flow() and not attempt.cancel_in_flight,
+				"[%s] the confirmed reset discharges the old ticket and releases the lease" % order)
+		test._check(Services.is_account_ready(), "[%s] the account and its saves are untouched" % order)
+		var reopened: bool = await NetManager.start_matchmaking()
+		test._check(reopened, "[%s] and the next Quick Match starts without a restart: %s" % [order, NetManager.last_error])
+		await _teardown(test)
+
+
+## A guest that leaves mid-search, and an owner that accepts an invitation elsewhere, have
+## let the search go too: a match that lands afterwards joins nothing, the lease holds until
+## the ticket's cleanup is settled -- through Party's bounded recovery when the pinned
+## binding never answers the cancel -- and the invitation waits, under the time it arrived
+## with, until the old group is gone.
+func _r7_leave_and_replacement_let_the_search_go(test: Node) -> void:
+	print("CASE: R7 a guest's Leave and an owner's accepted invitation are binding; a later match joins nothing and wedges nothing")
+	await _setup(test, "r7-guest-leave")
+	matchmaking.fake_cancel_waits = true
+	var guest := _staging_guest(test, 7)
+	var attempt := _guest_search(4, "r7-guest-ticket", 300000)
+	test._check(attempt != null and guest.phase == MatchmakingFlow.Phase.SEARCHING,
+		"the guest has joined the owner's ticket (phase %d)" % guest.phase)
+	if attempt != null:
+		NetManager.leave_match()
+		test._check(guest.retired and attempt.cancel_in_flight and NetManager.has_online_flow(),
+			"its Leave retires the flow and starts the ticket's native cancel, with the lease still held")
+		_native_match(attempt, "r7-after-leave")
+		test._check(party.fake_join_arranged_calls.is_empty(), "a match landing after the Leave is never joined")
+		var leaves := party.fake_calls.count("leave")
+		clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS + MatchmakingFlow.POLL_SECONDS * 3.0)
+		test._check(party.fake_calls.count("leave") > leaves, "the unanswered cancel is handed to Party's bounded recovery")
+		party.set("_recovery_required", false)
+		party.multiplayer_invalidated.emit(1)
+		clock.advance(MatchmakingFlow.POLL_SECONDS)
+		await test.get_tree().process_frame
+		test._check(not NetManager.has_online_flow(), "and the confirmed reset releases the lease")
+	await _teardown(test)
+
+	await _setup(test, "r7-replacement")
+	ScreenManager.set_container(test)
+	matchmaking.fake_cancel_waits = true
+	var flow := await _searching_owner(test)
+	var owned := _attempt()
+	if flow != null and owned != null:
+		var menu := NRScreen.new()
+		menu.scene_file_path = ScreenManager.MAIN_MENU
+		ScreenManager._stack.append(menu)
+		party.fake_join_result = {"ok": false, "error": "Injected join failure.", "kind": "", "context": null, "peer": null, "code": ""}
+		InviteRouter._on_join_requested({"connection_string": "r7-invite"})
+		for _frame in 3:
+			await test.get_tree().process_frame
+		var dialog: Variant = ScreenManager.current_screen()
+		if dialog != null and dialog.has_signal("dismissed"):
+			dialog.dismissed.emit(true)
+		for _frame in 3:
+			await test.get_tree().process_frame
+		test._check(flow.retired and owned.cancel_in_flight, "accepting the invitation is the group's binding Leave")
+		_native_match(owned, "r7-after-invite")
+		test._check(party.fake_join_arranged_calls.is_empty(), "a match landing then is never joined")
+		clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS + MatchmakingFlow.POLL_SECONDS * 3.0)
+		for _frame in 2:
+			await test.get_tree().process_frame
+		test._check(InviteRouter.has_pending_invite() and not party.fake_calls.has("join_by_connection_string"),
+			"the invitation is kept, not joined, while the old ticket is owed")
+		party.set("_recovery_required", false)
+		party.multiplayer_invalidated.emit(1)
+		clock.advance(MatchmakingFlow.POLL_SECONDS)
+		for _frame in 3:
+			await test.get_tree().process_frame
+		test._check(not NetManager.has_online_flow() and party.fake_calls.count("join_by_connection_string") == 1,
+			"once the reset releases the lease, the kept invitation is redeemed once: %d joins" % party.fake_calls.count("join_by_connection_string"))
+		var failed: Variant = ScreenManager.current_screen()
+		if failed != null and failed.scene_file_path == ScreenManager.DIALOG_BOX:
+			failed._ok_button.pressed.emit()
+		await test.get_tree().process_frame
+		ScreenManager._stack.erase(menu)
+		menu.queue_free()
+	ScreenManager.clear()
+	await _teardown(test)
+
+
+## Quitting while an abandoned ticket's cancel is unanswered is bounded by the one quit
+## budget: the drain waits on that cleanup like any other, and the exit happens once.
+func _r7_quit_is_bounded_while_a_cancel_is_unanswered(test: Node) -> void:
+	print("CASE: R7 quitting while an abandoned ticket's cancel is unanswered exits once, within the one quit budget")
+	await _setup(test, "r7-quit")
+	matchmaking.fake_cancel_waits = true
+	var flow := await _searching_owner(test)
+	var attempt := _attempt()
+	if flow == null or attempt == null:
+		await _teardown(test)
+		return
+	flow.cancel_search()
+	_native_match(attempt, "r7-quit")
+	test._check(flow.retired and NetManager.has_pending_online_work(),
+		"the abandoned group's unanswered cancel counts as online work to drain")
+	var app := _open_quit_probe(test)
+	app.request_shutdown()
+	var budget: int = app._quit_deadline_msec
+	test._check(app._quit_pending and app.quit_calls == 0, "the quit waits in the drain")
+	clock.advance(float(budget - clock.now_msec()) / 1000.0 + PartyService.POLL_INTERVAL)
+	test._check(app.quit_calls == 1, "and exits once, no later than its budget: %d exits" % app.quit_calls)
+	party.set("_recovery_required", false)
+	party.multiplayer_invalidated.emit(1)
+	clock.advance(MatchmakingFlow.POLL_SECONDS)
+	await _end_rb2_case(test, app)
+
+
+## A cancel the pinned binding never answers, and then a Party recovery of it that fails: the
+## runtime needs a restart. The old group joins nothing and searches nothing again. The lease
+## stays held, so nothing that cleanup guarded is released, and no further reset is asked for.
+## Every entry the lease refuses -- Quick Match, Host, Join, Practice and an invitation --
+## says the restart is needed rather than that something is still finishing, while the
+## outcome that ended the group stays what it was. The quit still exits once, on its budget.
+func _r7_failed_recovery_is_terminal_and_keeps_the_lease(test: Node) -> void:
+	print("CASE: R7 a failed recovery of an unanswered cancel keeps the lease, stops asking, reports the restart it needs, and quits once")
+	await _setup(test, "r7-failed-recovery")
+	ScreenManager.set_container(test)
+	matchmaking.fake_cancel_waits = true
+	var flow := await _searching_owner(test)
+	var attempt := _attempt()
+	if flow == null or attempt == null:
+		ScreenManager.clear()
+		await _teardown(test)
+		return
+	flow.cancel_search()
+	_native_match(attempt, "r7-failed")
+	var leaves := party.fake_calls.count("leave")
+	clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS + MatchmakingFlow.POLL_SECONDS * 3.0)
+	test._check(party.fake_calls.count("leave") == leaves + 1 and party.is_cleanup_pending(),
+		"the unanswered cancel is handed to Party's bounded recovery once")
+	# The scoped shutdown fails: Party latches its restart-required reason and reports it.
+	party.recovery_error = PartyService.RECOVERY_FAILED
+	NetManager._on_party_cleanup_status(PartyService.RECOVERY_FAILED)
+	test._check(flow.cleanup_error == PartyService.RECOVERY_FAILED
+		and String(NetManager.flow_snapshot().get("cleanup_error", "")) == PartyService.RECOVERY_FAILED,
+		"the retired flow reports the restart the failure needs")
+	test._check(NetManager.last_disconnect_reason == MatchmakingFlow.TEXT_MATCH_ABANDONED,
+		"while the outcome that ended the group stays its own: %s" % NetManager.last_disconnect_reason)
+	clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS * 4.0)
+	test._check(party.fake_calls.count("leave") == leaves + 1,
+		"no further reset is asked for once the failure is terminal: %d" % (party.fake_calls.count("leave") - leaves))
+	test._check(NetManager.has_online_flow() and NetManager.has_pending_online_work() and attempt.cancel_in_flight,
+		"the lease stays held over the cancel that is still unanswered")
+	test._check(party.fake_join_arranged_calls.is_empty() and matchmaking.fake_creates.size() == 1,
+		"the match it let go of is never joined, and nothing is searched again")
+	var matchmaking_started: bool = await NetManager.start_matchmaking()
+	test._check(not matchmaking_started and NetManager.last_error == PartyService.RECOVERY_FAILED,
+		"Quick Match is refused with the restart it needs: %s" % NetManager.last_error)
+	var hosted: bool = await NetManager.host_match()
+	test._check(not hosted and NetManager.last_error == PartyService.RECOVERY_FAILED,
+		"so is Host Match: %s" % NetManager.last_error)
+	test._check(not NetManager.start_offline() and NetManager.last_error == PartyService.RECOVERY_FAILED,
+		"and Practice, which the lease also holds: %s" % NetManager.last_error)
+	var refused_join := NetManager.join_by_invite("r7-failed-join")
+	test._check(refused_join.outcome == JoinRequest.Outcome.FAILED and refused_join.reason == PartyService.RECOVERY_FAILED,
+		"a join gives the same reason: %s" % refused_join.reason)
+	var menu := NRScreen.new()
+	menu.scene_file_path = ScreenManager.MAIN_MENU
+	ScreenManager._stack.append(menu)
+	InviteRouter._on_join_requested({"connection_string": "r7-failed-invite"})
+	for _frame in 3:
+		await test.get_tree().process_frame
+	var refusal: Variant = ScreenManager.current_screen()
+	var shown: bool = refusal != null and refusal.scene_file_path == ScreenManager.DIALOG_BOX
+	test._check(shown and refusal._message == PartyService.RECOVERY_FAILED,
+		"an invitation is answered with it too: %s" % (refusal._message if shown else "no dialog"))
+	test._check(not InviteRouter.has_pending_invite() and not party.fake_calls.has("join_by_connection_string"),
+		"and is not kept for a release that will not come")
+	if shown:
+		refusal._ok_button.pressed.emit()
+	for _frame in 2:
+		await test.get_tree().process_frame
+	ScreenManager._stack.erase(menu)
+	menu.queue_free()
+	ScreenManager.clear()
+	var app := _open_quit_probe(test)
+	app.request_shutdown()
+	var budget: int = app._quit_deadline_msec
+	test._check(app._quit_pending and app.quit_calls == 0, "the quit waits in the drain")
+	clock.advance(float(budget - clock.now_msec()) / 1000.0 + PartyService.POLL_INTERVAL)
+	test._check(app.quit_calls == 1, "and exits once, no later than its budget: %d exits" % app.quit_calls)
+	# The case is over. What the failure latched belongs to a runtime a restart discards.
+	party.recovery_error = ""
+	party.set("_recovery_required", false)
+	matchmaking.multiplayer_invalidated(2)
+	clock.advance(MatchmakingFlow.POLL_SECONDS)
+	await _end_rb2_case(test, app)
 
 
 # --- F11: guest replay, owner answers, destinations ------------------------------------------
@@ -3121,11 +4066,33 @@ func _f11_invite_destinations_and_exact_credentials(test: Node) -> void:
 	await _teardown(test)
 
 
-# --- F14: the full-four rejection -------------------------------------------------------------
+# --- F14: a four-member group's failed ticket ---------------------------------------------
 
-func _f14_full_four_rejection_restores_everyone(test: Node) -> void:
-	print("CASE: F14 a valid four reaches the ticket; the immediate and the asynchronous rejection both restore every member, unready and advertised, with the reason")
-	for form: String in ["immediate", "async"]:
+## The addon's result shapes, as a failed ticket reaches the service. The pinned binding
+## reports a creation that ended before any ticket id, and a tracked ticket's terminal
+## failure, as E_FAIL placeholders with no service cause; a result that does carry the
+## service's ticket-too-large HRESULT arrives sign-extended.
+const _E_FAIL_SIGNED := -2147467259
+const _TICKET_TOO_LARGE_SIGNED := -1994172846
+
+
+func _addon_failure(code: String, hresult: int = _E_FAIL_SIGNED) -> Dictionary:
+	return {"ok": false, "code": code, "hresult": hresult, "message": "Injected addon failure.", "data": {}}
+
+
+## A valid four reaches the ticket whatever happens next, and the service's own classifier
+## decides what its failure means. The pinned binding's placeholders -- a creation that
+## ended before any ticket id, a tracked ticket's generic terminal failure -- are generic
+## failures whose cause the addon does not report: never a confirmed queue-size rejection,
+## with the full-four limit told alongside as a configuration fact. An explicit start
+## failure is reported as itself. Only the service's ticket-too-large HRESULT is that
+## rejection. Either way the whole group is restored the same way: unready, unlocked,
+## reopened and advertised, the same reason in the envelope for a member that never held a
+## ticket, and nothing retried on its own.
+func _f14_four_member_failures_restore_everyone_honestly(test: Node) -> void:
+	print("CASE: F14 a four-member group's failed ticket restores every member with the service's honest reason; only the service's own cause is a confirmed full-four rejection")
+	var guidance := MatchmakingService.FULL_PARTY_GUIDANCE
+	for form: String in ["no_ticket_id", "terminal", "not_initialized", "confirmed"]:
 		await _setup(test, "f14-" + form)
 		var flow := await _open_group(test)
 		if flow == null:
@@ -3135,21 +4102,38 @@ func _f14_full_four_rejection_restores_everyone(test: Node) -> void:
 		_add_guest(6, "f14-c")
 		_add_guest(8, "f14-d")
 		NetManager.roster_changed.emit()
-		if form == "immediate":
-			matchmaking.fake_reject_create = {
-				"code": MatchmakingService.FULL_PARTY_REASON_CODE, "text": MatchmakingService.FULL_PARTY_REASON}
+		match form:
+			"no_ticket_id":
+				matchmaking.fake_create_result = _addon_failure("match_ticket_create_failed")
+			"not_initialized":
+				matchmaking.fake_create_result = _addon_failure("not_initialized")
+			"confirmed":
+				matchmaking.fake_create_result = _addon_failure("match_ticket_create_failed", _TICKET_TOO_LARGE_SIGNED)
 		_ready_all()
 		_ack_all(flow)
 		test._check(matchmaking.fake_creates.size() == 1 and _members(matchmaking.fake_creates[0]) == 4,
 			"[%s] the valid four reach the ticket create" % form)
-		if form == "async":
+		if form == "terminal":
 			var attempt := _attempt()
 			_progress(attempt, MatchmakingService.STATUS_WAITING_FOR_PLAYERS, "ticket-f14")
-			_finish(attempt, MatchmakingService.Outcome.FAILED, MatchmakingService.FULL_PARTY_REASON_CODE,
-				MatchmakingService.FULL_PARTY_REASON)
+			matchmaking.fake_classify(attempt, _addon_failure("match_ticket_failed"), &"terminal")
 		_complete_activity()
 		test._check(flow.phase == MatchmakingFlow.Phase.GATHERING, "[%s] the group gathers again (phase %d)" % [form, flow.phase])
-		test._check(flow.reason == MatchmakingService.FULL_PARTY_REASON, "[%s] with the durable reason: '%s'" % [form, flow.reason])
+		if form == "confirmed":
+			test._check(flow.reason_code == MatchmakingService.FULL_PARTY_REASON_CODE,
+				"[%s] the service's own cause is the confirmed rejection: %s" % [form, flow.reason_code])
+			test._check(flow.reason == MatchmakingService.FULL_PARTY_REASON, "[%s] with its reason: '%s'" % [form, flow.reason])
+		else:
+			test._check(flow.reason_code != MatchmakingService.FULL_PARTY_REASON_CODE and flow.reason_code != &"",
+				"[%s] a generic failure keeps its own code, never the confirmed rejection: %s" % [form, flow.reason_code])
+			test._check(flow.reason != MatchmakingService.FULL_PARTY_REASON and not guidance.is_empty(),
+				"[%s] and its own reason: '%s'" % [form, flow.reason])
+			if form == "not_initialized":
+				test._check(not flow.reason.contains(guidance),
+					"[%s] an explicit cause is reported as itself, with no queue-size note: '%s'" % [form, flow.reason])
+			else:
+				test._check(flow.reason.contains(guidance),
+					"[%s] a cause the addon does not report tells the full-four limit alongside, as a fact: '%s'" % [form, flow.reason])
 		var unready := true
 		for peer_id: int in NetManager.players:
 			unready = unready and not (NetManager.players[peer_id] as PlayerState).is_ready
@@ -3157,13 +4141,1414 @@ func _f14_full_four_rejection_restores_everyone(test: Node) -> void:
 		test._check(NetManager.is_accepting_joins() and not bool(party.fake_locked.get(party.fake_staging.context_id, true)),
 			"[%s] the lobby is unlocked and open again" % form)
 		var control: Dictionary = party.fake_search_control.get(party.fake_staging.context_id, {})
-		test._check(String(control.get("phase", "")) == MatchmakingFlow.ENVELOPE_GATHERING
-			and String(control.get("reason", "")) == MatchmakingService.FULL_PARTY_REASON,
-			"[%s] the envelope carries the reason to guests that never held a ticket" % form)
+		test._check(String(control.get("phase", "")) == MatchmakingFlow.ENVELOPE_GATHERING,
+			"[%s] the envelope says the group is gathering" % form)
+		test._check(String(control.get("reason", "")) == flow.reason and String(control.get("reason_code", "")) == String(flow.reason_code),
+			"[%s] and carries the same reason and code to members that never held a ticket: '%s'" % [form, String(control.get("reason", ""))])
 		test._check(NetManager._platform.wants_activity(), "[%s] the group is advertised again" % form)
 		test._check(matchmaking.fake_creates.size() == 1, "[%s] nothing is retried automatically" % form)
 		await _teardown(test)
-		matchmaking.fake_reject_create = {}
+		matchmaking.fake_create_result = null
+
+
+# --- Composed: the production services over the service suite's SDK doubles ------------------
+#
+# These cases run the real PartyService and MatchmakingService -- their proofs, scoped leaves,
+# recovery and ticket cleanup -- under the production NetManager, Services and flow. Only SDK
+# facts, call ordering and controlled native completions are set: no proof, recovery or
+# invalidation is re-implemented or emitted by the case.
+
+func _setup_composed(test: Node, account: String) -> void:
+	await test._reset()
+	chat = Doubles.Chat.new()
+	real_party = ServiceDoubles.Party.new(chat)
+	real_matchmaking = ServiceDoubles.Matchmaking.new()
+	real_clock = real_party.fake_clock
+	activity = Review.Activity.new()
+	_completed_calls = 0
+	Services._chat = chat
+	Services._party = real_party
+	Services.bind_party_signals()
+	Services._matchmaking = real_matchmaking
+	Services.bind_matchmaking_signals()
+	Services._activity = activity
+	Services.use_clock(real_clock)
+	NetManager._clock = real_clock.now_msec
+	_bind_composed_party(true)
+	# One Multiplayer runtime: its scoped shutdown answers the tickets' held cancels inside the
+	# call, as the runtime's own shutdown does, before the service reports the reset.
+	real_party.pf.multiplayer.shutdown_hook = real_matchmaking.sdk.invalidate_runtime
+	test._select(account, test._folder())
+	var signed_in: Array = [null]
+	_capture_sign_in(signed_in)
+	test._check(await _composed_until(test, func() -> bool: return signed_in[0] != null) and bool(signed_in[0]),
+		"composed account ready: " + account)
+
+
+## Runs the composed clock on one step at a time, a frame after each, until `done` holds or
+## `steps` run out. A step that never settles is then a named failure, not a hang.
+func _composed_until(test: Node, done: Callable, steps: int = 40, seconds: float = MatchmakingFlow.POLL_SECONDS) -> bool:
+	for _step in steps:
+		if bool(done.call()):
+			return true
+		real_clock.advance(seconds)
+		await test.get_tree().process_frame
+	return bool(done.call())
+
+
+func _capture_sign_in(box: Array) -> void:
+	box[0] = await Services.sign_in()
+
+
+func _capture_quick_match(box: Array) -> void:
+	box[0] = await NetManager.start_matchmaking()
+
+
+func _capture_host_match(box: Array) -> void:
+	box[0] = await NetManager.host_match()
+
+
+## The composed PartyService's notices, bound to NetManager as the title binds its own.
+func _bind_composed_party(bind: bool) -> void:
+	var links: Array = [
+		[real_party.network_lost, NetManager._on_party_network_lost],
+		[real_party.party_failed, NetManager._on_party_failed],
+		[real_party.cleanup_status_changed, NetManager._on_party_cleanup_status],
+		[real_party.context_updated, NetManager._on_context_changed],
+		[real_party.context_lost, NetManager._on_context_lost],
+	]
+	for link: Array in links:
+		var notice: Signal = link[0]
+		var handler: Callable = link[1]
+		if bind and not notice.is_connected(handler):
+			notice.connect(handler)
+		elif not bind and notice.is_connected(handler):
+			notice.disconnect(handler)
+
+
+## Lets every held SDK completion go, leaves what is live, runs out the clock, and discards
+## a runtime a case left restart-required by one real, successful recovery -- so nothing the
+## case started outlives it.
+func _teardown_composed(test: Node) -> void:
+	for lobby: ServiceDoubles.Lobby in real_party.pf.multiplayer.lobbies:
+		lobby.block_leave = false
+		lobby.leave_released.emit()
+		lobby.block_properties = false
+		lobby.properties_released.emit()
+	for network: ServiceDoubles.Network in real_party.pf.party.networks:
+		network.block_leave = false
+		network.leave_released.emit()
+	for ticket: ServiceDoubles.Ticket in real_matchmaking.sdk.tracked_tickets.duplicate():
+		ticket.block_cancel = false
+		ticket.cancel_released.emit()
+	real_party.pf.multiplayer.block_create = false
+	real_party.pf.multiplayer.create_released.emit()
+	real_party.pf.party.block_create = false
+	real_party.pf.party.create_released.emit()
+	real_party.pf.multiplayer.next_shutdown_result = null
+	real_party.pf.multiplayer.shutdown_hook = real_matchmaking.sdk.invalidate_runtime
+	NetManager.leave_match()
+	if not real_party.recovery_error.is_empty():
+		real_party.recovery_error = ""
+		real_party.require_recovery(&"case_teardown")
+		real_party.leave()
+	for _sweep in 6:
+		_complete_activity()
+		real_clock.advance(20.0)
+		await test.get_tree().process_frame
+	if NetManager.has_online_flow():
+		# A flow still holding its lease over work the case left owed stops watching it with
+		# its account, as it does in the title.
+		Services.invalidate_saves_for_resume()
+		for _sweep in 2:
+			real_clock.advance(1.0)
+			await test.get_tree().process_frame
+	test._check(not NetManager.has_online_flow() and not NetManager.has_session()
+		and NetManager._active_join_request == null and not NetManager.is_account_teardown_pending(),
+		"composed case leaves no flow, session, join or teardown behind")
+	test._check(real_clock.pending_sleepers() == 0 and real_clock.armed_alarm_count() == 0
+		and not real_matchmaking.has_pending_cleanup() and not real_party.is_cleanup_pending(),
+		"composed case leaves nothing asleep, armed or owed: %d asleep, %d armed, matchmaking cleanup %s, Party cleanup %s" % [
+			real_clock.pending_sleepers(), real_clock.armed_alarm_count(),
+			real_matchmaking.has_pending_cleanup(), real_party.is_cleanup_pending()])
+	real_party.pf.multiplayer.shutdown_hook = Callable()
+	_bind_composed_party(false)
+	Services.use_clock(OnlineFlowClock.new())
+	NetManager._clock = Time.get_ticks_msec
+	Services._party = null
+	Services._chat = null
+	Services._matchmaking = null
+	Services._activity = _saved_activity
+	real_party = null
+	real_matchmaking = null
+	real_clock = null
+
+
+## A hosted lobby at `connection`, owned by `owner`, with the transport a join finds behind it:
+## peer 1 is the owner and this player peer 7. Returns the SDK handles the case may change.
+func _composed_hosted_lobby(owner: Dictionary, connection: String) -> Dictionary:
+	var lobby := ServiceDoubles.Lobby.new()
+	lobby.lobby_id = connection + "-lobby"
+	lobby.connection_string = connection
+	lobby.owner_entity_key = owner.duplicate()
+	lobby.search_properties = {
+		PartyService.JOIN_CODE_KEY: "ABCDE",
+		PartyService.GAME_MODE_KEY: "deathmatch",
+		NRProtocol.LOBBY_KEY: NRProtocol.version_string(),
+	}
+	lobby.properties = {PartyService.DESCRIPTOR_KEY: connection + "-descriptor"}
+	lobby.members = [ServiceDoubles.Member.new(owner, {
+		MatchmakingService.PROTOCOL_MEMBER_KEY: NRProtocol.version_string(),
+	})]
+	var network := ServiceDoubles.Network.new()
+	var peer := RecordingPeer.new()
+	peer.keys[1] = owner.duplicate()
+	network.local_peer = peer
+	real_party.pf.multiplayer.lobby_by_connection[connection] = lobby
+	real_party.pf.party.queued_networks.append(network)
+	# The host's chat control is in the mesh a guest joins, as Party surfaces it.
+	chat.sdk.add_remote_control(owner)
+	return {"lobby": lobby, "network": network, "peer": peer}
+
+
+## The owner's own group, open over the real services, or null.
+func _composed_group(test: Node) -> MatchmakingFlow:
+	var opened: Array = [null]
+	_capture_quick_match(opened)
+	await _composed_until(test, func() -> bool: return opened[0] != null, 20)
+	_complete_activity()
+	var flow: MatchmakingFlow = NetManager._flow
+	var started := opened[0] != null and bool(opened[0])
+	test._check(started and flow != null and flow.staging_context != null,
+		"the owner's group opens over the real PartyService: %s" % NetManager.last_error)
+	return flow if started and flow != null and flow.staging_context != null else null
+
+
+## That group readied and searching on a real ticket, or null.
+func _composed_searching_group(test: Node) -> MatchmakingFlow:
+	var flow := await _composed_group(test)
+	if flow == null:
+		return null
+	NetManager.set_local_ready(true)
+	await _composed_until(test, func() -> bool: return _composed_ticket() != null, 20)
+	var ticket := _composed_ticket()
+	test._check(ticket != null, "the ready group's ticket is created through the real service")
+	if ticket == null:
+		return null
+	ticket.emit_status(MatchmakingService.STATUS_WAITING_FOR_MATCH)
+	await test.get_tree().process_frame
+	return flow
+
+
+func _composed_ticket() -> ServiceDoubles.Ticket:
+	if real_matchmaking == null or real_matchmaking.sdk.tracked_tickets.is_empty():
+		return null
+	return real_matchmaking.sdk.tracked_tickets.back()
+
+
+func _capture_scoped_leave(context: PartyService.LobbyContext, box: Array) -> void:
+	box[0] = await real_party.leave_lobby(context)
+
+
+func _capture_awaited_leave(done: Array) -> void:
+	await NetManager.leave_match_and_wait()
+	done[0] = true
+
+
+func _capture_suspend_teardown(done: Array) -> void:
+	await NetManager.finish_suspend_teardown()
+	done[0] = true
+
+
+## Item 1, over the real PartyService: an admitted ordinary hosted guest whose own lobby
+## connection drops while Party runs on keeps playing under the host it proved, and a lobby
+## that reconnects is proven in full again. A different peer 1, a lost transport or a cleared
+## owner still end the session once, and a join not yet admitted is refused at once -- no
+## identity is sent and the join's deadline is not waited out.
+func _c1_admitted_hosted_session_outlives_only_its_local_lobby_connection(test: Node) -> void:
+	print("CASE: C1 over the real PartyService an admitted hosted guest outlives only its own lobby connection; a join, a changed host or a lost transport do not")
+	var owner := _key("c1-host")
+	var outcomes := {
+		"continues": "",
+		"reconnected_changed": NetManager._HOST_CHANGED,
+		"host_key_changed": NetManager._HOST_CHANGED,
+		"transport_lost": NetManager._HOST_LEFT_BEFORE_JOIN,
+		"owner_cleared": NetManager._HOST_CHANGED,
+		"before_admission": NetManager._HOST_LEFT_BEFORE_JOIN,
+	}
+	for scenario: String in outcomes.keys():
+		await _setup_composed(test, "c1-" + scenario)
+		var connection := "c1-%s-connection" % scenario
+		var hosted := _composed_hosted_lobby(owner, connection)
+		var lobby: ServiceDoubles.Lobby = hosted["lobby"]
+		var peer: RecordingPeer = hosted["peer"]
+		var request := NetManager.join_by_invite(connection)
+		await test.get_tree().process_frame
+		test._check(NetManager._peer == peer and request.is_pending(),
+			"[%s] the real join binds the transport it found and waits for the host" % scenario)
+		if NetManager._peer != peer:
+			await _teardown_composed(test)
+			continue
+		peer.connect_remote(NetManager.HOST_PEER_ID)
+		if scenario == "before_admission":
+			lobby.disconnected = true
+			var started := real_clock.now_msec()
+			real_clock.advance(MatchmakingFlow.POLL_SECONDS)
+			await test.get_tree().process_frame
+			NetManager._request_player_identity()
+			test._check(request.outcome == JoinRequest.Outcome.FAILED and request.reason == String(outcomes[scenario]),
+				"[%s] a join whose lobby connection is gone is refused: %s" % [scenario, request.reason])
+			test._check(real_clock.now_msec() - started < 1000 and _rpc_calls(peer) == 0 and not NetManager.has_session(),
+				"[%s] at once, with no identity sent and nothing adopted" % scenario)
+			await _teardown_composed(test)
+			continue
+		NetManager._request_player_identity()
+		test._check(_rpc_calls(peer) == 1, "[%s] the real proof answers the host once" % scenario)
+		_host_replays_and_accepts("C1 Host")
+		real_clock.advance(MatchmakingFlow.POLL_SECONDS)
+		await test.get_tree().process_frame
+		test._check(request.succeeded() and NetManager.has_session(), "[%s] and the guest is admitted" % scenario)
+		lobby.disconnected = true
+		var kept := _send_host_state(5)
+		test._check(bool(kept["applied"]) and int(kept["ends"]) == 0 and NetManager.has_session(),
+			"[%s] with only its own lobby connection gone, the admitted session carries on under its host" % scenario)
+		match scenario:
+			"reconnected_changed":
+				lobby.disconnected = false
+				lobby.owner_entity_key = _key("c1-other-owner")
+			"host_key_changed":
+				peer.keys[1] = _key("c1-other")
+			"transport_lost":
+				peer.connected = false
+			"owner_cleared":
+				lobby.disconnected = false
+				lobby.owner_entity_key = {}
+		if scenario != "continues":
+			var seen := _send_host_state(6)
+			test._check(not bool(seen["applied"]) and int(seen["ends"]) == 1 and not NetManager.has_session(),
+				"[%s] and then ends once, applying nothing: %d ends" % [scenario, int(seen["ends"])])
+			test._check(NetManager.last_disconnect_reason == String(outcomes[scenario]),
+				"[%s] with this title's reason: %s" % [scenario, NetManager.last_disconnect_reason])
+		await _teardown_composed(test)
+
+
+## Item 1's other half: a matchmaking lobby whose own connection is gone stays lost. Over the
+## owner facts the service reports -- PartyService's own proof of them is the service suite's
+## case -- a staging guest's group ends, and an adopted rematch replacement's match ends, once
+## each, applying nothing peer 1 sends.
+func _c1_scoped_local_lobby_loss_stays_terminal(test: Node) -> void:
+	print("CASE: C1 a staging or rematch session whose own lobby connection is gone ends once; the hosted exception is not theirs")
+	for path: String in ["staging", "rematch"]:
+		await _setup(test, "c1-scoped-" + path)
+		var flow: MatchmakingFlow = null
+		var context: PartyService.LobbyContext = null
+		var expected := ""
+		if path == "rematch":
+			_pending_rematch(test, _key(ARRANGED_OWNER_ID))
+			NetManager._request_player_identity()
+			_host_replays_and_accepts("C1 Host")
+			clock.advance(MatchmakingFlow.POLL_SECONDS)
+			flow = NetManager._flow
+			context = party.fake_arranged
+			expected = NetManager._MATCH_HOST_LEFT
+		else:
+			flow = _staging_guest(test, 7)
+			context = party.fake_staging
+			expected = MatchmakingFlow.TEXT_GROUP_HOST_LEFT
+		test._check(flow != null and flow.is_current(), "[%s] the session is admitted" % path)
+		if flow == null:
+			await _teardown(test)
+			continue
+		party.fake_lobby_disconnected[context.context_id] = true
+		var seen := _send_host_state(5)
+		test._check(not bool(seen["applied"]) and int(seen["ends"]) == 1 and flow.retired,
+			"[%s] peer 1's next message ends it once, applying nothing: %d ends" % [path, int(seen["ends"])])
+		test._check(NetManager.last_disconnect_reason == expected,
+			"[%s] with its reason: %s" % [path, NetManager.last_disconnect_reason])
+		await _teardown(test)
+
+
+## Item 2, over the real PartyService: every waiter on a flow's scoped leaves -- the flow's
+## own first leave, a coalesced public caller, the quit drain and account teardown -- settles
+## from the global cleanup's confirmed reset while both native leaves are still held; the
+## lease goes with them. Releasing the old native signals afterwards settles nothing twice,
+## calls nothing again and touches no replacement. A native answer, at once or before the
+## grace, needs no reset at all; a reset that fails never looks like a release.
+func _c2_scoped_leave_waiters_settle_from_recovery(test: Node) -> void:
+	print("CASE: C2 over the real PartyService every scoped-leave waiter settles from the confirmed reset, once; a failed reset is no release")
+	for scenario: String in ["recovered", "recovered_account", "native_at_once", "native_delayed", "failed_recovery"]:
+		await _setup_composed(test, "c2-" + scenario)
+		var flow := await _composed_group(test)
+		if flow == null:
+			await _teardown_composed(test)
+			continue
+		var context: PartyService.LobbyContext = flow.staging_context
+		var lobby: ServiceDoubles.Lobby = real_party.pf.multiplayer.lobbies.back()
+		var network: ServiceDoubles.Network = real_party.pf.party.networks.back()
+		var held := scenario != "native_at_once"
+		lobby.block_leave = held
+		network.block_leave = held
+		if scenario == "failed_recovery":
+			real_party.pf.multiplayer.next_shutdown_result = ServiceDoubles.Results.make(
+				false, null, "shutting_down", "Injected scoped shutdown failure.", -2147467260)
+		NetManager.leave_match()
+		var direct: Array = [null]
+		if held:
+			_capture_scoped_leave(context, direct)
+		var quit_done: Array = [false]
+		if scenario == "recovered":
+			_capture_awaited_leave(quit_done)
+		if scenario == "recovered_account":
+			NetManager._on_account_lost()
+		await test.get_tree().process_frame
+		if scenario == "native_delayed":
+			lobby.leave_released.emit()
+			network.leave_released.emit()
+			real_clock.advance(MatchmakingFlow.POLL_SECONDS)
+			await test.get_tree().process_frame
+		elif held:
+			test._check(NetManager.has_online_flow() and direct[0] == null,
+				"[%s] while both native leaves are held, the lease and every waiter wait" % scenario)
+			real_clock.advance(NRConst.MATCH_CLEANUP_SECONDS + 1.0)
+			await test.get_tree().process_frame
+		var shutdowns := real_party.pf.multiplayer.shutdown_calls
+		var result: PartyService.PartyResult = direct[0]
+		if scenario == "failed_recovery":
+			test._check(result != null and not result.ok() and NetManager.has_online_flow()
+				and NetManager.retained_cleanup_failure() == PartyService.RECOVERY_FAILED,
+				"[%s] the waiters settle as failed and the lease stays held, restart-required" % scenario)
+		else:
+			if held:
+				test._check(result != null and result.ok(), "[%s] the coalesced public caller settles OK" % scenario)
+			test._check(not NetManager.has_online_flow(), "[%s] and the lease is released" % scenario)
+			test._check(shutdowns == (1 if scenario.begins_with("recovered") else 0),
+				"[%s] from %s: %d resets" % [scenario, "the one confirmed reset" if scenario.begins_with("recovered") else "the native answer", shutdowns])
+		if scenario == "recovered":
+			test._check(bool(quit_done[0]), "[%s] the quit drain's wait has finished too" % scenario)
+		if scenario == "recovered_account":
+			test._check(not NetManager.is_account_teardown_pending(), "[%s] and so has the account teardown" % scenario)
+		test._check(lobby.leaves == 1 and network.leaves == 1,
+			"[%s] each native leave was called once: %d, %d" % [scenario, lobby.leaves, network.leaves])
+		if scenario == "recovered":
+			var replacement := await _composed_group(test)
+			lobby.leave_released.emit()
+			network.leave_released.emit()
+			real_clock.advance(MatchmakingFlow.POLL_SECONDS)
+			await test.get_tree().process_frame
+			test._check(direct[0] == result and lobby.leaves == 1 and network.leaves == 1,
+				"[%s] the old native answers settle nothing twice and call nothing again" % scenario)
+			test._check(replacement != null and replacement == NetManager._flow and replacement.is_live()
+				and not real_party.snapshot(replacement.staging_context).is_empty(),
+				"[%s] and leave the replacement group untouched" % scenario)
+		await _teardown_composed(test)
+
+
+## Items 3 and 7, over the real services: a cancel in flight on a ticket the service then
+## matches is an obligation of the runtime, not of the flow or the account. Removing the
+## account or suspending before the flow's grace, a match landing while the teardown is
+## already running, or one landing after that teardown has finished, still gets exactly one
+## confirmed reset -- the held cancel is answered inside the shutdown and logged as released
+## by that reset, not as a lost race -- no old session is adopted, nothing old is owed
+## afterwards, and the next account starts Quick Match without a restart. Entry while the old
+## cleanup is owed waits for it: the next sign-in finishes the old session, reset included,
+## first, and a search still being cancelled says so. A late answer from the old runtime
+## changes nothing. A reset that fails is the restart-required refusal, and is not asked for
+## again. Every wait is bounded on the composed clock, so a step that never settles fails by
+## name.
+func _c3_orphaned_cancel_survives_account_removal_and_suspend(test: Node) -> void:
+	print("CASE: C3 over the real services an orphaned matched cancel survives account removal and suspend: one reset, nothing adopted, Quick Match again")
+	for scenario: String in ["account_removed", "suspended", "matched_during_teardown", "matched_after_teardown", "failed_recovery"]:
+		await _setup_composed(test, "c3-" + scenario)
+		var flow := await _composed_searching_group(test)
+		var ticket := _composed_ticket()
+		if flow == null or ticket == null:
+			await _teardown_composed(test)
+			continue
+		var lobby: ServiceDoubles.Lobby = real_party.pf.multiplayer.lobbies.back()
+		ticket.block_cancel = true
+		flow.cancel_search()
+		await test.get_tree().process_frame
+		test._check(ticket.cancel_waiting and real_matchmaking.has_pending_cleanup(),
+			"[%s] the owner's cancel is in flight" % scenario)
+		if scenario == "failed_recovery":
+			real_party.pf.multiplayer.shutdown_hook = Callable()
+			real_party.pf.multiplayer.next_shutdown_result = ServiceDoubles.Results.make(
+				false, null, "shutting_down", "Injected scoped shutdown failure.", -2147467260)
+		# Held so the old group's scoped leave is still owed while the account goes: the reset
+		# that settles it is then the only way forward.
+		if scenario == "account_removed" or scenario == "matched_during_teardown":
+			lobby.block_leave = true
+		if scenario in ["account_removed", "suspended", "failed_recovery"]:
+			ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+			await test.get_tree().process_frame
+			test._check(flow.retired and real_matchmaking.has_orphaned_matched_cancel() and NetManager.has_online_flow(),
+				"[%s] the match lands on the stopped search: the group ends, its lease held over the orphaned cancel" % scenario)
+		# Before the flow's own grace has run, the title suspends and resumes, or the account goes.
+		if scenario == "suspended":
+			NetManager.abandon_for_suspend()
+			Services.invalidate_saves_for_resume()
+			var resumed: Array = [false]
+			_capture_suspend_teardown(resumed)
+			test._check(await _composed_until(test, func() -> bool: return bool(resumed[0]), 60, 1.0),
+				"[%s] the resume's deferred teardown finishes" % scenario)
+		else:
+			Services.cancel_sign_in()
+			await test.get_tree().process_frame
+		if scenario == "matched_during_teardown":
+			ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+			await test.get_tree().process_frame
+			test._check(NetManager.is_account_teardown_pending() and real_matchmaking.has_orphaned_matched_cancel(),
+				"[%s] the match lands after the teardown's first look, while it still runs" % scenario)
+			lobby.leave_released.emit()
+		var signed_in: Array = [null]
+		if scenario == "account_removed":
+			_capture_sign_in(signed_in)
+			await test.get_tree().process_frame
+			test._check(signed_in[0] == null and NetManager.is_account_teardown_pending()
+				and Services.sign_in_stage == "Finishing the previous session"
+				and real_party.pf.multiplayer.shutdown_calls == 0,
+				"[%s] the next account's sign-in waits while the old session's reset is still owed" % scenario)
+		test._check(await _composed_until(test, func() -> bool: return not NetManager.is_account_teardown_pending(), 60, 1.0),
+			"[%s] the teardown finishes on its bounded cleanup" % scenario)
+		if signed_in[0] == null and not Services.is_account_ready():
+			_capture_sign_in(signed_in)
+		var account_back: bool = await _composed_until(test, func() -> bool: return Services.is_account_ready(), 40)
+		test._check(account_back, "[%s] the next account signs in" % scenario)
+		if scenario == "matched_after_teardown":
+			test._check(real_party.pf.multiplayer.shutdown_calls == 0 and real_matchmaking.has_pending_cleanup()
+				and not real_matchmaking.has_orphaned_matched_cancel(),
+				"[%s] the teardown found only a search still being cancelled, and reset nothing" % scenario)
+			var waiting: Array = [null]
+			_capture_quick_match(waiting)
+			await _composed_until(test, func() -> bool: return waiting[0] != null, 20)
+			test._check(waiting[0] == false and NetManager.last_error == NetManager._PREVIOUS_SEARCH_FINISHING,
+				"[%s] the next account's Quick Match waits, told the previous search is still finishing: %s" % [scenario, NetManager.last_error])
+			ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+			await _composed_until(test, func() -> bool: return real_party.pf.multiplayer.shutdown_calls > 0 and not real_matchmaking.has_pending_cleanup(), 20)
+		test._check(real_party.pf.multiplayer.shutdown_calls == 1,
+			"[%s] exactly one reset is run: %d" % [scenario, real_party.pf.multiplayer.shutdown_calls])
+		test._check(real_party.pf.multiplayer.arranged_calls.is_empty() and not NetManager.has_online_flow(),
+			"[%s] no arranged match is joined and nothing of the old group is held" % scenario)
+		if scenario == "failed_recovery":
+			test._check(real_party.recovery_error == PartyService.RECOVERY_FAILED,
+				"[%s] the failed reset latches the restart it needs" % scenario)
+			var refused: Array = [null]
+			_capture_quick_match(refused)
+			await _composed_until(test, func() -> bool: return refused[0] != null, 20)
+			test._check(refused[0] == false and NetManager.last_error == PartyService.RECOVERY_FAILED,
+				"[%s] and Quick Match says a restart is needed: %s" % [scenario, NetManager.last_error])
+			var hosted: Array = [null]
+			_capture_host_match(hosted)
+			await _composed_until(test, func() -> bool: return hosted[0] != null, 20)
+			test._check(hosted[0] == false and NetManager.last_error == PartyService.RECOVERY_FAILED,
+				"[%s] so does Host Match: %s" % [scenario, NetManager.last_error])
+			real_clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS * 3.0)
+			await test.get_tree().process_frame
+			test._check(real_party.pf.multiplayer.shutdown_calls == 1, "[%s] and no reset is asked for again" % scenario)
+			await _teardown_composed(test)
+			continue
+		test._check(not real_matchmaking.has_pending_cleanup() and not real_matchmaking.has_orphaned_matched_cancel(),
+			"[%s] the confirmed reset leaves nothing of the old ticket owed" % scenario)
+		var released_by_reset := false
+		var lost_race := false
+		for line: String in real_matchmaking.fake_warnings:
+			released_by_reset = released_by_reset or line.contains("cancel_released_by_reset")
+			lost_race = lost_race or line.contains("cancel_lost_race")
+		test._check(released_by_reset and not lost_race,
+			"[%s] and the held cancel is logged as released by that reset, not as a lost race" % scenario)
+		# The old runtime's late answers: the ticket's own terminal status and a lobby leave the
+		# reset already settled.
+		ticket.emit_status(MatchmakingService.STATUS_CANCELLED)
+		lobby.block_leave = false
+		lobby.leave_released.emit()
+		await test.get_tree().process_frame
+		test._check(not real_matchmaking.has_pending_cleanup() and not real_party.is_cleanup_pending()
+			and real_party.pf.multiplayer.shutdown_calls == 1 and lobby.leaves == 1,
+			"[%s] late old answers change nothing and call nothing again: %d leaves" % [scenario, lobby.leaves])
+		var reopened: Array = [null]
+		_capture_quick_match(reopened)
+		await _composed_until(test, func() -> bool: return reopened[0] != null, 20)
+		_complete_activity()
+		test._check(reopened[0] == true and NetManager.is_online_flow_live(),
+			"[%s] and starts Quick Match without a restart: %s" % [scenario, NetManager.last_error])
+		await _teardown_composed(test)
+
+
+## Item 9, over the real PartyService: a scoped network's recoverable error, carrying
+## sensitive words in its message and data, reaches the log as PartyService's one safe record
+## and nothing else -- NetManager adds no second diagnostic and keeps none of the SDK's words
+## -- and the group carries on.
+func _c9_scoped_network_error_is_logged_once_and_safely(test: Node) -> void:
+	print("CASE: C9 a scoped network's recoverable error is logged once, safely, and the group carries on")
+	await _setup_composed(test, "c9-scoped-error")
+	var flow := await _composed_group(test)
+	if flow == null:
+		await _teardown_composed(test)
+		return
+	var network: ServiceDoubles.Network = real_party.pf.party.networks.back()
+	var sentinel := "C9-SENTINEL-alpha C9-SENTINEL-bravo C9-SENTINEL-entity"
+	var change := ServiceDoubles.Change.new()
+	change.kind = PartyService.NETWORK_CHANGE_ERROR
+	change.network = network
+	change.reason = sentinel
+	change.result = ServiceDoubles.Results.make(
+		false, {"party_error": 12, "state_change_result": 3, "note": sentinel},
+		"party_network_connect_failed", sentinel, -2147467259)
+	var recorded := real_party.fake_warnings.size()
+	var tap := LogTap.new()
+	OS.add_logger(tap)
+	network.state_changed.emit(change)
+	OS.remove_logger(tap)
+	var records: Array = real_party.fake_warnings.slice(recorded)
+	test._check(records.size() == 1 and String(records[0]).begins_with("[Party] failure stage=scoped_network_state"),
+		"PartyService logs its one structured record: %s" % str(records))
+	var leaked := false
+	var repeated := false
+	for line: String in Array(tap.lines) + records:
+		leaked = leaked or line.contains("C9-SENTINEL")
+		repeated = repeated or line.contains("non-fatal") or line.contains("[NetManager]")
+	test._check(not leaked, "no log line carries the SDK's words")
+	test._check(not repeated, "and nothing after it claims a second failure")
+	test._check(not NetManager.last_error.contains("C9-SENTINEL") and NetManager.last_error == NetManager._CONTEXT_RECOVERABLE_FAILURE,
+		"what is kept for the player is this title's text: %s" % NetManager.last_error)
+	test._check(flow.is_live() and NetManager.has_online_flow() and NetManager.has_session(),
+		"and the group carries on")
+	await _teardown_composed(test)
+
+
+# --- Delta: cleanup readiness, the final teardown look, Practice, hosted continuity ---------
+
+## A main menu under the router, as the title has one, for the composed invitation cases.
+func _composed_menu(test: Node) -> NRScreen:
+	ScreenManager.set_container(test)
+	var menu := NRScreen.new()
+	menu.scene_file_path = ScreenManager.MAIN_MENU
+	ScreenManager._stack.append(menu)
+	return menu
+
+
+## Dismisses what an invitation case left open and stops a join it started -- waiting, on the
+## composed clock, for that join to settle -- then empties the stack, so nothing it began is
+## still waiting when the next case starts.
+func _end_composed_menu(test: Node, menu: NRScreen) -> void:
+	InviteRouter.decline_pending_invite()
+	var joining: JoinRequest = NetManager._active_join_request
+	if joining != null:
+		NetManager.cancel_join(joining)
+		await _composed_until(test, func() -> bool: return not joining.is_pending(), 40, 1.0)
+	for _dialog in 3:
+		var dialog: Variant = _composed_dialog()
+		if dialog == null:
+			break
+		dialog.dismissed.emit(false)
+		await test.get_tree().process_frame
+	await test.get_tree().process_frame
+	ScreenManager._stack.erase(menu)
+	menu.queue_free()
+	ScreenManager.clear()
+
+
+## The dialog on top of the stack, or null.
+func _composed_dialog() -> Variant:
+	var screen: NRScreen = ScreenManager.current_screen()
+	return screen if screen != null and screen.scene_file_path == ScreenManager.DIALOG_BOX else null
+
+
+func _capture_transport_leave(context: PartyService.LobbyContext, box: Array) -> void:
+	box[0] = await real_party.leave_transport(context)
+
+
+## Delta item 1, over the real services: a group's lobby or Party transport whose native leave
+## fails still owes its cleanup. The failed leave says so itself; the group keeps its lease;
+## online entry stays refused; and an invitation accepted for the group is kept -- neither
+## dispatched nor spent -- under the time it arrived, with no new network made, until Party's
+## reset has confirmed both services. A confirmed reset then joins the invitation once, with its
+## exact connection string. A newer invitation that arrived meanwhile is the one joined, and one
+## that expired meanwhile is discarded. A failed reset answers the invitation once with the
+## restart it needs and is not asked for again. Party asks for that reset as soon as the failed
+## leave is known, so the case holds its Party shutdown at the SDK boundary while it looks at
+## the window before the reset answers, then lets it answer.
+func _d1_failed_native_leave_keeps_cleanup_and_the_invitation(test: Node) -> void:
+	print("CASE: D1 over the real services a failed native lobby or transport leave keeps the group's cleanup, its lease and a kept invitation until the reset settles; a failed reset answers the invitation once")
+	for form: String in ["lobby-reset", "transport-reset", "lobby-failed_reset", "transport-failed_reset", "lobby-newer", "transport-expired"]:
+		await _setup_composed(test, "d1-" + form)
+		var held_sdk := HeldPartySDK.new()
+		real_party.pf.party = held_sdk
+		var menu := _composed_menu(test)
+		var flow := await _composed_group(test)
+		if flow == null:
+			await _end_composed_menu(test, menu)
+			await _teardown_composed(test)
+			continue
+		var lobby_failure := form.begins_with("lobby")
+		var context: PartyService.LobbyContext = flow.staging_context
+		var staging_lobby: ServiceDoubles.Lobby = real_party.pf.multiplayer.lobbies.back()
+		var staging_network: ServiceDoubles.Network = real_party.pf.party.networks.back()
+		var target := "d1-%s-target" % form
+		if form != "lobby-newer":
+			_composed_hosted_lobby(_key("d1-host"), target)
+		if lobby_failure:
+			staging_lobby.next_leave_result = ServiceDoubles.Results.make(
+				false, null, "lobby_leave_start_failed", "Injected lobby leave failure.", -2147467259)
+		else:
+			staging_network.next_leave_result = ServiceDoubles.Results.make(
+				false, null, "party_resource_not_ready", "Injected transport leave failure.", -2147467259)
+		if form.ends_with("failed_reset"):
+			real_party.pf.multiplayer.next_shutdown_result = ServiceDoubles.Results.make(
+				false, null, "shutting_down", "Injected scoped shutdown failure.", -2147467260)
+		held_sdk.hold_shutdown = true
+		var party_joins := real_party.pf.party.join_calls.size()
+		var party_creates := real_party.pf.party.create_calls.size()
+		var arrived_from := Time.get_ticks_msec()
+		InviteRouter._on_join_requested({"connection_string": target})
+		var arrived_to := Time.get_ticks_msec()
+		var confirm: Variant = _composed_dialog()
+		test._check(confirm != null and confirm._title == "Join Match",
+			"[%s] an invitation for the live group asks before leaving it" % form)
+		if confirm != null:
+			confirm._ok_button.pressed.emit()
+		var kept: bool = await _composed_until(test, func() -> bool: return InviteRouter.has_pending_invite(), 40, 0.5)
+		var kept_since := InviteRouter._pending_since_msec
+		test._check(kept and kept_since >= arrived_from and kept_since <= arrived_to and not InviteRouter._joining,
+			"[%s] the invitation is kept, under the time it arrived, while the group's cleanup is owed" % form)
+		test._check(held_sdk.shutdown_starts == 1 and real_party.pf.multiplayer.shutdown_calls == 0
+			and real_party.is_cleanup_running(),
+			"[%s] Party's reset is under way, held at the SDK boundary, while the window is looked at" % form)
+		var direct: Array = [null]
+		if lobby_failure:
+			_capture_scoped_leave(context, direct)
+		else:
+			_capture_transport_leave(context, direct)
+		var failed_leave: PartyService.PartyResult = direct[0]
+		test._check(failed_leave != null and not failed_leave.ok() and failed_leave.cleanup_pending,
+			"[%s] the failed leave reports its cleanup still owed" % form)
+		test._check(NetManager.has_online_flow() and not NetManager.is_online_flow_live()
+			and not real_party.context_is_quiescent(context) and real_party.has_owned_work(),
+			"[%s] the group keeps its lease over a context that is not quiescent" % form)
+		test._check(not real_party.pf.multiplayer.join_calls.has(target)
+			and real_party.pf.party.join_calls.size() == party_joins and real_party.pf.party.create_calls.size() == party_creates,
+			"[%s] nothing is joined and no network is made while it is unsafe" % form)
+		test._check(StringName(NetManager.online_cleanup_readiness().get("state")) == NetManager.ONLINE_CLEANUP_PENDING,
+			"[%s] online entry reads the cleanup as still settling" % form)
+		var hosted: Array = [null]
+		_capture_host_match(hosted)
+		await _composed_until(test, func() -> bool: return hosted[0] != null, 10)
+		test._check(hosted[0] == false and NetManager.last_error == NetManager._PREVIOUS_SESSION_FINISHING,
+			"[%s] a direct Host Match is refused, not queued: %s" % [form, NetManager.last_error])
+		if form == "lobby-newer":
+			target = "d1-lobby-newer-replacement"
+			_composed_hosted_lobby(_key("d1-newer-host"), target)
+			InviteRouter._on_join_requested({"connection_string": target})
+			test._check(InviteRouter.has_pending_invite() and String(InviteRouter._pending_request.get("connection_string", "")) == target,
+				"[%s] a newer invitation replaces the kept one and waits the same way" % form)
+			kept_since = InviteRouter._pending_since_msec
+		if form == "transport-expired":
+			InviteRouter._pending_since_msec -= int((InviteRouter.PENDING_TTL_SECONDS + 1.0) * 1000.0)
+			kept_since = InviteRouter._pending_since_msec
+		held_sdk.hold_shutdown = false
+		held_sdk.shutdown_released.emit()
+		await _composed_until(test, func() -> bool: return real_party.pf.multiplayer.shutdown_calls > 0, 40, 1.0)
+		test._check(real_party.pf.party.shutdown_calls == 1 and real_party.pf.multiplayer.shutdown_calls == 1,
+			"[%s] Party's reset asks both services once" % form)
+		if form.ends_with("failed_reset"):
+			await _composed_until(test, func() -> bool: return _composed_dialog() != null, 20)
+			var refusal: Variant = _composed_dialog()
+			test._check(real_party.recovery_error == PartyService.RECOVERY_FAILED and NetManager.has_online_flow()
+				and not real_party.context_is_quiescent(context),
+				"[%s] a failed reset keeps the lease and the owed cleanup" % form)
+			test._check(refusal != null and refusal._title == "Cannot Join" and refusal._message == PartyService.RECOVERY_FAILED
+				and not InviteRouter.has_pending_invite() and not real_party.pf.multiplayer.join_calls.has(target),
+				"[%s] and answers the invitation once with the restart it needs" % form)
+			if refusal != null:
+				refusal._ok_button.pressed.emit()
+			real_clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS * 3.0)
+			await test.get_tree().process_frame
+			test._check(real_party.pf.multiplayer.shutdown_calls == 1 and _composed_dialog() == null,
+				"[%s] the reset is not asked for again and nothing is answered twice" % form)
+			await _end_composed_menu(test, menu)
+			await _teardown_composed(test)
+			continue
+		if form == "transport-expired":
+			await _composed_until(test, func() -> bool: return not NetManager.has_online_flow(), 20)
+			for _frame in 3:
+				await test.get_tree().process_frame
+			test._check(not InviteRouter.has_pending_invite() and not real_party.pf.multiplayer.join_calls.has(target),
+				"[%s] an invitation that expired while it waited is discarded, not joined" % form)
+			await _end_composed_menu(test, menu)
+			await _teardown_composed(test)
+			continue
+		test._check(InviteRouter._pending_since_msec == kept_since or not InviteRouter.has_pending_invite(),
+			"[%s] the kept invitation keeps the time it arrived" % form)
+		await _composed_until(test, func() -> bool: return real_party.pf.multiplayer.join_calls.has(target), 20)
+		test._check(not NetManager.has_online_flow() and real_party.context_is_quiescent(context),
+			"[%s] the confirmed reset settles the owed cleanup and releases the lease" % form)
+		test._check(real_party.pf.multiplayer.join_calls.count(target) == 1 and not InviteRouter.has_pending_invite(),
+			"[%s] then the invitation is joined once, with its exact connection string: %s" % [form, str(real_party.pf.multiplayer.join_calls)])
+		if form == "lobby-newer":
+			test._check(not real_party.pf.multiplayer.join_calls.has("d1-lobby-newer-target"),
+				"[%s] and the older invitation is never joined" % form)
+		await _end_composed_menu(test, menu)
+		await _teardown_composed(test)
+
+
+## Delta item 1's flowless case: after an account change, an old ticket's cancellation is still
+## settling with no group left to own it. Direct entry is refused, and an invitation is kept --
+## not dispatched into a refusal -- until that cleanup settles, then joined once.
+func _d1_flowless_cleanup_keeps_the_invitation_after_account_change(test: Node) -> void:
+	print("CASE: D1 after an account change an invitation waits for an old ticket's cleanup with no group left to own it, then is joined once; direct entry is refused meanwhile")
+	await _setup_composed(test, "d1-flowless")
+	var menu := _composed_menu(test)
+	var flow := await _composed_searching_group(test)
+	var ticket := _composed_ticket()
+	if flow == null or ticket == null:
+		await _end_composed_menu(test, menu)
+		await _teardown_composed(test)
+		return
+	ticket.block_cancel = true
+	flow.cancel_search()
+	await test.get_tree().process_frame
+	Services.cancel_sign_in()
+	await test.get_tree().process_frame
+	test._check(await _composed_until(test, func() -> bool: return not NetManager.is_account_teardown_pending(), 60, 1.0),
+		"the old account's teardown finishes")
+	var signed_in: Array = [null]
+	_capture_sign_in(signed_in)
+	test._check(await _composed_until(test, func() -> bool: return Services.is_account_ready(), 40), "the next account signs in")
+	var readiness := NetManager.online_cleanup_readiness()
+	test._check(not NetManager.has_online_flow() and real_matchmaking.has_pending_cleanup()
+		and StringName(readiness.get("state")) == NetManager.ONLINE_CLEANUP_PENDING
+		and String(readiness.get("reason")) == NetManager._PREVIOUS_SEARCH_FINISHING,
+		"with no group left, the old ticket's cleanup still reads as settling: %s" % String(readiness.get("reason")))
+	var joined := NetManager.join_by_code("ABCDE")
+	test._check(joined.outcome == JoinRequest.Outcome.FAILED and joined.reason == NetManager._PREVIOUS_SEARCH_FINISHING,
+		"a direct join is refused, for the player to try again: %s" % joined.reason)
+	var target := "d1-flowless-target"
+	_composed_hosted_lobby(_key("d1-flowless-host"), target)
+	InviteRouter._on_join_requested({"connection_string": target})
+	for _frame in 3:
+		await test.get_tree().process_frame
+	test._check(InviteRouter.has_pending_invite() and not real_party.pf.multiplayer.join_calls.has(target)
+		and _composed_dialog() == null,
+		"an invitation waits for that cleanup instead of being spent on the refusal")
+	ticket.release_cancel(ServiceDoubles.Results.make(true, ticket, "cancelled", "Injected cancel result.", 0))
+	ticket.emit_status(MatchmakingService.STATUS_CANCELLED)
+	await _composed_until(test, func() -> bool: return real_party.pf.multiplayer.join_calls.has(target), 20)
+	test._check(not real_matchmaking.has_pending_cleanup() and real_party.pf.multiplayer.join_calls.count(target) == 1
+		and not InviteRouter.has_pending_invite() and real_party.pf.multiplayer.shutdown_calls == 0,
+		"once the ticket's cleanup settles, the invitation is joined once, with no reset needed")
+	await _end_composed_menu(test, menu)
+	await _teardown_composed(test)
+
+
+## Delta item 2, over the real services: a match that lands on an old ticket while the account
+## teardown's last step -- the chat control's destruction -- is still finishing is recovered
+## before that teardown counts as finished, with no entry needed to trigger it. The reset is
+## confirmed while the teardown is still under way. A failed reset keeps the restart-required
+## refusal and is not asked for again. A late answer from the old runtime changes nothing, and
+## the next account signs in as usual.
+func _d2_matched_during_the_final_teardown_await_is_recovered_first(test: Node) -> void:
+	print("CASE: D2 a match on an old ticket during the teardown's final chat destruction is recovered before the teardown finishes; a failed reset stays restart-required")
+	for scenario: String in ["recovered", "failed_recovery"]:
+		await _setup_composed(test, "d2-" + scenario)
+		var flow := await _composed_searching_group(test)
+		var ticket := _composed_ticket()
+		if flow == null or ticket == null:
+			await _teardown_composed(test)
+			continue
+		if not chat.has_control():
+			chat.set_chat_allowed(true)
+			await chat.ensure_control(Services.playfab_user(), {})
+		test._check(chat.has_control(), "[%s] the account holds a chat control the teardown destroys last" % scenario)
+		ticket.block_cancel = true
+		flow.cancel_search()
+		await test.get_tree().process_frame
+		if scenario == "failed_recovery":
+			real_party.pf.multiplayer.shutdown_hook = Callable()
+			real_party.pf.multiplayer.next_shutdown_result = ServiceDoubles.Results.make(
+				false, null, "shutting_down", "Injected scoped shutdown failure.", -2147467260)
+		chat.sdk.hold_destroy = true
+		var seen := {"teardown_at_reset": false, "teardown_at_failure": false}
+		var on_reset := func(_epoch: int) -> void:
+			seen["teardown_at_reset"] = NetManager.is_account_teardown_pending()
+		var on_status := func(message: String) -> void:
+			if message == PartyService.RECOVERY_FAILED:
+				seen["teardown_at_failure"] = NetManager.is_account_teardown_pending()
+		real_party.multiplayer_invalidated.connect(on_reset)
+		real_party.cleanup_status_changed.connect(on_status)
+		Services.cancel_sign_in()
+		var held: bool = await _composed_until(test, func() -> bool: return chat.sdk.calls.size() > 0 and chat.sdk.calls.back().begins_with("destroy:"), 40, 1.0)
+		test._check(held and NetManager.is_account_teardown_pending() and real_party.pf.multiplayer.shutdown_calls == 0
+			and not real_matchmaking.has_orphaned_matched_cancel(),
+			"[%s] the teardown reaches the chat control's destruction with nothing owed yet" % scenario)
+		ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+		for _frame in 2:
+			await test.get_tree().process_frame
+		test._check(real_matchmaking.has_orphaned_matched_cancel() and NetManager.is_account_teardown_pending()
+			and real_party.pf.multiplayer.shutdown_calls == 0,
+			"[%s] the match lands while that destruction is still finishing" % scenario)
+		chat.sdk.hold_destroy = false
+		chat.sdk.destroy_released.emit()
+		test._check(await _composed_until(test, func() -> bool: return not NetManager.is_account_teardown_pending(), 40, 1.0),
+			"[%s] the teardown then finishes on its own" % scenario)
+		real_party.multiplayer_invalidated.disconnect(on_reset)
+		real_party.cleanup_status_changed.disconnect(on_status)
+		test._check(real_party.pf.multiplayer.shutdown_calls == 1,
+			"[%s] exactly one reset is run: %d" % [scenario, real_party.pf.multiplayer.shutdown_calls])
+		if scenario == "recovered":
+			test._check(bool(seen["teardown_at_reset"]) and not real_matchmaking.has_pending_cleanup(),
+				"[%s] and it is confirmed before the teardown counts as finished" % scenario)
+		else:
+			test._check(bool(seen["teardown_at_failure"]) and real_party.recovery_error == PartyService.RECOVERY_FAILED,
+				"[%s] and its failure is known before the teardown counts as finished" % scenario)
+		ticket.emit_status(MatchmakingService.STATUS_CANCELLED)
+		chat.sdk.destroy_released.emit()
+		var signed_in: Array = [null]
+		_capture_sign_in(signed_in)
+		test._check(await _composed_until(test, func() -> bool: return Services.is_account_ready(), 40),
+			"[%s] the next account signs in" % scenario)
+		var quick: Array = [null]
+		_capture_quick_match(quick)
+		await _composed_until(test, func() -> bool: return quick[0] != null, 20)
+		_complete_activity()
+		if scenario == "recovered":
+			test._check(quick[0] == true and NetManager.is_online_flow_live() and real_party.pf.multiplayer.shutdown_calls == 1,
+				"[%s] and starts Quick Match with nothing old owed: %s" % [scenario, NetManager.last_error])
+		else:
+			real_clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS * 3.0)
+			await test.get_tree().process_frame
+			test._check(quick[0] == false and NetManager.last_error == PartyService.RECOVERY_FAILED
+				and real_party.pf.multiplayer.shutdown_calls == 1,
+				"[%s] and Quick Match says a restart is needed, with no reset asked for again: %s" % [scenario, NetManager.last_error])
+		await _teardown_composed(test)
+
+
+## Delta item 4: flowless Practice after an account switch. With the old ticket's cleanup still
+## settling, or Party's recovery of it latched as failed, a ready account starts Practice. That
+## makes no online call and asks for no reset, while Host, Quick Match and a join are still
+## refused with the same reason as before.
+func _d4_flowless_practice_after_an_account_switch(test: Node) -> void:
+	print("CASE: D4 after an account switch Practice starts with online cleanup still settling or restart-required; online entry stays refused and nothing online is asked for")
+	for scenario: String in ["pending", "failed"]:
+		await _setup_composed(test, "d4-" + scenario)
+		var flow := await _composed_searching_group(test)
+		var ticket := _composed_ticket()
+		if flow == null or ticket == null:
+			await _teardown_composed(test)
+			continue
+		ticket.block_cancel = true
+		flow.cancel_search()
+		await test.get_tree().process_frame
+		if scenario == "failed":
+			real_party.pf.multiplayer.shutdown_hook = Callable()
+			real_party.pf.multiplayer.next_shutdown_result = ServiceDoubles.Results.make(
+				false, null, "shutting_down", "Injected scoped shutdown failure.", -2147467260)
+			ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+			await test.get_tree().process_frame
+		Services.cancel_sign_in()
+		await test.get_tree().process_frame
+		test._check(await _composed_until(test, func() -> bool: return not NetManager.is_account_teardown_pending(), 60, 1.0),
+			"[%s] the old account's teardown finishes" % scenario)
+		var signed_in: Array = [null]
+		_capture_sign_in(signed_in)
+		test._check(await _composed_until(test, func() -> bool: return Services.is_account_ready(), 40),
+			"[%s] the next account signs in" % scenario)
+		var expected := NetManager._PREVIOUS_SEARCH_FINISHING if scenario == "pending" else PartyService.RECOVERY_FAILED
+		var shutdowns := real_party.pf.multiplayer.shutdown_calls
+		var creates := real_party.pf.party.create_calls.size()
+		var lobby_joins := real_party.pf.multiplayer.join_calls.size()
+		test._check(not NetManager.has_online_flow() and not NetManager.is_account_teardown_pending(),
+			"[%s] no group or teardown holds the lease" % scenario)
+		var practiced := NetManager.start_offline()
+		test._check(practiced and NetManager.is_offline() and NetManager.has_session(),
+			"[%s] a ready account starts Practice: %s" % [scenario, NetManager.last_error])
+		real_clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS * 3.0)
+		await test.get_tree().process_frame
+		test._check(real_party.pf.multiplayer.shutdown_calls == shutdowns and real_party.pf.party.create_calls.size() == creates
+			and real_party.pf.multiplayer.join_calls.size() == lobby_joins,
+			"[%s] Practice asks for no reset and makes no online call" % scenario)
+		NetManager.leave_match()
+		await test.get_tree().process_frame
+		var hosted: Array = [null]
+		_capture_host_match(hosted)
+		await _composed_until(test, func() -> bool: return hosted[0] != null, 10)
+		test._check(hosted[0] == false and NetManager.last_error == expected,
+			"[%s] Host Match is still refused: %s" % [scenario, NetManager.last_error])
+		var quick: Array = [null]
+		_capture_quick_match(quick)
+		await _composed_until(test, func() -> bool: return quick[0] != null, 10)
+		test._check(quick[0] == false and NetManager.last_error == expected,
+			"[%s] so is Quick Match: %s" % [scenario, NetManager.last_error])
+		var joined := NetManager.join_by_code("ABCDE")
+		test._check(joined.outcome == JoinRequest.Outcome.FAILED and joined.reason == expected,
+			"[%s] and a join: %s" % [scenario, joined.reason])
+		await _teardown_composed(test)
+
+
+## Delta item 7, over the real PartyService: a hosted lobby joined before its owner had
+## replicated, whose owner this guest then proves and is admitted under. When only its own
+## lobby connection drops, the session carries on under that host. An owner cleared with that
+## drop, a different owner, or a different peer 1 each end it once, applying nothing more.
+func _d7_hosted_owner_proven_after_the_join_keeps_only_local_continuity(test: Node) -> void:
+	print("CASE: D7 over the real PartyService a hosted owner proven after the join carries its session through a local-only lobby drop; an owner cleared with it, another owner or another peer 1 end it once")
+	var owner := _key("d7-host")
+	var outcomes := {
+		"local_only": "",
+		"owner_cleared": NetManager._HOST_CHANGED,
+		"other_owner": NetManager._HOST_CHANGED,
+		"other_peer": NetManager._HOST_CHANGED,
+	}
+	for scenario: String in outcomes.keys():
+		await _setup_composed(test, "d7-" + scenario)
+		var connection := "d7-%s-connection" % scenario
+		var hosted := _composed_hosted_lobby(owner, connection)
+		var lobby: ServiceDoubles.Lobby = hosted["lobby"]
+		var peer: RecordingPeer = hosted["peer"]
+		lobby.owner_entity_key = {}
+		var request := NetManager.join_by_invite(connection)
+		await test.get_tree().process_frame
+		test._check(NetManager._peer == peer and request.is_pending(),
+			"[%s] the join binds with no owner known yet" % scenario)
+		if NetManager._peer != peer:
+			await _teardown_composed(test)
+			continue
+		peer.connect_remote(NetManager.HOST_PEER_ID)
+		NetManager._request_player_identity()
+		test._check(_rpc_calls(peer) == 0, "[%s] nothing is sent before the owner is known" % scenario)
+		lobby.owner_entity_key = owner.duplicate()
+		real_clock.advance(MatchmakingFlow.POLL_SECONDS)
+		await test.get_tree().process_frame
+		test._check(_rpc_calls(peer) == 1, "[%s] once the owner arrives, the host is answered once" % scenario)
+		_host_replays_and_accepts("D7 Host")
+		real_clock.advance(MatchmakingFlow.POLL_SECONDS)
+		await test.get_tree().process_frame
+		test._check(request.succeeded() and NetManager.has_session(), "[%s] and the guest is admitted" % scenario)
+		match scenario:
+			"owner_cleared":
+				lobby.owner_entity_key = {}
+			"other_owner":
+				lobby.owner_entity_key = _key("d7-other-owner")
+			"other_peer":
+				peer.keys[1] = _key("d7-other-peer")
+		lobby.disconnected = true
+		var seen := _send_host_state(5)
+		if scenario == "local_only":
+			test._check(bool(seen["applied"]) and int(seen["ends"]) == 0 and NetManager.has_session(),
+				"[%s] with only its own lobby connection gone, the session carries on under that host" % scenario)
+		else:
+			test._check(not bool(seen["applied"]) and int(seen["ends"]) == 1 and not NetManager.has_session(),
+				"[%s] the session ends once, applying nothing: %d ends" % [scenario, int(seen["ends"])])
+			test._check(NetManager.last_disconnect_reason == String(outcomes[scenario]),
+				"[%s] with this title's reason: %s" % [scenario, NetManager.last_disconnect_reason])
+		await _teardown_composed(test)
+
+
+# --- F5: debt that outlives its owner, and the quit that meets it --------------------------
+
+## Starts Quick Match with the group's opening held at its lobby or its Party network, and a
+## late leave failure set for the one that is held. True once the opening is waiting on it.
+func _hold_group_opening(test: Node, resource: String, opened: Array) -> bool:
+	var failure := ServiceDoubles.Results.make(false, null,
+		"lobby_leave_start_failed" if resource == "lobby" else "party_resource_not_ready",
+		"Injected late leave failure.", -2147467259)
+	if resource == "lobby":
+		real_party.pf.multiplayer.next_created_lobby_leave_result = failure
+		real_party.pf.multiplayer.block_create = true
+	else:
+		real_party.pf.party.next_created_network_leave_result = failure
+		real_party.pf.party.block_create = true
+	_capture_quick_match(opened)
+	var held: bool = await _composed_until(test, func() -> bool: return _late_opening_held(resource), 20)
+	test._check(held and opened[0] == null and NetManager.has_online_flow(),
+		"[%s] the group's opening is held at its %s" % [resource, resource])
+	return held and opened[0] == null
+
+
+## The group's opening held at its lobby or its Party network while the owner leaves. The
+## flow and its global cleanup finish -- that cleanup resets the runtime at its deadline, over
+## the opening still outstanding -- and, when `release` is set, the held opening then answers
+## late: the native leave of its stale lobby or transport fails. Nothing owns what that leaves.
+## The held opening stands in for any failed leave left with no owner; the runtime's own
+## ordering can differ.
+## Returns the Lobby shutdowns counted before the late answer, or -1 if the setup failed.
+func _composed_late_leave_failure(test: Node, resource: String, release: bool = true) -> int:
+	var opened: Array = [null]
+	var held: bool = await _hold_group_opening(test, resource, opened)
+	if not held:
+		return -1
+	NetManager.leave_match()
+	var settled: bool = await _composed_until(test, func() -> bool: return _late_opening_settled(opened), 40, 1.0)
+	test._check(settled and opened[0] == false,
+		"[%s] the owner's leave ends the group and its cleanup finishes" % resource)
+	if not settled:
+		return -1
+	var shutdowns := real_party.pf.multiplayer.shutdown_calls
+	if release:
+		_release_late_opening(resource)
+	return shutdowns
+
+
+## Whether the group's opening is waiting on its held lobby or Party network creation.
+func _late_opening_held(resource: String) -> bool:
+	var held: Signal = real_party.pf.multiplayer.create_released if resource == "lobby" \
+		else real_party.pf.party.create_released
+	return not held.get_connections().is_empty()
+
+
+func _release_late_opening(resource: String) -> void:
+	if resource == "lobby":
+		real_party.pf.multiplayer.block_create = false
+		real_party.pf.multiplayer.create_released.emit()
+	else:
+		real_party.pf.party.block_create = false
+		real_party.pf.party.create_released.emit()
+
+
+func _late_opening_settled(opened: Array) -> bool:
+	return opened[0] != null and not NetManager.has_online_flow() and not real_party.is_cleanup_running()
+
+
+func _party_debt_settled() -> bool:
+	return not real_party.has_idle_cleanup_debt() and not real_party.is_cleanup_running()
+
+
+## The debt a late failure leaves, read the moment it lands: owed, nothing running, no group or
+## session holding the seat, and online entry reading it as cleanup still settling.
+func _check_idle_debt(test: Node, label: String) -> void:
+	test._check(real_party.has_idle_cleanup_debt() and not real_party.is_cleanup_running(),
+		"[%s] the late failure leaves debt that nothing is running yet" % label)
+	test._check(not NetManager.has_online_flow() and not NetManager.has_session()
+		and StringName(NetManager.online_cleanup_readiness().get("state")) == NetManager.ONLINE_CLEANUP_PENDING,
+		"[%s] with no group or session to own it, and online entry waiting on it" % label)
+
+
+## F5 case 1. The late failure is recovered with no player action: the next idle frame asks
+## Party's existing recovery once, both services confirm, the old context is gone, and Host
+## Match, Quick Match and a join all work again.
+func _f5_late_leave_failure_without_an_owner_is_recovered_once(test: Node) -> void:
+	print("CASE: F5-debt a late lobby or transport leave that fails after its group's cleanup finished is recovered once with no player action; online entry then works")
+	for resource: String in ["lobby", "transport"]:
+		await _setup_composed(test, "f5-late-" + resource)
+		var shutdowns := await _composed_late_leave_failure(test, resource)
+		if shutdowns < 0:
+			await _teardown_composed(test)
+			continue
+		_check_idle_debt(test, resource)
+		test._check(real_party.pf.multiplayer.shutdown_calls == shutdowns,
+			"[%s] nothing is reset inside the failure itself" % resource)
+		await _composed_until(test, func() -> bool: return _party_debt_settled(), 20)
+		test._check(real_party.pf.multiplayer.shutdown_calls == shutdowns + 1,
+			"[%s] the next idle frame asks the existing recovery once: %d resets" % [resource, real_party.pf.multiplayer.shutdown_calls - shutdowns])
+		test._check(not real_party.has_owned_work() and real_party.recovery_error.is_empty()
+			and StringName(NetManager.online_cleanup_readiness().get("state")) == NetManager.ONLINE_CLEANUP_CLEAR,
+			"[%s] the confirmed reset leaves the old context quiescent and online entry clear" % resource)
+		var hosted: Array = [null]
+		_capture_host_match(hosted)
+		await _composed_until(test, func() -> bool: return hosted[0] != null, 20)
+		test._check(hosted[0] == true and NetManager.is_host(),
+			"[%s] Host Match then works: %s" % [resource, NetManager.last_error])
+		NetManager.leave_match()
+		await _composed_until(test, func() -> bool: return not real_party.is_cleanup_running() and not NetManager.has_session(), 20, 1.0)
+		var quick: Array = [null]
+		_capture_quick_match(quick)
+		await _composed_until(test, func() -> bool: return quick[0] != null, 20)
+		_complete_activity()
+		test._check(quick[0] == true and NetManager.is_online_flow_live(),
+			"[%s] so does Quick Match: %s" % [resource, NetManager.last_error])
+		NetManager.leave_match()
+		await _composed_until(test, func() -> bool: return not real_party.is_cleanup_running() and not NetManager.has_online_flow(), 40, 1.0)
+		var target := "f5-late-%s-target" % resource
+		_composed_hosted_lobby(_key("f5-host"), target)
+		var joined := NetManager.join_by_invite(target)
+		await _composed_until(test, func() -> bool: return real_party.pf.multiplayer.join_calls.has(target), 20)
+		test._check(joined.is_pending() and real_party.pf.multiplayer.join_calls.count(target) == 1,
+			"[%s] and so does a join: %s" % [resource, joined.reason])
+		NetManager.cancel_join(joined)
+		await _composed_until(test, func() -> bool: return not joined.is_pending(), 40, 1.0)
+		await _teardown_composed(test)
+
+
+## F5 case 2. A failed leave raised while Party's own cleanup is already running is that
+## cleanup's to recover: the running leave takes it into its one recovery, on its own
+## deadline, and nothing asks for a second reset.
+func _f5_debt_raised_while_cleanup_runs_joins_that_cleanup(test: Node) -> void:
+	print("CASE: F5-debt a failed leave raised while Party's cleanup runs is recovered by that cleanup, once, on its own deadline")
+	await _setup_composed(test, "f5-running")
+	var opened: Array = [null]
+	var held: bool = await _hold_group_opening(test, "lobby", opened)
+	if not held:
+		await _teardown_composed(test)
+		return
+	var left_at := real_clock.now_msec()
+	NetManager.leave_match()
+	real_clock.advance(2.0)
+	await test.get_tree().process_frame
+	test._check(real_party.is_cleanup_running() and real_party.pf.multiplayer.shutdown_calls == 0,
+		"the owner's leave is still running its cleanup")
+	_release_late_opening("lobby")
+	test._check(real_party.is_cleanup_running() and not real_party.has_idle_cleanup_debt(),
+		"the late failure lands inside that running cleanup, not as debt for anyone else")
+	var reset_at := 0
+	for _step in 30:
+		if reset_at == 0 and real_party.pf.multiplayer.shutdown_calls > 0:
+			reset_at = real_clock.now_msec()
+		if not real_party.is_cleanup_running():
+			break
+		real_clock.advance(0.5)
+		await test.get_tree().process_frame
+	if reset_at == 0 and real_party.pf.multiplayer.shutdown_calls > 0:
+		reset_at = real_clock.now_msec()
+	for _frame in 3:
+		await test.get_tree().process_frame
+	test._check(real_party.pf.multiplayer.shutdown_calls == 1 and real_party.pf.party.shutdown_calls == 1,
+		"the running cleanup recovers it with its one reset: %d resets" % real_party.pf.multiplayer.shutdown_calls)
+	test._check(reset_at > 0 and reset_at - left_at <= int(NRConst.MATCH_CLEANUP_SECONDS * 1000.0),
+		"on the deadline it started with, which the late failure did not renew: %d ms" % (reset_at - left_at))
+	test._check(not real_party.has_idle_cleanup_debt() and not real_party.has_owned_work()
+		and StringName(NetManager.online_cleanup_readiness().get("state")) == NetManager.ONLINE_CLEANUP_CLEAR,
+		"nothing is left owed and online entry is clear")
+	await _teardown_composed(test)
+
+
+## F5 case 3. A late failure that lands while another online session holds the seat resets
+## nothing: the session carries on, and the debt stays visible until that session's own leave
+## -- the existing safe boundary -- recovers it, once.
+func _f5_live_replacement_keeps_the_seat_until_it_leaves(test: Node) -> void:
+	print("CASE: F5-debt a late failure while another session holds the seat resets nothing; that session's own leave discharges it once")
+	await _setup_composed(test, "f5-replacement")
+	var shutdowns := await _composed_late_leave_failure(test, "transport", false)
+	if shutdowns < 0:
+		await _teardown_composed(test)
+		return
+	var target := "f5-replacement-target"
+	var hosted_lobby := _composed_hosted_lobby(_key("f5-replacement-host"), target)
+	var peer: RecordingPeer = hosted_lobby["peer"]
+	var request := NetManager.join_by_invite(target)
+	var bound: bool = await _composed_until(test, func() -> bool: return NetManager._peer == peer, 20)
+	test._check(bound and request.is_pending(), "the replacement join binds its transport")
+	peer.connect_remote(NetManager.HOST_PEER_ID)
+	NetManager._request_player_identity()
+	_host_replays_and_accepts("F5 Host")
+	await _composed_until(test, func() -> bool: return request.succeeded(), 20)
+	test._check(request.succeeded() and NetManager.has_session(), "another session holds the seat")
+	_release_late_opening("transport")
+	test._check(real_party.has_idle_cleanup_debt() and not real_party.is_cleanup_running(),
+		"the late failure leaves its debt")
+	for _step in 5:
+		real_clock.advance(MatchmakingFlow.POLL_SECONDS)
+		await test.get_tree().process_frame
+	test._check(real_party.pf.multiplayer.shutdown_calls == shutdowns and NetManager.has_session()
+		and request.succeeded() and real_party.has_idle_cleanup_debt(),
+		"the live session is not reset, and the debt stays visible")
+	NetManager.leave_match()
+	await _composed_until(test, func() -> bool: return not real_party.is_cleanup_running() and not real_party.has_idle_cleanup_debt(), 40, 1.0)
+	test._check(real_party.pf.multiplayer.shutdown_calls == shutdowns + 1 and not real_party.has_owned_work(),
+		"that session's own leave recovers it, once: %d resets" % (real_party.pf.multiplayer.shutdown_calls - shutdowns))
+	test._check(StringName(NetManager.online_cleanup_readiness().get("state")) == NetManager.ONLINE_CLEANUP_CLEAR,
+		"and online entry is clear")
+	await _teardown_composed(test)
+
+
+## Closes a composed case's quit probe the way the RB2 cases close theirs, then tears the
+## composed services down.
+func _end_composed_quit(test: Node, app: Node) -> void:
+	await test.get_tree().process_frame
+	ScreenManager.clear()
+	app.queue_free()
+	await test.get_tree().process_frame
+	ScreenManager.set_container(test)
+	Services._shutting_down = false
+	AudioManager.set_script(_probe_audio)
+	PlayerProfile.apply_dict(PlayerProfile.to_dict())
+	await _teardown_composed(test)
+
+
+## Answers the platform calls a quit waits on, then reads whether it has exited.
+func _quit_exited(app: Node) -> bool:
+	_complete_activity()
+	return app.quit_calls > 0
+
+
+## F5 case 4. Quitting with unowned failed-leave debt, before the idle frame that would have
+## recovered it: the quit runs the ordinary leave and its recovery at once, inside its one
+## budget. With the reset confirmed promptly the quit exits once without waiting the budget
+## out. With the reset held, frames keep coming only until that same budget ends, the quit
+## exits once, and the late confirmation cannot quit again.
+func _f5_quit_with_idle_debt_leaves_and_recovers_first(test: Node) -> void:
+	print("CASE: F5-debt quitting with unowned failed-leave debt runs the leave and its recovery at once, within the one budget, and quits once")
+	for scenario: String in ["prompt", "held"]:
+		await _setup_composed(test, "f5-quit-" + scenario)
+		var held_sdk := HeldPartySDK.new()
+		real_party.pf.party = held_sdk
+		var shutdowns := await _composed_late_leave_failure(test, "transport")
+		if shutdowns < 0:
+			await _teardown_composed(test)
+			continue
+		var starts := held_sdk.shutdown_starts
+		_check_idle_debt(test, scenario)
+		held_sdk.hold_shutdown = scenario == "held"
+		var app := _open_quit_probe(test)
+		var asked_at := real_clock.now_msec()
+		app.request_shutdown()
+		var budget: int = app._quit_deadline_msec
+		test._check(held_sdk.shutdown_starts == starts + 1,
+			"[%s] the quit's own leave asks the recovery at once, before its budget is spent" % scenario)
+		if scenario == "prompt":
+			var exited: bool = await _composed_until(test, func() -> bool: return _quit_exited(app), 10, 0.0)
+			test._check(exited and app.quit_calls == 1 and real_clock.now_msec() == asked_at
+				and app._quit_deadline_msec == budget and not real_party.has_idle_cleanup_debt(),
+				"[prompt] the confirmed reset lets the quit exit once, with none of its budget waited out")
+		else:
+			test._check(app._quit_pending and app.quit_calls == 0 and real_party.is_cleanup_running(),
+				"[held] the quit waits on the recovery it started")
+			real_clock.advance(float(budget - 1 - real_clock.now_msec()) / 1000.0)
+			await test.get_tree().process_frame
+			test._check(app.quit_calls == 0 and app._quit_deadline_msec == budget,
+				"[held] frames keep coming until one millisecond before the same budget ends")
+			real_clock.advance(PartyService.POLL_INTERVAL)
+			var cut_off: bool = await _composed_until(test, func() -> bool: return _quit_exited(app), 10, 0.0)
+			test._check(cut_off and app.quit_calls == 1 and real_party.is_cleanup_running(),
+				"[held] then the quit exits once, on that budget, leaving the held recovery as it is")
+			held_sdk.hold_shutdown = false
+			held_sdk.shutdown_released.emit()
+			for _frame in 2:
+				await test.get_tree().process_frame
+			test._check(app.quit_calls == 1 and not real_party.is_cleanup_running() and not real_party.has_idle_cleanup_debt(),
+				"[held] the late confirmation finishes the recovery without quitting again")
+		held_sdk.hold_shutdown = false
+		held_sdk.shutdown_released.emit()
+		for _frame in 2:
+			await test.get_tree().process_frame
+		test._check(held_sdk.shutdown_starts == starts + 1,
+			"[%s] the idle frame that follows asks for no second reset" % scenario)
+		await _end_composed_quit(test, app)
+
+
+## F5 case 5. The recovery of unowned debt fails: online entry says a restart is needed, the
+## old context stays owed, nothing reads as clear and no reset is asked for again. The quit
+## is not held by the failure as if it were a recovery still running.
+func _f5_terminal_recovery_failure_stays_restart_required(test: Node) -> void:
+	print("CASE: F5-debt a failed recovery of unowned debt stays restart-required, is not retried, and does not hold the quit")
+	await _setup_composed(test, "f5-terminal")
+	var shutdowns := await _composed_late_leave_failure(test, "lobby", false)
+	if shutdowns < 0:
+		await _teardown_composed(test)
+		return
+	real_party.pf.multiplayer.shutdown_hook = Callable()
+	real_party.pf.multiplayer.next_shutdown_result = ServiceDoubles.Results.make(
+		false, null, "shutting_down", "Injected scoped shutdown failure.", -2147467260)
+	_release_late_opening("lobby")
+	_check_idle_debt(test, "terminal")
+	await _composed_until(test, func() -> bool: return not real_party.recovery_error.is_empty(), 20)
+	test._check(real_party.recovery_error == PartyService.RECOVERY_FAILED and real_party.has_owned_work()
+		and not real_party.is_cleanup_running() and not real_party.has_idle_cleanup_debt(),
+		"the failed reset latches the restart it needs, the old context still owed and nothing running")
+	test._check(StringName(NetManager.online_cleanup_readiness().get("state")) == NetManager.ONLINE_CLEANUP_RESTART_REQUIRED,
+		"online entry reads it as restart-required, never clear")
+	var hosted: Array = [null]
+	_capture_host_match(hosted)
+	await _composed_until(test, func() -> bool: return hosted[0] != null, 10)
+	test._check(hosted[0] == false and NetManager.last_error == PartyService.RECOVERY_FAILED,
+		"Host Match says a restart is needed: %s" % NetManager.last_error)
+	var failed_resets := real_party.pf.multiplayer.shutdown_calls
+	real_clock.advance(MatchmakingFlow.CANCEL_GRACE_SECONDS * 3.0)
+	for _frame in 3:
+		await test.get_tree().process_frame
+	test._check(real_party.pf.multiplayer.shutdown_calls == failed_resets,
+		"and no reset is asked for again")
+	var app := _open_quit_probe(test)
+	var asked_at := real_clock.now_msec()
+	app.request_shutdown()
+	var budget: int = app._quit_deadline_msec
+	var exited: bool = await _composed_until(test, func() -> bool: return _quit_exited(app), 10, 0.0)
+	test._check(exited and app.quit_calls == 1 and real_clock.now_msec() == asked_at and app._quit_deadline_msec == budget,
+		"the quit exits once, with none of its budget spent waiting on the failure as a recovery still running")
+	test._check(real_party.pf.multiplayer.shutdown_calls == failed_resets and real_party.recovery_error == PartyService.RECOVERY_FAILED,
+		"and asks for no reset of its own, leaving the restart-required refusal in place")
+	await _end_composed_quit(test, app)
+
+
+## F5 case 6. An invitation that arrives during unowned failed-leave debt is kept, under the
+## time it arrived and with its exact string, and nothing joins its target while the debt
+## stands. A confirmed recovery then joins it once; a failed one answers it once with the
+## restart it needs; a newer invitation that arrived meanwhile is the one joined; one that
+## expired meanwhile is discarded. An account change before the recovery hands the debt to
+## that account's teardown, which recovers it once; the kept invitation, still as it arrived,
+## is joined once by the next account.
+func _f5_invitation_waits_for_unowned_debt(test: Node) -> void:
+	print("CASE: F5-debt an invitation during unowned failed-leave debt waits for its recovery: joined once on success, answered once on failure; newer, expired and account rules hold")
+	for scenario: String in ["recovered", "failed", "newer", "expired", "account"]:
+		await _setup_composed(test, "f5-invite-" + scenario)
+		var menu := _composed_menu(test)
+		var shutdowns := await _composed_late_leave_failure(test, "transport", false)
+		if shutdowns < 0:
+			await _end_composed_menu(test, menu)
+			await _teardown_composed(test)
+			continue
+		if scenario == "failed":
+			real_party.pf.multiplayer.shutdown_hook = Callable()
+			real_party.pf.multiplayer.next_shutdown_result = ServiceDoubles.Results.make(
+				false, null, "shutting_down", "Injected scoped shutdown failure.", -2147467260)
+		var target := "f5-invite-%s-target" % scenario
+		if scenario != "newer":
+			_composed_hosted_lobby(_key("f5-invite-host"), target)
+		_release_late_opening("transport")
+		var arrived_from := Time.get_ticks_msec()
+		InviteRouter._on_join_requested({"connection_string": target})
+		var arrived_to := Time.get_ticks_msec()
+		var kept_since := InviteRouter._pending_since_msec
+		test._check(InviteRouter.has_pending_invite() and kept_since >= arrived_from and kept_since <= arrived_to
+			and String(InviteRouter._pending_request.get("connection_string", "")) == target
+			and not real_party.pf.multiplayer.join_calls.has(target) and _composed_dialog() == null,
+			"[%s] the invitation is kept, exactly as it arrived, while the debt stands" % scenario)
+		if scenario == "newer":
+			target = "f5-invite-newer-replacement"
+			_composed_hosted_lobby(_key("f5-invite-newer-host"), target)
+			InviteRouter._on_join_requested({"connection_string": target})
+			test._check(String(InviteRouter._pending_request.get("connection_string", "")) == target,
+				"[newer] a newer invitation replaces the kept one")
+		if scenario == "expired":
+			InviteRouter._pending_since_msec -= int((InviteRouter.PENDING_TTL_SECONDS + 1.0) * 1000.0)
+		if scenario == "account":
+			Services.cancel_sign_in()
+			var torn_down: bool = await _composed_until(test, func() -> bool: return not NetManager.is_account_teardown_pending(), 60, 1.0)
+			test._check(torn_down and real_party.pf.multiplayer.shutdown_calls == shutdowns + 1 and _party_debt_settled()
+				and not real_party.pf.multiplayer.join_calls.has(target),
+				"[account] the account's teardown takes the debt into its own recovery, once, and joins nothing")
+			test._check(InviteRouter.has_pending_invite() and InviteRouter._pending_since_msec == kept_since
+				and String(InviteRouter._pending_request.get("connection_string", "")) == target,
+				"[account] the invitation stays kept, as it arrived, for the next account")
+			var signed_in: Array = [null]
+			_capture_sign_in(signed_in)
+			test._check(await _composed_until(test, func() -> bool: return Services.is_account_ready(), 40),
+				"[account] the next account signs in")
+		if scenario == "failed":
+			await _composed_until(test, func() -> bool: return _composed_dialog() != null, 20)
+			var refusal: Variant = _composed_dialog()
+			test._check(refusal != null and refusal._title == "Cannot Join" and refusal._message == PartyService.RECOVERY_FAILED
+				and not InviteRouter.has_pending_invite() and not real_party.pf.multiplayer.join_calls.has(target),
+				"[failed] a failed recovery answers the invitation once, with the restart it needs")
+			if refusal != null:
+				refusal._ok_button.pressed.emit()
+			for _frame in 3:
+				await test.get_tree().process_frame
+			test._check(_composed_dialog() == null, "[failed] and answers it only once")
+		elif scenario == "expired":
+			await _composed_until(test, func() -> bool: return _party_debt_settled(), 20)
+			for _frame in 3:
+				await test.get_tree().process_frame
+			test._check(real_party.pf.multiplayer.shutdown_calls == shutdowns + 1 and InviteRouter._pending_request.is_empty()
+				and not real_party.pf.multiplayer.join_calls.has(target) and _composed_dialog() == null,
+				"[expired] an invitation that expired while the debt stood is discarded once it settles, not joined")
+		else:
+			await _composed_until(test, func() -> bool: return real_party.pf.multiplayer.join_calls.has(target), 20)
+			test._check(real_party.pf.multiplayer.shutdown_calls == shutdowns + 1
+				and real_party.pf.multiplayer.join_calls.count(target) == 1 and not InviteRouter.has_pending_invite(),
+				"[%s] the confirmed recovery comes first, then one join with the exact string: %s" % [scenario, str(real_party.pf.multiplayer.join_calls)])
+			if scenario == "newer":
+				test._check(not real_party.pf.multiplayer.join_calls.has("f5-invite-newer-target"),
+					"[newer] and the older invitation is never joined")
+		await _end_composed_menu(test, menu)
+		await _teardown_composed(test)
 
 
 # --- RB2: a quit with only Party's own cleanup or recovery left ----------------------

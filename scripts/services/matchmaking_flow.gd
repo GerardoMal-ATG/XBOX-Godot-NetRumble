@@ -23,6 +23,8 @@ extends RefCounted
 signal changed()
 ## Raised once when the owned staging leave in flight answers or its deadline wins.
 signal _owned_leave_settled()
+## Raised once when release_native() has finished, for the callers that joined it.
+signal native_release_done()
 
 enum Phase {
 	IDLE,
@@ -108,6 +110,15 @@ const TEXT_HOST_DID_NOT_RETURN := "The match host did not return to the lobby."
 const TEXT_ARRANGED_CHANGED := "The match lobby changed unexpectedly."
 const TEXT_GROUP_NOT_RETIRED := "The previous group could not be left cleanly."
 const TEXT_OLD_NETWORK_NOT_LEFT := "The previous group's connection could not be closed."
+const TEXT_GROUP_HOST_LEFT := "The group host left or is no longer available, so the group was closed."
+const TEXT_MATCH_ABANDONED := "A match was found just as the search stopped, so the group was closed."
+
+## Phases in which a ticket can still be searching, stopping or being let go of: a native
+## match on a ticket this group already released is judged against these.
+const _PRE_MATCH_PHASES := [
+	Phase.GATHERING, Phase.FREEZING, Phase.CREATING_TICKET, Phase.JOINING_TICKET,
+	Phase.SEARCHING, Phase.CANCELLING, Phase.RESTORING_STAGING,
+]
 
 ## How a flow began. The staging role above is the ticket role only; who hosts an
 ## arranged session is `arranged_owner`, whichever premade role a player had.
@@ -159,6 +170,10 @@ var reason_epoch := 0
 var presented_reason_epoch := 0
 var restoration_failed := false
 var cancel_unresolved := false
+## Party's reason, once its recovery of the cleanup this retired flow still holds the lease
+## for has failed: that cleanup cannot finish before the title restarts. Kept apart from
+## `reason`, which stays the outcome that ended the flow.
+var cleanup_error := ""
 ## Set once this member's arranged join has succeeded and a staging-transport loss is
 ## expected rather than fatal. See NetManager._on_server_disconnected(). It says nothing
 ## about the staging *lobby*: arming does not prove the cohort barrier, so a lost lobby
@@ -182,6 +197,7 @@ var search_deadline_msec := 0
 var phase_deadline_msec := 0
 var retired := false
 var native_release_started := false
+var native_release_finished := false
 ## Players per match for this flow's mode, as the service validated it from the mode's
 ## real configuration when the flow started. Tickets are built from a fresh validation;
 ## this is what the flow was admitted with.
@@ -214,6 +230,10 @@ var _unresolved_attempts: Array = []
 ## Scoped Party operations this flow started whose native completion is still owed after
 ## their caller settled -- a timeout, usually. Held for the same reason as the attempts.
 var _unresolved_operations: Array = []
+## Lobbies and transports this flow left whose leave settled with their cleanup still owed:
+## Party's recovery of them failed, and they stay fenced until the title restarts. Held for
+## the same reason as the attempts, and read through Party's own quiescence query.
+var _unresolved_contexts: Array = []
 ## The attempt this guest last told the owner it cannot join, so a refusal is sent once.
 var _refused_epoch := 0
 ## Guest bookkeeping for the current epoch: how far it has moved, whether it acknowledged
@@ -358,6 +378,7 @@ func presentation() -> Dictionary:
 		"presented_epoch": presented_reason_epoch,
 		"restoration_failed": restoration_failed,
 		"cancel_unresolved": cancel_unresolved,
+		"cleanup_error": cleanup_error,
 	}
 
 
@@ -828,6 +849,11 @@ func _watch_ticket(attempt: Variant, attempt_epoch: int) -> void:
 	_finished_callback = _on_ticket_finished.bind(attempt_epoch)
 	attempt.progress_changed.connect(_progress_callback)
 	attempt.finished.connect(_finished_callback)
+	# Kept for the attempt's whole native life, after this flow stops reading its outcome
+	# too: a match that lands once the search was let go of still has to end the group.
+	if attempt.has_signal("native_terminal_changed") \
+			and not attempt.native_terminal_changed.is_connected(_on_native_terminal):
+		attempt.native_terminal_changed.connect(_on_native_terminal)
 	# A synchronous failure has already settled; a snapshot may already carry an id.
 	if not attempt.is_pending():
 		_on_ticket_finished(attempt, attempt_epoch)
@@ -861,8 +887,8 @@ func _retire_ticket() -> void:
 	_release_ticket_observation()
 
 
-## Whether any attempt or scoped operation this flow let go of still has native cleanup
-## its service owes.
+## Whether any attempt, scoped operation or left context this flow let go of still has
+## native cleanup its service owes.
 func _cleanup_outstanding() -> bool:
 	for index in range(_unresolved_attempts.size() - 1, -1, -1):
 		var attempt: Variant = _unresolved_attempts[index]
@@ -872,7 +898,13 @@ func _cleanup_outstanding() -> bool:
 		var operation: Variant = _unresolved_operations[index]
 		if operation == null or not bool(operation.cleanup_pending):
 			_unresolved_operations.remove_at(index)
-	return not _unresolved_attempts.is_empty() or not _unresolved_operations.is_empty()
+	var party: PartyService = Services.party() if Services != null else null
+	for index in range(_unresolved_contexts.size() - 1, -1, -1):
+		var context: Variant = _unresolved_contexts[index]
+		if context == null or party == null or party.context_is_quiescent(context):
+			_unresolved_contexts.remove_at(index)
+	return not _unresolved_attempts.is_empty() or not _unresolved_operations.is_empty() \
+		or not _unresolved_contexts.is_empty()
 
 
 ## Keeps the handle of a scoped operation whose caller settled while its native completion
@@ -884,6 +916,18 @@ func _hold_operation(result: Variant) -> void:
 	var operation: Variant = result.operation
 	if operation != null and bool(operation.cleanup_pending) and not _unresolved_operations.has(operation):
 		_unresolved_operations.append(operation)
+
+
+## Keeps the context of a scoped leave that settled with its cleanup still owed -- the
+## failed recovery that settles it leaves the context fenced -- so a leaving flow does not
+## release its lease as though the leave had finished. The context is polled, not the result.
+func _hold_leave(result: Variant) -> void:
+	if result == null:
+		return
+	_hold_operation(result)
+	var context: Variant = result.context
+	if bool(result.cleanup_pending) and context != null and not _unresolved_contexts.has(context):
+		_unresolved_contexts.append(context)
 
 
 func _ticket_current(attempt: Variant, attempt_epoch: int) -> bool:
@@ -928,8 +972,7 @@ func _on_ticket_finished(attempt: Variant, attempt_epoch: int) -> void:
 		if phase == Phase.CANCELLING or not _pending_stop.is_empty():
 			# The match won a cancel race. The cancel request stays binding: the group
 			# leaves rather than starting a match nobody asked to keep.
-			_retire_ticket()
-			NetManager._flow_fail(self, TEXT_CANCELLED)
+			_abandon_matched()
 			return
 		_on_matched(attempt)
 		return
@@ -971,9 +1014,11 @@ func _on_ticket_finished(attempt: Variant, attempt_epoch: int) -> void:
 ## usually a cancellation it could not confirm. A live ticket could still match the group,
 ## so it stays closed and visibly cancelling; nothing is reopened or searched again until
 ## the service reports the ticket safe, and then the group is restored with the reason
-## already captured. Leaving stays available throughout.
+## already captured -- unless that ticket matched while it was held, which ends the group
+## instead. Leaving stays available throughout.
 func _hold_for_cleanup(code: StringName, text: String) -> void:
 	var holding_epoch := epoch
+	var held := _unresolved_attempts.duplicate()
 	_pending_stop = {"code": code, "text": text}
 	cancel_unresolved = true
 	if phase != Phase.CANCELLING:
@@ -981,10 +1026,53 @@ func _hold_for_cleanup(code: StringName, text: String) -> void:
 		NetManager._flow_broadcast_phase(self, {})
 	changed.emit()
 	while _cleanup_outstanding():
+		if _any_matched(held):
+			_abandon_matched()
+			return
 		await _clock.sleep_seconds(POLL_SECONDS)
 		if not is_current() or epoch != holding_epoch or phase != Phase.CANCELLING:
 			return
+	# A cleared cleanup flag says the ticket is safe, not that it never matched.
+	if _any_matched(held):
+		_abandon_matched()
+		return
 	_restore(code, text)
+
+
+## Whether any of these attempts reached native Matched: level state, read afresh.
+static func _any_matched(attempts: Array) -> bool:
+	for attempt: Variant in attempts:
+		if attempt != null and int(attempt.status) == MatchmakingService.STATUS_MATCHED:
+			return true
+	return false
+
+
+## A ticket this group had already let go of -- cancelled, left, timed out or failed --
+## was matched anyway. Native Matched is terminal proof, but the stop stays binding: the
+## old group neither joins that match, searches again nor reopens as if nothing happened,
+## because the players it matched are no longer this group's to gather. It ends here,
+## with its reason; the lease stays held until the ticket's native cleanup is settled.
+func _abandon_matched() -> void:
+	if not is_current():
+		return
+	_retire_ticket()
+	NetManager._flow_fail(self, TEXT_MATCH_ABANDONED)
+
+
+## The service first observed a ticket's native terminal state. A match that lands on a
+## ticket this group still searches with arrives as its settled outcome instead; this is
+## for one it already let go of, whatever order the events came in.
+func _on_native_terminal(attempt: Variant) -> void:
+	if attempt == null or not is_current() or phase not in _PRE_MATCH_PHASES:
+		return
+	if attempt != ticket and not _unresolved_attempts.has(attempt):
+		return
+	if int(attempt.status) != MatchmakingService.STATUS_MATCHED:
+		return
+	var let_go: bool = attempt != ticket or phase == Phase.CANCELLING or not _pending_stop.is_empty() \
+		or (not attempt.is_pending() and int(attempt.outcome) != MatchmakingService.Outcome.MATCHED)
+	if let_go:
+		_abandon_matched()
 
 
 ## Stops the current search attempt. Before a ticket exists this is a restoration; with a
@@ -1842,11 +1930,17 @@ func _drive_admission() -> void:
 	while request != null and request.is_pending():
 		if not is_current() or request != admission_request:
 			return
-		if request.admitted:
-			NetManager._consume_flow_admission(self, request)
-			if is_current() and request.succeeded():
-				await _retire_staging()
+		# The host's identity request, if its proof was still pending, is asked again on
+		# every poll as well as on every lobby update, inside this phase's own deadline.
+		NetManager._settle_pending_authority()
+		if not is_current() or request != admission_request or not request.is_pending():
 			return
+		if request.admitted:
+			# Still waiting only while the host's proof settles; otherwise answered either way.
+			if NetManager._consume_flow_admission(self, request):
+				if is_current() and request.succeeded():
+					await _retire_staging()
+				return
 		if _clock.has_expired(phase_deadline_msec):
 			NetManager._flow_fail(self, "The match could not be joined in time.")
 			return
@@ -1957,6 +2051,7 @@ func reconcile_arranged() -> void:
 ## the owner-published phase first -- so an invite read after it is admitted or refused on
 ## the right side -- then the lock. Reopening publishes the rematch phase and confirms the
 ## unlock; closing publishes gameplay and confirms the lock. The local gate is NetManager's.
+## A refusal is told in this title's words: the service's own are for its log.
 func set_rematch_open(open: bool) -> bool:
 	last_admission_error = ""
 	if not is_current() or not arranged_owner or arranged_context == null or phase != Phase.REMATCH_GATHERING:
@@ -1972,7 +2067,7 @@ func set_rematch_open(open: bool) -> bool:
 		last_admission_error = "The match has ended."
 		return false
 	if posted == null or not posted.ok():
-		last_admission_error = _result_reason(posted, "The match could not be updated.")
+		last_admission_error = "The match could not be updated."
 		return false
 	var locked: PartyService.PartyResult = await party.set_context_locked(arranged_context, not open, deadline)
 	_hold_operation(locked)
@@ -1980,7 +2075,7 @@ func set_rematch_open(open: bool) -> bool:
 		last_admission_error = "The match has ended."
 		return false
 	if locked == null or not locked.ok():
-		last_admission_error = _result_reason(locked, "The match could not be updated.")
+		last_admission_error = "The match could not be updated."
 		return false
 	return true
 
@@ -2036,16 +2131,76 @@ func release_native() -> void:
 	if party != null:
 		for context: Variant in held_contexts():
 			var left_lobby: PartyService.PartyResult = await party.leave_lobby(context)
-			_hold_operation(left_lobby)
+			_hold_leave(left_lobby)
 			var left_transport: PartyService.PartyResult = await party.leave_transport(context)
-			_hold_operation(left_transport)
+			_hold_leave(left_transport)
 	# A retired ticket or scoped operation the service has not finished with could still
 	# act for this player, so the lease -- and with it every online entry -- is held until
 	# the service reports it safe, for as long as this is the signed-in account. The wait is
 	# shown as quarantine after the cancellation grace; quit and account teardown bound it
-	# from outside.
+	# from outside. Once Party's recovery of it has failed, the lease stays held but nothing
+	# more is asked of Party: the flow reports the restart that failure requires.
+	var orphaned_since := -1
 	while _cleanup_outstanding() and Services != null and Services.is_current_account(account_generation):
+		var failure := _cleanup_failure()
+		if not failure.is_empty():
+			note_cleanup_failed(failure)
+		else:
+			orphaned_since = _recover_orphaned_cancel(orphaned_since)
 		await _clock.sleep_seconds(POLL_SECONDS)
+	native_release_finished = true
+	native_release_done.emit()
+
+
+## Returns once the release already under way has finished; at once if it has. For the
+## callers that join a release another started.
+func wait_native_release() -> void:
+	if native_release_finished or not native_release_started:
+		return
+	await native_release_done
+
+
+## Party's reason its recovery failed, or empty. Terminal until the title restarts.
+func _cleanup_failure() -> String:
+	var party: PartyService = Services.party() if Services != null else null
+	return party.recovery_error if party != null else ""
+
+
+## Party's recovery of the cleanup this retired flow still waits on has failed. The lease
+## stays held -- nothing that cleanup guarded is safe yet -- and the reason it cannot finish
+## is kept for the flow's snapshot and every refusal the lease causes. `reason` is left as
+## the outcome that ended the flow.
+func note_cleanup_failed(failure: String) -> void:
+	if failure.is_empty() or cleanup_error == failure:
+		return
+	cleanup_error = failure
+	changed.emit()
+
+
+## The pinned binding never answers a cancel that lost its race to a match, so that waiter
+## would hold the lease for good. It is native cleanup trouble, not a search still being
+## cancelled: once it has stood for the cancellation grace, with this flow's own lobbies
+## and transports already released, Party's bounded recovery resets the Party and Lobby
+## runtime -- never PlayFab itself, the account or its saves -- and the confirmed reset
+## discharges the old ticket. Asked again at the same pace for as long as it stands, until
+## Party reports that its recovery failed. Returns when the current stand began, or -1 while
+## nothing is orphaned.
+func _recover_orphaned_cancel(since_msec: int) -> int:
+	var orphaned := false
+	for attempt: Variant in _unresolved_attempts:
+		if attempt != null and bool(attempt.native_terminal) and bool(attempt.cancel_in_flight) \
+				and int(attempt.status) == MatchmakingService.STATUS_MATCHED:
+			orphaned = true
+			break
+	if not orphaned:
+		return -1
+	var now := _clock.now_msec()
+	if since_msec < 0:
+		return now
+	if now - since_msec < int(CANCEL_GRACE_SECONDS * 1000.0):
+		return since_msec
+	NetManager._flow_request_recovery(self)
+	return now
 
 
 ## A result context this flow was not allowed to keep: a success that arrived after the

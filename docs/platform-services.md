@@ -251,6 +251,33 @@ during recovery is taken as proof that every old lobby and ticket is gone: the f
 first, synchronously, and the matchmaking service then discharges the old tickets. A Party-only
 loss, or a shutdown that failed, proves nothing, and a ticket still owed stays quarantined.
 
+A stop is binding. Once a group has let a search go -- its owner cancelled, a member left, the
+search timed out or failed, or an invitation replaced it -- a native match on that ticket is
+terminal proof but not a match to join: the old group joins nothing, reopens nothing and searches
+nothing again, and ends with *"A match was found just as the search stopped, so the group was
+closed."* The lease stays held while the ticket's native cleanup is owed. The addon this sample is
+built with never answers a cancel that loses this race, so once that waiter has stood for the
+five-second cancellation grace, with the old group's lobbies and transport already released, the
+flow hands it to Party's bounded recovery -- Party and Lobby only, never PlayFab itself, the
+account or its saves -- and the confirmed reset discharges it. A binding that answers the cancel
+releases the lease with no recovery at all. The obligation belongs to the multiplayer runtime,
+not to the flow or its account: if the account is removed or the title suspended before that
+grace ends, the deferred account teardown claims the same recovery before its global leave, and
+a match that lands on the old ticket after that teardown's first look -- even while its last step
+is still finishing -- is recovered before the teardown finishes. Online entry stays refused until
+the old ticket is discharged, and an invitation received meanwhile is kept, under the time it
+arrived, and joined once that cleanup has settled. A recovery that fails is not asked for again:
+the lease stays held, since the cleanup it guards never finished, and the retired flow and every
+entry the lease refuses -- Quick Match, Host, Join, Practice and a received invitation -- report
+Party's restart-required reason instead of a session still finishing. A received invitation is
+answered with it once. The outcome that ended the group is kept as it was, and quitting stays
+bounded by the one budget.
+
+A lobby or Party transport whose native leave fails is cleanup still owed, not cleanup done. The
+group that left it keeps the lease until Party's recovery confirms the reset, and online entry
+and received invitations wait for that in the same way; a recovery that fails leaves the same
+restart-required state as above.
+
 ---
 
 ## Moderation and reporting

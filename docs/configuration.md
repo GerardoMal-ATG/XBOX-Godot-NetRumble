@@ -92,6 +92,19 @@ The PlayFab title must provision that matching queue in Game Manager; retuning t
 without changing the queue makes Quick Match unavailable rather than silently matching a
 different cohort.
 
+Quick Match validates the addon surface it requires before entry. Optional diagnostic fields are
+read only when present, and ordinary lobby-code search is not required for Quick Match. In particular,
+`PlayFabLobbyJoinConfig` must expose `max_member_count`, `access_policy`,
+`owner_migration_policy`, `restrict_invites_to_lobby_owner` and `member_properties`;
+`PlayFabMatchmakingMember` must expose both `user` and `attributes`; and the Lobby, Party
+network/peer and service methods used by staging, handoff, admission, updates, locks and cleanup
+must be present. `max_players` belongs to `PlayFabLobbyConfig` and is not an alias for the
+arranged join field.
+
+Build from the Sample addon revision pinned by this repository and record that revision and the
+rebuilt addon package with validation results. A gitlink by itself does not identify the loaded
+binaries; see Known issues for the current package's Matchmaking cancellation behavior.
+
 ### 3. Get XBOX title and sandbox access
 
 The XBOX half (sign-in, friends, invites and achievements against the live service) needs a

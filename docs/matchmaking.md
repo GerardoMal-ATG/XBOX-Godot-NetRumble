@@ -31,6 +31,12 @@ A full group of four is deliberately submitted through the same ticket path, but
 a ticket that already fills this queue's maximum. See
 [A full group of four cannot use Quick Match](known-issues.md#a-full-group-of-four-cannot-use-quick-match).
 
+The title confirms that cause only when the addon exposes the native
+`0x89235652` result. The currently supported wrapper can report some immediate or terminal
+failures only as generic `E_FAIL`; those remain generic Matchmaking failures and carry the
+full-four limitation as separate guidance. Ticket status alone, a missing ticket id or service
+message text never proves a queue-size rejection or "no match."
+
 ## Service boundary
 
 `MatchmakingService` owns ticket handles independently of screens:
@@ -43,6 +49,12 @@ a ticket that already fills this queue's maximum. See
 - arms one cancellable alarm at the search deadline;
 - invalidates only old-runtime ticket obligations after a confirmed PlayFab Multiplayer reset.
 
+Ticket terminal status and cancellation completion are separate obligations. Matched,
+Cancelled or Failed is authoritative ticket state; an in-flight native cancel remains owned
+until its completion or confirmed Multiplayer invalidation. Build from the Sample addon revision
+pinned by this repository, record that revision with validation results, and see Known issues for
+the current package's cancellation behavior.
+
 `PartyService` owns native resources by captured context:
 
 - staging and arranged Lobby handles may coexist during an arranged join;
@@ -54,6 +66,12 @@ a ticket that already fills this queue's maximum. See
   deadline and cleanup handle;
 - a caller may receive `TIMEOUT` while the still-running native result remains owned; a late
   Lobby or network is released exactly once and cannot attach to a replacement context;
+- a non-OK scoped Lobby or Party leave remains cleanup-pending after returning its service error;
+  only confirmed multiplayer recovery clears that obligation, while failed recovery requires a
+  restart;
+- retained failed-leave debt can exist between cleanup runs: it continues to block online entry,
+  but the title distinguishes that obligation from cleanup currently executing so an available
+  owner can start the existing recovery promptly;
 - unexpected Lobby disconnect or owner change is reported separately from Party transport loss;
 - a confirmed Multiplayer reset advances the recovery epoch before notifying the ticket service.
 
@@ -61,6 +79,10 @@ Unexpected staging Lobby loss is terminal even after the old-transport-loss bran
 That armed exception applies only to the captured old Party transport. Normal handoff retires the
 staging Lobby deliberately; `PartyService` disconnects its Lobby callback before native teardown,
 so the expected retirement emits no `context_lost`.
+
+The ordinary hosted-session continuity rule for a client's local-only Lobby notification loss
+does not apply to Matchmaking contexts. Staging and arranged Lobby loss remains terminal until
+the captured context enters its own deliberate leave boundary.
 
 The ordinary hosted/code/invite APIs remain compatibility entry points. Scoped matchmaking
 cleanup never guesses which of two lobbies a global field refers to.

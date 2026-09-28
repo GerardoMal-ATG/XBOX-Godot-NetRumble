@@ -1,15 +1,194 @@
 extends RefCounted
 
 const Doubles := preload("res://tools/tests/pregame_service_doubles.gd")
+const SOURCE_REQUIRED_SURFACES := [
+	"PlayFabLobbyJoinConfig.member_properties",
+	"PlayFabLobbyJoinConfig.max_member_count",
+	"PlayFabLobbyJoinConfig.access_policy",
+	"PlayFabLobbyJoinConfig.owner_migration_policy",
+	"PlayFabLobbyJoinConfig.restrict_invites_to_lobby_owner",
+	"PlayFabLobbyConfig.max_players",
+	"PlayFabLobbyConfig.access_policy",
+	"PlayFabLobbyConfig.owner_migration_policy",
+	"PlayFabLobbyConfig.search_properties",
+	"PlayFabLobbyConfig.lobby_properties",
+	"PlayFabLobbyConfig.member_properties",
+	"PlayFabLobbyConfig.restrict_invites_to_lobby_owner",
+	"PlayFabLobbyUpdateConfig.lobby_properties",
+	"PlayFabLobbyUpdateConfig.search_properties",
+	"PlayFabLobby.lobby_id",
+	"PlayFabLobby.connection_string",
+	"PlayFabLobby.owner_entity_key",
+	"PlayFabLobby.max_member_count",
+	"PlayFabLobby.members",
+	"PlayFabLobby.properties",
+	"PlayFabLobby.search_properties",
+	"PlayFabLobby.access_policy",
+	"PlayFabLobby.owner_migration_policy",
+	"PlayFabLobby.membership_lock",
+	"PlayFabLobby.restrict_invites_to_lobby_owner",
+	"PlayFabLobby.is_disconnected",
+	"PlayFabLobby.is_owner",
+	"PlayFabLobby.set_properties_async",
+	"PlayFabLobby.set_member_properties_async",
+	"PlayFabLobby.set_membership_lock_async",
+	"PlayFabLobby.post_update_async",
+	"PlayFabLobby.leave_async",
+	"PlayFabLobby.state_changed",
+	"PlayFabLobbyMember.entity_key",
+	"PlayFabLobbyMember.properties",
+	"PlayFabLobbyMember.connection_status",
+	"PlayFabLobbyStateChange.kind",
+	"PlayFabLobbyStateChange.result",
+	"PlayFabPartyConfig.max_players",
+	"PlayFabPartyConfig.invitation_id",
+	"PlayFabPartyConfig.enable_voice_chat",
+	"PlayFabPartyConfig.enable_text_chat",
+	"PlayFabPartyConfig.enable_transcription",
+	"PlayFabPartyConfig.enable_translation",
+	"PlayFabPartyConfig.direct_peer_connectivity",
+	"PlayFabPartyNetwork.descriptor",
+	"PlayFabPartyNetwork.local_peer",
+	"PlayFabPartyNetwork.leave_async",
+	"PlayFabPartyNetwork.state_changed",
+	"PlayFabPartyNetworkStateChange.kind",
+	"PlayFabPartyNetworkStateChange.network",
+	"PlayFabPartyNetworkStateChange.result",
+	"PlayFabPartyNetworkStateChange.peer_id",
+	"PlayFabPartyNetworkStateChange.state",
+	"PlayFabPartyPeer.get_peer_entity_key",
+	"PlayFabPartyPeer.get_connection_status",
+	"PlayFabPartyPeer.get_unique_id",
+	"PlayFabMatchmakingTicketConfig.queue_name",
+	"PlayFabMatchmakingTicketConfig.timeout_seconds",
+	"PlayFabMatchmakingTicketConfig.members",
+	"PlayFabMatchmakingTicketConfig.members_to_match_with",
+	"PlayFabMatchTicket.ticket_id",
+	"PlayFabMatchTicket.status",
+	"PlayFabMatchTicket.match_id",
+	"PlayFabMatchTicket.arranged_lobby_connection_string",
+	"PlayFabMatchTicket.cancel_async",
+	"PlayFabMatchTicket.state_changed",
+	"PlayFabMatchTicketStateChange.result",
+	"PlayFabMatchmakingMember.user",
+	"PlayFabMatchmakingMember.attributes",
+	"PlayFabResult.ok",
+	"PlayFabResult.data",
+	"PlayFabResult.hresult",
+	"PlayFabResult.code",
+	"PlayFabResult.message",
+	"PlayFabUser.get_entity_key",
+	"PlayFab.is_initialized",
+	"PlayFabMultiplayer.is_initialized",
+	"PlayFabMultiplayer.initialize_async",
+	"PlayFabMultiplayer.shutdown_async",
+	"PlayFabMultiplayer.create_lobby_async",
+	"PlayFabMultiplayer.join_lobby_async",
+	"PlayFabMultiplayer.create_match_ticket_async",
+	"PlayFabMultiplayer.join_match_ticket_async",
+	"PlayFabMultiplayer.join_arranged_lobby_async",
+	"PlayFabParty.is_initialized",
+	"PlayFabParty.initialize_async",
+	"PlayFabParty.shutdown_async",
+	"PlayFabParty.create_and_join_network_async",
+	"PlayFabParty.join_network_async",
+]
+const SOURCE_OPTIONAL_SURFACES := [
+	"PlayFabPartyNetworkStateChange.reason",
+	"PlayFabMatchTicket.properties",
+	"PlayFabLobbySearchConfig.filter",
+	"PlayFabLobbySearchConfig.max_results",
+	"PlayFabLobbySummary.connection_string",
+	"PlayFabLobbySummary.member_count",
+	"PlayFabLobbySummary.max_member_count",
+	"PlayFabLobbySearchResult.lobbies",
+	"PlayFabMultiplayer.find_lobbies_async",
+]
+# Pinned Sample b1b4e0b, PlayFab Multiplayer implementation lines 624-652,
+# 1926-1928, 1990-2001, 2772-2939, 3434-3437 and 3470-3507.
+const SOURCE_MATCHMAKING_NATIVE_CODES := [
+	"shutting_down",
+	"not_initialized",
+	"invalid_user",
+	"invalid_match_ticket_config",
+	"invalid_match_ticket_member",
+	"match_ticket_create_start_failed",
+	"match_ticket_create_failed",
+	"invalid_join_match_ticket",
+	"match_ticket_join_start_failed",
+	"match_ticket_join_failed",
+	"match_ticket_join_cancelled",
+	"invalid_match_ticket",
+	"match_ticket_cancel_start_failed",
+	"match_ticket_failed",
+	"match_ticket_completed_failed",
+	"lobby_state_finish_failed",
+	"matchmaking_state_finish_failed",
+	"cancelled",
+]
+# Pinned Sample b1b4e0b, PlayFab Multiplayer implementation lines 2056-2091,
+# 2238-2769 and 3077-3437; PlayFab Party implementation lines 25-41,
+# 2149-2202, 2685-2707, 2872-3128, 3230-3660 and 4620-4758.
+const SOURCE_PARTY_NATIVE_CODES := [
+	"shutting_down",
+	"not_initialized",
+	"already_initialized",
+	"multiplayer_queue_create_failed",
+	"multiplayer_initialize_failed",
+	"multiplayer_cleanup_failed",
+	"invalid_user",
+	"invalid_properties",
+	"unsupported_on_gdk_edition",
+	"lobby_create_start_failed",
+	"lobby_create_failed",
+	"invalid_connection_string",
+	"lobby_join_start_failed",
+	"lobby_join_failed",
+	"invalid_arranged_lobby_connection_string",
+	"invalid_arranged_lobby_config",
+	"arranged_lobby_join_start_failed",
+	"arranged_lobby_join_failed",
+	"invalid_search",
+	"lobby_search_start_failed",
+	"lobby_search_failed",
+	"invalid_lobby",
+	"invalid_update",
+	"lobby_update_start_failed",
+	"lobby_update_failed",
+	"member_update_start_failed",
+	"lobby_leave_start_failed",
+	"lobby_disconnected",
+	"lobby_state_finish_failed",
+	"matchmaking_state_finish_failed",
+	"party_shutting_down",
+	"party_not_initialized",
+	"party_already_initialized",
+	"party_invalid_options",
+	"party_invalid_user",
+	"party_network_create_failed",
+	"party_network_connect_failed",
+	"party_descriptor_invalid",
+	"party_transport_create_failed",
+	"party_peer_not_connected",
+	"party_chat_control_create_failed",
+	"party_resource_not_ready",
+	"party_state_start_failed",
+	"party_state_finish_failed",
+	"party_cleanup_failed",
+	"cancelled",
+]
 
 
 func run(test: Node) -> void:
+	Doubles.Matchmaking.clear_test_instances()
 	var previous_party: PartyService = Services._party
 	var previous_matchmaking: MatchmakingService = Services._matchmaking
 	var previous_chat: ChatService = Services._chat
 	var previous_clock: Variant = Services.clock() if Services.has_method("clock") else null
 
 	await _s1_capability_and_profile_gates(test)
+	await _s1_required_runtime_surface(test)
+	await _s1_optional_capability_degradation(test)
 	await _s1_arranged_capacity_contract(test)
 	await _s1_default_ticket_clock(test)
 	await _s2_group_ticket_shape(test)
@@ -17,6 +196,10 @@ func run(test: Node) -> void:
 	await _s3_guest_join_and_late_retirement(test)
 	await _s4_failure_cancel_and_timeout(test)
 	await _s4_native_cleanup_ownership(test)
+	await _s4_matched_cancel_contracts(test)
+	await _s4_failure_cause_availability(test)
+	await _s4_safe_structured_failure_logging(test)
+	await _s4_source_derived_native_code_paths(test)
 	await _s4_observe_terminal_before_cancel(test)
 	await _s5_scoped_lobby_ownership(test)
 	await _s5_hosted_production_paths(test)
@@ -24,6 +207,10 @@ func run(test: Node) -> void:
 	await _s5_global_leave_and_overlap(test)
 	await _s5_global_leave_waits_for_pending_prepare(test)
 	await _s5_recovery_epoch_isolates_late_scoped_work(test)
+	await _s5_recovery_settles_scoped_leave_waiters(test)
+	await _s5_cleanup_execution_and_idle_debt_facts(test)
+	await _s5_native_leave_failure_cleanup_debt(test)
+	await _s5_late_result_leave_failure_idle_debt(test)
 	await _s5_serialized_operations_stop_after_leave(test)
 	await _s5_transport_conflict_cleanup(test)
 	await _s5_scoped_cancellation_and_owned_work(test)
@@ -31,9 +218,21 @@ func run(test: Node) -> void:
 	await _s6_scoped_deadline_ownership(test)
 	await _s6_context_loss_and_admission(test)
 	await _s7_arranged_control_and_publication(test)
+	await _s8_joined_owner_authority_without_flow(test)
+	await _s8_legacy_guest_authority_changes(test)
 	await _s8_invite_destinations(test)
 	await _s9_multiplayer_invalidation(test)
 	await _s10_staging_retirement_observation(test)
+
+	var orphaned := Doubles.Matchmaking.orphan_report()
+	test._check(orphaned.is_empty(),
+		"suite-end matchmaking ownership is empty: %s" % orphaned)
+	Doubles.Matchmaking.invalidate_test_instances()
+	await _frames(test, 3)
+	var remaining := Doubles.Matchmaking.orphan_report()
+	test._check(remaining.is_empty(),
+		"suite-end invalidation releases every alarm/waiter: %s" % remaining)
+	Doubles.Matchmaking.clear_test_instances()
 
 	Services._party = previous_party
 	Services._matchmaking = previous_matchmaking
@@ -69,14 +268,14 @@ func _s1_capability_and_profile_gates(test: Node) -> void:
 	service.fake_group_support = false
 	test._check(not service.is_available()
 		and service.availability_reason()
-			== "This build's PlayFab addon cannot create group matchmaking tickets.",
+			== "Quick Match needs PlayFab addon support for: injected_group_capability.",
 		"missing group-ticket capability reason=%s" % service.availability_reason())
 	service.fake_group_support = true
 
 	service.fake_arranged_support = false
 	test._check(not service.is_available()
 		and service.availability_reason()
-			== "This build's PlayFab addon cannot configure a matched lobby, so Quick Match is unavailable.",
+			== "Quick Match needs arranged-lobby support for: injected_arranged_capability.",
 		"missing arranged-lobby capability reason=%s" % service.availability_reason())
 	service.fake_arranged_support = true
 
@@ -121,17 +320,108 @@ func _s1_capability_and_profile_gates(test: Node) -> void:
 		"profile drift cannot bypass the unavailable UI")
 
 	service.fake_mode_config = _mode_config(3)
-	var forged_create := _spec(user, [user.entity_key], 3)
-	forged_create.expected_match_count = 4
-	var forged_create_attempt := service.begin_create(forged_create)
-	var forged_join := _join_spec(user, [user.entity_key], 4, "forged-ticket")
-	forged_join.expected_match_count = 4
-	var forged_join_attempt := service.begin_join(forged_join)
-	test._check(forged_create_attempt.outcome == MatchmakingService.Outcome.FAILED
-		and forged_join_attempt.outcome == MatchmakingService.Outcome.FAILED
+	var mismatched_create := _spec(user, [user.entity_key], 3)
+	mismatched_create.expected_match_count = 4
+	var mismatched_create_attempt := service.begin_create(mismatched_create)
+	var mismatched_join := _join_spec(
+		user, [user.entity_key], 4, "mismatched-ticket")
+	mismatched_join.expected_match_count = 4
+	var mismatched_join_attempt := service.begin_join(mismatched_join)
+	test._check(mismatched_create_attempt.outcome == MatchmakingService.Outcome.FAILED
+		and mismatched_join_attempt.outcome == MatchmakingService.Outcome.FAILED
 		and service.sdk.create_calls.is_empty() and service.sdk.join_calls.is_empty(),
 		"caller-supplied four cannot bypass a configured three-player profile")
 	service.fake_mode_config = _mode_config(4)
+
+
+func _s1_required_runtime_surface(test: Node) -> void:
+	print("CASE: Quick Match capability probes cover its required SDK surface")
+	var baseline := Doubles.SurfaceMatchmaking.new()
+	test._check(baseline.is_available(),
+		"the verified current addon surface passes: %s" % baseline.availability_reason())
+
+	var alias_only := Doubles.SurfaceMatchmaking.new()
+	alias_only.join_alias_only = true
+	test._check(not alias_only.is_available()
+		and alias_only.missing_join_config_properties().has(
+			"PlayFabLobbyJoinConfig.max_member_count"),
+		"join config max_players alias cannot satisfy max_member_count")
+	var alias_attempt := alias_only.begin_create(
+		_spec(Doubles.User.new("surface-alias"), [
+			{"id": "surface-alias", "type": "title_player_account"},
+		], 15))
+	test._check(alias_attempt.outcome == MatchmakingService.Outcome.FAILED,
+		"alias-only direct entry fails before ticket creation")
+	test._check(alias_only.multiplayer.create_match_calls == 0,
+		"alias-only native create calls=%d" % alias_only.multiplayer.create_match_calls)
+
+	for missing_surface: String in SOURCE_REQUIRED_SURFACES:
+		_assert_missing_surface(test, missing_surface)
+
+
+func _assert_missing_surface(test: Node, missing_surface: String) -> void:
+	var service := Doubles.SurfaceMatchmaking.new()
+	service.missing_surface = missing_surface
+	var reason := service.availability_reason()
+	test._check(not service.is_available() and reason.contains(missing_surface),
+		"missing %s reason=%s" % [missing_surface, reason])
+	var user := Doubles.User.new("missing-surface")
+	var attempt := service.begin_create(_spec(user, [user.entity_key], 16))
+	test._check(attempt.outcome == MatchmakingService.Outcome.FAILED,
+		"missing %s direct outcome=%d" % [missing_surface, attempt.outcome])
+	test._check(service.multiplayer.create_match_calls == 0,
+		"missing %s native creates=%d" % [
+			missing_surface, service.multiplayer.create_match_calls])
+
+
+func _s1_optional_capability_degradation(test: Node) -> void:
+	print("CASE: optional diagnostics and code search do not disable Quick Match")
+	for optional_surface: String in SOURCE_OPTIONAL_SURFACES:
+		var service := Doubles.SurfaceMatchmaking.new()
+		service.missing_surface = optional_surface
+		test._check(service.is_available(),
+			"optional %s leaves Quick Match available: %s" % [
+				optional_surface, service.availability_reason()])
+	for optional_class: String in Doubles.SurfaceMatchmaking.OPTIONAL_SEARCH_CLASSES:
+		var without_class := Doubles.SurfaceMatchmaking.new()
+		without_class.missing_class = optional_class
+		test._check(without_class.is_available(),
+			"missing optional %s leaves Quick Match available: %s" % [
+				optional_class, without_class.availability_reason()])
+
+	var party := Doubles.Party.new(ChatService.new())
+	var hosted: Dictionary = await party.host(
+		Doubles.User.new("optional-reason"), 4, "deathmatch")
+	var losses: Array[String] = []
+	party.network_lost.connect(func(reason: String, _context: Variant) -> void:
+		losses.append(reason))
+	var change := Doubles.ChangeWithoutReason.new()
+	change.kind = PartyService.NETWORK_CHANGE_STATE
+	change.state = PartyService.NETWORK_STATE_DISCONNECTED
+	change.network = party._network
+	change.result = Doubles.Results.make(
+		false, null, "party_network_connect_failed", "Fallback terminal reason.")
+	party._network.state_changed.emit(change)
+	test._check(bool(hosted.get("ok", false)) and losses == ["Fallback terminal reason."],
+		"missing change.reason falls back to structured result text=%s" % [losses])
+	await party.leave()
+
+	var matchmaking := Doubles.Matchmaking.new()
+	var ticket := Doubles.TicketWithoutProperties.new()
+	matchmaking.sdk.queued_create_results.append(Doubles.Results.make(true, ticket))
+	var user := Doubles.User.new("optional-properties")
+	var attempt := matchmaking.begin_create(_spec(user, [user.entity_key], 17))
+	await _frames(test, 2)
+	ticket.emit_status(
+		MatchmakingService.STATUS_FAILED,
+		Doubles.Results.make(
+			false,
+			null,
+			"match_ticket_completed_failed",
+			"Terminal detail without ticket properties."))
+	test._check(attempt.outcome == MatchmakingService.Outcome.FAILED
+		and attempt.diagnostic.contains("match_ticket_completed_failed"),
+		"missing ticket.properties preserves result diagnostic without a hard read")
 
 
 func _s1_arranged_capacity_contract(test: Node) -> void:
@@ -251,6 +541,8 @@ func _s1_default_ticket_clock(test: Node) -> void:
 	await _frames(test, 2)
 	test._check(not standalone.has_pending_cleanup(),
 		"standalone retirement reaches ticket quiescence")
+	test._check(standalone.sdk.pending_cancel_waiters() == 0,
+		"standalone retirement leaves no native cancel waiter")
 
 	var configured := Doubles.Matchmaking.new()
 	var fake_clock := Doubles.Clock.new()
@@ -270,6 +562,8 @@ func _s1_default_ticket_clock(test: Node) -> void:
 	await _frames(test, 2)
 	test._check(not configured.has_pending_cleanup(),
 		"configured attempt returns cleanup ownership to zero")
+	test._check(configured.sdk.pending_cancel_waiters() == 0,
+		"configured retirement leaves no native cancel waiter")
 	await _drain_clock(test, fake_clock, "S1 configured ticket clock")
 
 
@@ -418,24 +712,135 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 	var user := Doubles.User.new("s4-local")
 	var members := _full_group(user, "s4")
 
-	var immediate := Doubles.Matchmaking.new()
-	immediate.sdk.queued_create_results.append(Doubles.Results.make(
-		false, null, "invalid_match_ticket_config", "Injected maximum-size rejection."))
-	var immediate_attempt := immediate.begin_create(_spec(user, members, 40))
-	await _frames(test, 2)
-	_full_party_failure(test, immediate_attempt,
-		"immediate full-party rejection has the specific durable outcome")
-	test._check(immediate_attempt.ticket == null and not immediate_attempt.cleanup_pending,
-		"no-ticket rejection does not wait for a nonexistent cancellation")
+	for hresult: int in [-1994172846, 2300794450]:
+		var immediate := Doubles.Matchmaking.new()
+		immediate.sdk.queued_create_results.append(Doubles.Results.make(
+			false,
+			null,
+			"match_ticket_create_failed",
+			"Injected credential SECRET_IMMEDIATE.",
+			hresult))
+		var immediate_attempt := immediate.begin_create(_spec(user, members, 40))
+		await _frames(test, 2)
+		_full_party_failure(test, immediate_attempt,
+			"immediate signed/unsigned size HRESULT has the specific durable outcome")
+		test._check(immediate.fake_warnings.size() == 1
+			and immediate.fake_warnings[0].contains("detail=available"),
+			"confirmed size HRESULT logs available cause detail=%s" % \
+				[immediate.fake_warnings])
+		test._check(immediate_attempt.ticket == null
+			and not immediate_attempt.cleanup_pending,
+			"confirmed no-ticket rejection owns no nonexistent cancellation")
 
-	var terminal := Doubles.Matchmaking.new()
-	var failed_ticket := Doubles.Ticket.new()
-	terminal.sdk.queued_create_results.append(Doubles.Results.make(true, failed_ticket))
-	var terminal_attempt := terminal.begin_create(_spec(user, members, 41))
+		var terminal := Doubles.Matchmaking.new()
+		var failed_ticket := Doubles.Ticket.new()
+		terminal.sdk.queued_create_results.append(Doubles.Results.make(true, failed_ticket))
+		var terminal_attempt := terminal.begin_create(_spec(user, members, 41))
+		await _frames(test, 2)
+		failed_ticket.emit_status(
+			MatchmakingService.STATUS_FAILED,
+			Doubles.Results.make(
+				false,
+				null,
+				"match_ticket_failed",
+				"Injected credential SECRET_TERMINAL.",
+				hresult))
+		_full_party_failure(test, terminal_attempt,
+			"terminal signed/unsigned size HRESULT has the specific durable outcome")
+
+	var lossy_create := Doubles.Matchmaking.new()
+	lossy_create.sdk.queued_create_results.append(Doubles.Results.make(
+		false,
+		null,
+		"match_ticket_create_failed",
+		"Injected lossy create detail.",
+		-2147467259))
+	var lossy_create_attempt := lossy_create.begin_create(
+		_spec(user, members, 42))
 	await _frames(test, 2)
-	failed_ticket.emit_status(MatchmakingService.STATUS_FAILED)
-	_full_party_failure(test, terminal_attempt,
-		"terminal full-party rejection uses the same durable outcome")
+	_generic_full_party_failure(
+		test,
+		lossy_create_attempt,
+		&"ticket_create_failed",
+		"lossy no-id create stays generic with separate policy guidance")
+
+	var lossy_terminal := Doubles.Matchmaking.new()
+	var lossy_ticket := Doubles.Ticket.new()
+	lossy_terminal.sdk.queued_create_results.append(
+		Doubles.Results.make(true, lossy_ticket))
+	var lossy_terminal_attempt := lossy_terminal.begin_create(
+		_spec(user, members, 43))
+	await _frames(test, 2)
+	lossy_ticket.emit_status(
+		MatchmakingService.STATUS_FAILED,
+		Doubles.Results.make(
+			false,
+			null,
+			"match_ticket_failed",
+			"Injected lossy terminal detail.",
+			-2147467259))
+	_generic_full_party_failure(
+		test,
+		lossy_terminal_attempt,
+		&"matchmaking_failed",
+		"lossy terminal failure stays generic with separate policy guidance")
+	test._check(MatchmakingService.reason_for_code(
+		String(MatchmakingService.FULL_PARTY_REASON_CODE))
+			== MatchmakingService.FULL_PARTY_REASON,
+		"confirmed full-party reason lookup remains unchanged")
+	test._check(MatchmakingService.reason_for_code("matchmaking_failed").is_empty(),
+		"generic reason codes are carried with explicit text, not inferred")
+	var guided_control_text := PartyService.encode_search_control({
+		"epoch": 1,
+		"phase": "gathering",
+		"group": [user.entity_key],
+		"reason_code": String(lossy_terminal_attempt.reason_code),
+		"reason": lossy_terminal_attempt.reason,
+	})
+	var guided_control := PartyService.decode_search_control(guided_control_text)
+	test._check(bool(guided_control.get("valid", false))
+		and String(guided_control.get("reason", ""))
+			== lossy_terminal_attempt.reason,
+		"search control preserves the complete generic reason and policy guidance")
+
+	var absent_terminal := Doubles.Matchmaking.new()
+	var absent_ticket := Doubles.Ticket.new()
+	absent_terminal.sdk.queued_create_results.append(
+		Doubles.Results.make(true, absent_ticket))
+	var absent_attempt := absent_terminal.begin_create(
+		_spec(user, members, 44))
+	await _frames(test, 2)
+	absent_ticket.emit_status(MatchmakingService.STATUS_FAILED)
+	_generic_full_party_failure(
+		test,
+		absent_attempt,
+		&"matchmaking_failed",
+		"terminal failure without native detail stays generic with separate guidance")
+
+	for explicit_failure: Dictionary in [
+		{"code": "not_initialized", "hresult": -1994183168},
+		{"code": "shutting_down", "hresult": -1994183167},
+		{"code": "invalid_user", "hresult": -2147024809},
+		{"code": "invalid_member", "hresult": -2147024809},
+		{"code": "invalid_config", "hresult": -2147024809},
+		{"code": "queue_not_found", "hresult": -1994174463},
+	]:
+		var explicit := Doubles.Matchmaking.new()
+		explicit.sdk.queued_create_results.append(Doubles.Results.make(
+			false,
+			null,
+			String(explicit_failure.code),
+			"Injected explicit failure.",
+			int(explicit_failure.hresult)))
+		var explicit_attempt := explicit.begin_create(_spec(user, members, 45))
+		await _frames(test, 2)
+		test._check(explicit_attempt.reason_code == &"ticket_create_failed",
+			"explicit %s reason_code=%s" % [
+				explicit_failure.code, explicit_attempt.reason_code])
+		test._check(not explicit_attempt.reason.contains(
+			MatchmakingService.FULL_PARTY_GUIDANCE),
+			"explicit %s is not recast as queue-size failure" % \
+				explicit_failure.code)
 
 	var diagnostic_service := Doubles.Matchmaking.new()
 	var diagnostic_ticket := Doubles.Ticket.new()
@@ -443,7 +848,7 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 	diagnostic_service.sdk.queued_create_results.append(
 		Doubles.Results.make(true, diagnostic_ticket))
 	var diagnostic_attempt := diagnostic_service.begin_create(
-		_spec(user, [user.entity_key], 44))
+		_spec(user, [user.entity_key], 46))
 	await _frames(test, 2)
 	diagnostic_ticket.emit_status(
 		MatchmakingService.STATUS_FAILED,
@@ -456,7 +861,7 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 	var cancelling := Doubles.Matchmaking.new()
 	var cancel_ticket := Doubles.Ticket.new()
 	cancelling.sdk.queued_create_results.append(Doubles.Results.make(true, cancel_ticket))
-	var cancel_attempt := cancelling.begin_create(_spec(user, [user.entity_key], 42))
+	var cancel_attempt := cancelling.begin_create(_spec(user, [user.entity_key], 47))
 	await _frames(test, 2)
 	cancelling.request_cancel(cancel_attempt)
 	await _frames(test, 2)
@@ -468,7 +873,7 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 	timing.configure_clock(clock)
 	var timeout_ticket := Doubles.Ticket.new()
 	timing.sdk.queued_create_results.append(Doubles.Results.make(true, timeout_ticket))
-	var timeout_spec := _spec(user, [user.entity_key], 43)
+	var timeout_spec := _spec(user, [user.entity_key], 48)
 	timeout_spec.deadline_msec = 600000
 	var timeout_attempt := timing.begin_create(timeout_spec)
 	await _frames(test, 2)
@@ -539,6 +944,14 @@ func _cancel_in_flight_timeout_race(
 		ticket.match_id = "cancel-race-match"
 		ticket.arranged_lobby_connection_string = "cancel-race-arrangement"
 		ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+	elif terminal_status == MatchmakingService.STATUS_FAILED:
+		var failed_completion := Doubles.Results.make(
+			false,
+			ticket,
+			"match_ticket_failed",
+			"Injected current-package terminal failure.",
+			-2147467259)
+		ticket.emit_status(terminal_status, failed_completion)
 	else:
 		ticket.emit_status(terminal_status)
 	test._check(attempt.outcome == MatchmakingService.Outcome.TIMEOUT,
@@ -549,8 +962,18 @@ func _cancel_in_flight_timeout_race(
 			"[matched] terminal cleanup still captures handoff diagnostics")
 	test._check(service.has_pending_cleanup(),
 		"[%s] cancel await remains owned until its native return" % label)
-	ticket.block_cancel = false
-	ticket.cancel_released.emit()
+	if terminal_status == MatchmakingService.STATUS_MATCHED:
+		ticket.invalidate_runtime()
+	elif terminal_status == MatchmakingService.STATUS_FAILED:
+		ticket.release_cancel(Doubles.Results.make(
+			false,
+			ticket,
+			"match_ticket_failed",
+			"Injected current-package terminal failure.",
+			-2147467259))
+	else:
+		ticket.block_cancel = false
+		ticket.cancel_released.emit()
 	await _frames(test, 3)
 	test._check(ticket.cancel_calls == 1,
 		"[%s] native cancel total=%d" % [label, ticket.cancel_calls])
@@ -561,6 +984,9 @@ func _cancel_in_flight_timeout_race(
 			label, attempt.cleanup_pending])
 	test._check(not service.has_pending_cleanup(),
 		"[%s] service reaches ticket quiescence" % label)
+	test._check(service.sdk.pending_cancel_waiters() == 0,
+		"[%s] fake native cancel waiters=%d" % [
+			label, service.sdk.pending_cancel_waiters()])
 	test._check(clock.armed_alarm_count() == 0,
 		"[%s] final alarm count=%d" % [
 			label, clock.armed_alarm_count()])
@@ -629,8 +1055,7 @@ func _s4_native_cleanup_ownership(test: Node) -> void:
 	race_ticket.match_id = "late-match"
 	race_ticket.arranged_lobby_connection_string = "late-arrangement"
 	race_ticket.emit_status(MatchmakingService.STATUS_MATCHED)
-	race_ticket.block_cancel = false
-	race_ticket.cancel_released.emit()
+	race_ticket.invalidate_runtime()
 	await _frames(test, 2)
 	test._check(race.outcome == MatchmakingService.Outcome.TIMEOUT
 		and race.match_id == "late-match" and not race.cleanup_pending
@@ -666,6 +1091,578 @@ func _s4_native_cleanup_ownership(test: Node) -> void:
 	test._check(matched.outcome == MatchmakingService.Outcome.MATCHED
 		and matched_ticket.cancel_calls == 0 and not matched.cleanup_pending,
 		"retiring a natively matched ticket never issues cancellation")
+
+
+func _s4_matched_cancel_contracts(test: Node) -> void:
+	print("CASE: Matched truth preserves cancel ownership and neutral observer attribution")
+	var user := Doubles.User.new("matched-cancel-contract")
+
+	var legacy := Doubles.Matchmaking.new()
+	var legacy_clock := Doubles.Clock.new()
+	legacy.configure_clock(legacy_clock)
+	var legacy_cleanup_events: Array[int] = []
+	legacy.cleanup_state_changed.connect(func() -> void:
+		legacy_cleanup_events.append(1))
+	var legacy_ticket := Doubles.Ticket.new()
+	legacy_ticket.block_cancel = true
+	legacy.sdk.queued_create_results.append(Doubles.Results.make(true, legacy_ticket))
+	var legacy_attempt := legacy.begin_create(
+		_spec(user, [user.entity_key], 80))
+	var legacy_terminal: Array = []
+	legacy_attempt.native_terminal_changed.connect(
+		func(_attempt: Variant) -> void: legacy_terminal.append(true))
+	await _frames(test, 2)
+	legacy.request_cancel(legacy_attempt)
+	await _frames(test, 1)
+	legacy.retire(legacy_attempt)
+	test._check(legacy_attempt.retired
+		and legacy_attempt.outcome == MatchmakingService.Outcome.SUPERSEDED,
+		"legacy abandoned attempt settles locally before native Matched")
+	legacy_ticket.match_id = "legacy-match"
+	legacy_ticket.arranged_lobby_connection_string = "legacy-arrangement"
+	var terminal_events_before := legacy_cleanup_events.size()
+	legacy_ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+	test._check(legacy_cleanup_events.size() > terminal_events_before,
+		"native terminal cleanup notification is emitted synchronously")
+	await _frames(test, 2)
+	test._check(legacy_attempt.outcome == MatchmakingService.Outcome.SUPERSEDED,
+		"legacy native Matched cannot rewrite retired caller outcome=%d" % \
+			legacy_attempt.outcome)
+	test._check(legacy_terminal.size() == 1,
+		"legacy native terminal notifications=%d" % legacy_terminal.size())
+	test._check(legacy_attempt.match_id == "legacy-match"
+		and legacy_attempt.arrangement == "legacy-arrangement",
+		"legacy retired attempt still exposes native Matched data")
+	test._check(legacy_attempt.cancel_in_flight
+		and legacy_attempt.cleanup_pending
+		and legacy.has_pending_cleanup(),
+		"legacy Matched keeps the unresolved native cancel owned")
+	test._check(legacy.has_orphaned_matched_cancel(),
+		"legacy Matched exposes process-lifetime orphaned cancel state")
+	test._check(legacy.has_pending_cleanup(),
+		"an orphaned Matched cancel always keeps the process cleanup fence raised")
+	test._check(not legacy_cleanup_events.is_empty(),
+		"legacy orphan state emits service-level cleanup notification")
+	legacy.fake_account_current = false
+	test._check(legacy.has_orphaned_matched_cancel(),
+		"account staleness does not erase process-lifetime cancel ownership")
+	test._check(legacy_ticket.cancel_calls == 1,
+		"legacy Matched issues no second cancel calls=%d" % \
+			legacy_ticket.cancel_calls)
+	test._check(legacy.sdk.pending_cancel_waiters() == 1,
+		"legacy pinned contract retains one native cancel waiter")
+	var invalidation_events_before := legacy_cleanup_events.size()
+	legacy.multiplayer_invalidated(1)
+	test._check(legacy_cleanup_events.size() > invalidation_events_before,
+		"Multiplayer invalidation emits cleanup state synchronously")
+	await _frames(test, 3)
+	test._check(not legacy_attempt.cancel_in_flight
+		and not legacy_attempt.cleanup_pending
+		and not legacy.has_pending_cleanup(),
+		"confirmed runtime invalidation discharges the legacy cancel waiter")
+	test._check(not legacy.has_orphaned_matched_cancel(),
+		"confirmed invalidation clears orphaned cancel state")
+	test._check(legacy_terminal.size() == 1,
+		"legacy invalidation emits no duplicate terminal notification")
+	test._check(legacy.sdk.pending_cancel_waiters() == 0,
+		"runtime invalidation releases every legacy cancel waiter")
+	test._check(legacy.fake_warnings.size() == 1
+		and legacy.fake_warnings[0].contains(
+			"reason=cancel_released_by_reset")
+		and legacy.fake_warnings[0].contains("native_code=cancelled")
+		and legacy.fake_warnings[0].contains("hresult=0x80004004"),
+		"legacy reset release has distinct provenance=%s" % \
+			[legacy.fake_warnings])
+	await _drain_clock(test, legacy_clock, "S4 legacy matched cancel")
+
+	var failed := Doubles.Matchmaking.new()
+	var failed_ticket := Doubles.Ticket.new()
+	failed_ticket.block_cancel = true
+	failed.sdk.queued_create_results.append(Doubles.Results.make(
+		true, failed_ticket))
+	var failed_attempt := failed.begin_create(
+		_spec(user, [user.entity_key], 81))
+	await _frames(test, 2)
+	failed.request_cancel(failed_attempt)
+	await _frames(test, 1)
+	var failed_completion := Doubles.Results.make(
+		false,
+		failed_ticket,
+		"match_ticket_completed_failed",
+		"Injected current-package failed completion.",
+		-2147467259)
+	failed_ticket.emit_status(
+		MatchmakingService.STATUS_FAILED,
+		failed_completion)
+	failed_ticket.release_cancel(failed_completion)
+	await _frames(test, 3)
+	test._check(failed_attempt.outcome == MatchmakingService.Outcome.FAILED
+		and not failed_attempt.cancel_in_flight
+		and not failed_attempt.cleanup_pending,
+		"a FAILED completion remains a ticket failure and reaches quiescence")
+	var failed_lost_race := false
+	for warning: String in failed.fake_warnings:
+		failed_lost_race = failed_lost_race or warning.contains("cancel_lost_race")
+	test._check(not failed_lost_race,
+		"a FAILED completion is never labelled as a lost cancel race")
+
+	for ordering: String in ["event_first", "completion_first"]:
+		var observer := Doubles.Matchmaking.new()
+		var observer_clock := Doubles.Clock.new()
+		observer.configure_clock(observer_clock)
+		var observer_ticket := Doubles.Ticket.new()
+		observer_ticket.block_cancel = true
+		observer.sdk.queued_create_results.append(Doubles.Results.make(
+			true, observer_ticket))
+		var observer_attempt := observer.begin_create(
+			_spec(user, [user.entity_key], 81))
+		var observer_terminal: Array = []
+		observer_attempt.native_terminal_changed.connect(
+			func(_attempt: Variant) -> void: observer_terminal.append(true))
+		await _frames(test, 2)
+		observer.request_cancel(observer_attempt)
+		await _frames(test, 1)
+		observer_ticket.match_id = "observer-" + ordering
+		observer_ticket.arranged_lobby_connection_string = \
+			"observer-arrangement-" + ordering
+		if ordering == "event_first":
+			observer_ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+		else:
+			observer_ticket.status = MatchmakingService.STATUS_MATCHED
+		observer_ticket.release_cancel(Doubles.Results.make(
+			false,
+			observer_ticket,
+			"observer_completion_failed",
+			"Injected observer completion.",
+			-2147024809))
+		await _frames(test, 3)
+		test._check(observer_attempt.outcome == MatchmakingService.Outcome.MATCHED,
+			"[%s] observer completion preserves Matched outcome=%d" % [
+				ordering, observer_attempt.outcome])
+		test._check(observer_terminal.size() == 1,
+			"[%s] Matched terminal notifications=%d" % [
+				ordering, observer_terminal.size()])
+		test._check(observer_attempt.match_id == "observer-" + ordering
+			and observer_attempt.arrangement == "observer-arrangement-" + ordering,
+			"[%s] Matched observation preserves terminal data" % ordering)
+		test._check(observer_ticket.cancel_calls == 1,
+			"[%s] native cancel observer calls=%d" % [
+				ordering, observer_ticket.cancel_calls])
+		test._check(not observer_attempt.cancel_in_flight
+			and not observer_attempt.cleanup_pending
+			and not observer.has_pending_cleanup(),
+			"[%s] explicit observer completion reaches quiescence" % ordering)
+		test._check(observer.fake_warnings.size() == 1
+			and observer.fake_warnings[0].contains(
+				"reason=cancel_observer_aborted")
+			and observer.fake_warnings[0].contains(
+				"native_code=unavailable"),
+			"[%s] unrecognized observer completion stays neutral=%s" % [
+				ordering, observer.fake_warnings])
+		await _drain_clock(
+			test, observer_clock, "S4 Matched observer " + ordering)
+
+
+func _s4_failure_cause_availability(test: Node) -> void:
+	print("CASE: failure cause availability follows pinned result provenance")
+	for case_data: Dictionary in [
+		{
+			"label": "absent result",
+			"result": null,
+			"stage": &"create",
+			"available": false,
+		},
+		{
+			"label": "generic create wrapper",
+			"result": Doubles.Results.make(
+				false, null, "match_ticket_create_failed", "", -2147467259),
+			"stage": &"create",
+			"available": false,
+		},
+		{
+			"label": "generic terminal wrapper",
+			"result": Doubles.Results.make(
+				false, null, "match_ticket_failed", "", -2147467259),
+			"stage": &"terminal",
+			"available": false,
+		},
+		{
+			"label": "generic guest join wrapper",
+			"result": Doubles.Results.make(
+				false, null, "match_ticket_join_failed", "", -2147467259),
+			"stage": &"join",
+			"available": false,
+		},
+		{
+			"label": "detailed guest join HRESULT",
+			"result": Doubles.Results.make(
+				false, null, "match_ticket_join_failed", "", -2147024809),
+			"stage": &"join",
+			"available": true,
+		},
+		{
+			"label": "supported local validation",
+			"result": Doubles.Results.make(
+				false, null, "invalid_user", "", -2147024809),
+			"stage": &"create",
+			"available": true,
+		},
+	]:
+		var case_result: Variant = case_data.get("result")
+		var case_stage := StringName(case_data.get("stage", &""))
+		var expected_available := bool(case_data.get("available", false))
+		var outcome := MatchmakingService.failure_outcome(
+			case_result,
+			case_stage,
+			false,
+			1)
+		test._check(
+			bool(outcome.get("cause_available", false))
+				== expected_available,
+			"[%s] cause_available=%s expected=%s" % [
+				case_data.label,
+				outcome.get("cause_available", false),
+				expected_available,
+			])
+
+
+func _s4_safe_structured_failure_logging(test: Node) -> void:
+	print("CASE: matchmaking and Party failures log one safe structured record")
+	var user := Doubles.User.new("logging-user")
+	var secret := "SECRET_CONNECTION|entity=player-token"
+
+	var create := Doubles.Matchmaking.new()
+	create.sdk.queued_create_results.append(Doubles.Results.make(
+		false,
+		null,
+		"match_ticket_create_failed",
+		secret,
+		-2147467259))
+	create.begin_create(_spec(user, [user.entity_key], 90))
+	await _frames(test, 2)
+	_check_safe_warning(test, create.fake_warnings, [
+		"stage=create",
+		"native_code=match_ticket_create_failed",
+		"hresult=0x80004005",
+		"result_present=true",
+		"detail=unavailable",
+	], secret, "create")
+
+	var joining := Doubles.Matchmaking.new()
+	joining.sdk.queued_join_results.append(Doubles.Results.make(
+		false,
+		null,
+		"match_ticket_join_failed",
+		secret,
+		-2147467259))
+	var joining_attempt := joining.begin_join(_join_spec(
+		user, [user.entity_key], 91, "logging-ticket"))
+	await _frames(test, 2)
+	test._check(joining_attempt.reason_code == &"ticket_join_failed",
+		"generic guest join wrapper keeps the generic player classification")
+	_check_safe_warning(test, joining.fake_warnings, [
+		"stage=join",
+		"native_code=match_ticket_join_failed",
+		"hresult=0x80004005",
+		"detail=unavailable",
+	], secret, "join")
+
+	var detailed_join := Doubles.Matchmaking.new()
+	detailed_join.sdk.queued_join_results.append(Doubles.Results.make(
+		false,
+		null,
+		"match_ticket_join_failed",
+		secret,
+		-2147024809))
+	var detailed_join_attempt := detailed_join.begin_join(_join_spec(
+		user, [user.entity_key], 911, "logging-detailed-ticket"))
+	await _frames(test, 2)
+	test._check(detailed_join_attempt.reason_code == &"ticket_join_failed",
+		"detailed guest join failure keeps the same player classification")
+	_check_safe_warning(test, detailed_join.fake_warnings, [
+		"stage=join",
+		"native_code=match_ticket_join_failed",
+		"hresult=0x80070057",
+		"detail=available",
+	], secret, "join-detailed")
+
+	var terminal := Doubles.Matchmaking.new()
+	var terminal_ticket := Doubles.Ticket.new()
+	terminal_ticket.properties = {"credential": secret}
+	terminal.sdk.queued_create_results.append(
+		Doubles.Results.make(true, terminal_ticket))
+	terminal.begin_create(_spec(user, [user.entity_key], 92))
+	await _frames(test, 2)
+	terminal_ticket.emit_status(
+		MatchmakingService.STATUS_FAILED,
+		Doubles.Results.make(
+			false, null, "match_ticket_failed", secret, -2147467259))
+	terminal_ticket.emit_status(
+		MatchmakingService.STATUS_FAILED,
+		Doubles.Results.make(
+			false, null, "match_ticket_failed", secret, -2147467259))
+	_check_safe_warning(test, terminal.fake_warnings, [
+		"stage=terminal",
+		"native_code=match_ticket_failed",
+		"hresult=0x80004005",
+		"status=6",
+		"detail=unavailable",
+	], secret, "terminal")
+
+	var timing := Doubles.Matchmaking.new()
+	var timing_clock := Doubles.Clock.new()
+	timing.configure_clock(timing_clock)
+	var timing_ticket := Doubles.Ticket.new()
+	timing.sdk.queued_create_results.append(Doubles.Results.make(
+		true, timing_ticket))
+	var timing_spec := _spec(user, [user.entity_key], 93)
+	timing_spec.deadline_msec = 100
+	timing.begin_create(timing_spec)
+	await _frames(test, 2)
+	timing_clock.advance(0.1)
+	await _frames(test, 2)
+	_check_safe_warning(test, timing.fake_warnings, [
+		"stage=timeout",
+		"reason=search_timeout",
+		"hresult=0x00000000",
+		"detail=unavailable",
+	], secret, "timeout")
+	await _drain_clock(test, timing_clock, "S4 logging timeout")
+
+	var cancel := Doubles.Matchmaking.new()
+	var cancel_ticket := Doubles.Ticket.new()
+	cancel_ticket.cancel_ok = false
+	cancel.sdk.queued_create_results.append(Doubles.Results.make(
+		true, cancel_ticket))
+	var cancel_attempt := cancel.begin_create(
+		_spec(user, [user.entity_key], 94))
+	await _frames(test, 2)
+	cancel.request_cancel(cancel_attempt)
+	await _frames(test, 2)
+	_check_safe_warning(test, cancel.fake_warnings, [
+		"stage=cancel",
+		"reason=cancel_unconfirmed",
+		"native_code=match_ticket_cancel_start_failed",
+		"hresult=0x80004005",
+		"detail=available",
+	], secret, "cancel")
+	cancel_ticket.emit_status(MatchmakingService.STATUS_CANCELLED)
+
+	var party := Doubles.Party.new(ChatService.new())
+	party.configure_clock(party.fake_clock)
+	party.pf.multiplayer.next_arranged_result = Doubles.Results.make(
+		false,
+		null,
+		"arranged_lobby_join_failed",
+		secret,
+		-2147467259)
+	await party.join_arranged(
+		Doubles.User.new("logging-party"),
+		secret,
+		{},
+		4,
+		1,
+		95,
+		party.fake_clock.now_msec() + 1000)
+	_check_safe_warning(test, party.fake_warnings, [
+		"stage=join_arranged",
+		"native_code=arranged_lobby_join_failed",
+		"hresult=0x80004005",
+		"detail=available",
+	], secret, "scoped")
+	await _drain_clock(test, party.fake_clock, "S4 logging scoped")
+
+	var numeric_party := Doubles.Party.new(ChatService.new())
+	numeric_party.configure_clock(numeric_party.fake_clock)
+	numeric_party.pf.multiplayer.next_arranged_result = Doubles.Results.make(
+		false,
+		{"party_error": 1234, "state_change_result": 5678},
+		"unknown_sensitive_identifier",
+		secret,
+		-2147467259)
+	await numeric_party.join_arranged(
+		Doubles.User.new("logging-party-numeric"),
+		secret,
+		{},
+		4,
+		1,
+		96,
+		numeric_party.fake_clock.now_msec() + 1000)
+	_check_safe_warning(test, numeric_party.fake_warnings, [
+		"native_code=unavailable",
+		"party_error=1234",
+		"state_change_result=5678",
+		"detail=available",
+	], secret, "scoped-numeric")
+	await _drain_clock(test, numeric_party.fake_clock, "S4 logging numeric")
+
+	var unknown_party := Doubles.Party.new(ChatService.new())
+	unknown_party.configure_clock(unknown_party.fake_clock)
+	unknown_party.pf.multiplayer.next_arranged_result = Doubles.Results.make(
+		false,
+		null,
+		"unknown_sensitive_identifier",
+		secret,
+		-2147467259)
+	await unknown_party.join_arranged(
+		Doubles.User.new("logging-party-unknown"),
+		secret,
+		{},
+		4,
+		1,
+		97,
+		unknown_party.fake_clock.now_msec() + 1000)
+	_check_safe_warning(test, unknown_party.fake_warnings, [
+		"native_code=unavailable",
+		"party_error=unavailable",
+		"state_change_result=unavailable",
+		"detail=unavailable",
+	], secret, "scoped-unknown")
+	await _drain_clock(test, unknown_party.fake_clock, "S4 logging unknown")
+
+	var matcher := Doubles.Matchmaking.new()
+	for real_code: String in SOURCE_MATCHMAKING_NATIVE_CODES:
+		test._check(matcher._safe_native_code(real_code) == real_code,
+			"matchmaking native code survives allowlist: %s" % real_code)
+	for production_code: String in MatchmakingService.SAFE_NATIVE_CODES:
+		test._check(SOURCE_MATCHMAKING_NATIVE_CODES.has(production_code),
+			"matchmaking allowlist code has a pinned-source anchor: %s" % \
+				production_code)
+	test._check(MatchmakingService.SAFE_NATIVE_CODES.size()
+			== SOURCE_MATCHMAKING_NATIVE_CODES.size(),
+		"matchmaking allowlist and pinned-source inventory have equal size")
+	test._check(matcher._safe_native_code("credential_like_identifier")
+			== "unavailable",
+		"unknown matchmaking identifier is omitted")
+
+	var party_codes := Doubles.Party.new(ChatService.new())
+	for real_code: String in SOURCE_PARTY_NATIVE_CODES:
+		var safe_result := Doubles.Results.make(
+			false, null, real_code, "", -2147467259)
+		test._check(party_codes._safe_result_code(safe_result) == real_code,
+			"Party native code survives allowlist: %s" % real_code)
+	for production_code: String in PartyService.SAFE_NATIVE_CODES:
+		test._check(SOURCE_PARTY_NATIVE_CODES.has(production_code),
+			"Party allowlist code has a pinned-source anchor: %s" % \
+				production_code)
+	test._check(PartyService.SAFE_NATIVE_CODES.size()
+			== SOURCE_PARTY_NATIVE_CODES.size(),
+		"Party allowlist and pinned-source inventory have equal size")
+	test._check(party_codes._safe_result_code(Doubles.Results.make(
+		false, null, "credential_like_identifier", "", -2147467259))
+			== "unavailable",
+		"unknown Party identifier is omitted")
+
+
+func _s4_source_derived_native_code_paths(test: Node) -> void:
+	print("CASE: source-derived native codes survive representative service stages")
+	var user := Doubles.User.new("native-code-paths")
+	var secret := "SECRET_NATIVE_CODE_PATH"
+
+	var ticket := Doubles.Matchmaking.new()
+	ticket.sdk.queued_create_results.append(Doubles.Results.make(
+		false, null, "invalid_user", secret, -2147024809))
+	ticket.begin_create(_spec(user, [user.entity_key], 912))
+	await _frames(test, 2)
+	_check_safe_warning(test, ticket.fake_warnings, [
+		"stage=create",
+		"native_code=invalid_user",
+		"detail=available",
+	], secret, "ticket-validation")
+
+	var party_initialize := Doubles.Party.new(ChatService.new())
+	party_initialize.pf.party.initialized = false
+	party_initialize.pf.party.next_initialize_result = Doubles.Results.make(
+		false, null, "party_already_initialized", secret, -2147467259)
+	await party_initialize.host(user, 4, "deathmatch")
+	_check_safe_warning(test, party_initialize.fake_warnings, [
+		"stage=legacy_party_initialize",
+		"native_code=party_already_initialized",
+		"detail=available",
+	], secret, "Party-initialize")
+
+	for initialize_code: String in [
+		"already_initialized",
+		"multiplayer_queue_create_failed",
+		"multiplayer_initialize_failed",
+	]:
+		var multiplayer_initialize := Doubles.Party.new(ChatService.new())
+		multiplayer_initialize.pf.multiplayer.initialized = false
+		multiplayer_initialize.pf.multiplayer.next_initialize_result = \
+			Doubles.Results.make(
+				false, null, initialize_code, secret, -2147467259)
+		await multiplayer_initialize.host(user, 4, "deathmatch")
+		_check_safe_warning(test, multiplayer_initialize.fake_warnings, [
+			"stage=legacy_lobby_initialize",
+			"native_code=" + initialize_code,
+			"detail=available",
+		], secret, "Multiplayer-initialize-" + initialize_code)
+
+	var lobby_create := Doubles.Party.new(ChatService.new())
+	lobby_create.pf.multiplayer.next_create_result = Doubles.Results.make(
+		false, null, "invalid_properties", secret, -2147024809)
+	await lobby_create.host(user, 4, "deathmatch")
+	await _frames(test, 2)
+	_check_safe_warning(test, lobby_create.fake_warnings, [
+		"stage=legacy_lobby_create",
+		"native_code=invalid_properties",
+		"detail=available",
+	], secret, "Lobby-create-validation")
+	await lobby_create.leave()
+
+	var lookup := Doubles.Party.new(ChatService.new())
+	lookup.pf.multiplayer.next_find_result = Doubles.Results.make(
+		false, null, "invalid_search", secret, -2147024809)
+	await lookup.join(user, "ABCDE")
+	_check_safe_warning(test, lookup.fake_warnings, [
+		"stage=lobby_search",
+		"native_code=invalid_search",
+		"detail=available",
+	], secret, "Lobby-search-validation")
+
+	var lobby_join := Doubles.Party.new(ChatService.new())
+	lobby_join.pf.multiplayer.next_join_result = Doubles.Results.make(
+		false, null, "lobby_join_failed", secret, -1994169818)
+	await lobby_join.join_by_connection_string(
+		user, "native-code-connection")
+	_check_safe_warning(test, lobby_join.fake_warnings, [
+		"stage=lobby_join",
+		"native_code=lobby_join_failed",
+		"detail=available",
+	], secret, "Lobby-join")
+
+	for party_code: String in [
+		"party_invalid_options",
+		"party_peer_not_connected",
+		"party_chat_control_create_failed",
+	]:
+		var network := Doubles.Party.new(ChatService.new())
+		network.pf.party.next_create_result = Doubles.Results.make(
+			false, null, party_code, secret, -2147024809)
+		await network.host(user, 4, "deathmatch")
+		_check_safe_warning(test, network.fake_warnings, [
+			"stage=legacy_network_create",
+			"native_code=" + party_code,
+			"detail=available",
+		], secret, "Party-network-" + party_code)
+
+
+func _check_safe_warning(
+	test: Node,
+	warnings: Array[String],
+	required: Array[String],
+	forbidden: String,
+	label: String
+) -> void:
+	test._check(warnings.size() == 1,
+		"[%s] warning count=%d records=%s" % [
+			label, warnings.size(), warnings])
+	var warning := warnings[0] if warnings.size() == 1 else ""
+	for expected: String in required:
+		test._check(warning.contains(expected),
+			"[%s] warning includes %s: %s" % [label, expected, warning])
+	test._check(not warning.contains(forbidden),
+		"[%s] warning redacts seeded credential text" % label)
 
 
 func _s4_observe_terminal_before_cancel(test: Node) -> void:
@@ -901,13 +1898,13 @@ func _s5_hosted_production_paths(test: Node) -> void:
 
 	var losses: Array = []
 	service.network_lost.connect(func(_reason: String, context: Variant) -> void:
-		losses.append(context))
+		losses.append(context == null))
 	var destroyed := Doubles.Change.new()
 	destroyed.kind = PartyService.NETWORK_CHANGE_DESTROYED
 	destroyed.reason = "Injected hosted loss."
 	destroyed.network = hosted_network
 	hosted_network.state_changed.emit(destroyed)
-	test._check(losses == [null], "legacy hosted loss reports a null scoped context")
+	test._check(losses == [true], "legacy hosted loss reports a null scoped context")
 	await service.leave()
 	test._check(hosted_lobby.leaves == 1, "hosted leave releases the named legacy lobby")
 
@@ -1104,7 +2101,7 @@ func _s5_global_leave_waits_for_pending_prepare(test: Node) -> void:
 		"global leave results=%d" % global_results.size())
 	test._check(replacement_results.size() == 1
 		and not bool((replacement_results[0] as Dictionary).get("ok", false)),
-		"cleanup-time replacement is refused once, results=%s" % replacement_results)
+		"cleanup-time replacement is refused once, results=%s" % [replacement_results])
 	test._check(returned_network.leaves == 1,
 		"stale returned network leaves=%d" % returned_network.leaves)
 	test._check(service._contexts.is_empty(),
@@ -1189,7 +2186,7 @@ func _s5_recovery_epoch_isolates_late_scoped_work(test: Node) -> void:
 	test._check(service._contexts.size() == 1
 		and service._contexts.has(replacement.context.context_id)
 		and not service._contexts.has(old_context.context_id),
-		"old context stays retired; registry keys=%s" % service._contexts.keys())
+		"old context stays retired; registry keys=%s" % [service._contexts.keys()])
 
 	old_lobby.block_leave = false
 	old_lobby.leave_released.emit()
@@ -1206,6 +2203,488 @@ func _s5_recovery_epoch_isolates_late_scoped_work(test: Node) -> void:
 		and service._contexts.is_empty() and not service.has_owned_work(),
 		"next leave needs no repeated recovery and reaches quiescence")
 	await _drain_clock(test, service.fake_clock, "S5 recovery epoch")
+
+
+func _s5_recovery_settles_scoped_leave_waiters(test: Node) -> void:
+	print("CASE: confirmed recovery settles first and coalesced scoped-leave callers")
+	var service := Doubles.Party.new(ChatService.new())
+	service.configure_clock(service.fake_clock)
+	var user := Doubles.User.new("leave-recovery")
+	var arranged: PartyService.PartyResult = await service.join_arranged(
+		user, "leave-recovery-arranged", {}, 4, 1, 78, 1000)
+	var prepared: PartyService.PartyResult = await service.prepare_transport(
+		arranged.context, user, 1000)
+	var lobby: Doubles.Lobby = arranged.context.lobby
+	var network: Doubles.Network = arranged.context.network
+	lobby.block_leave = true
+	network.block_leave = true
+	var lobby_first: Array = []
+	var lobby_second: Array = []
+	var transport_first: Array = []
+	var transport_second: Array = []
+	var global_results: Array = []
+	_capture_scoped_lobby_leave(service, arranged.context, lobby_first)
+	_capture_scoped_transport_leave(service, arranged.context, transport_first)
+	await _frames(test, 1)
+	_capture_scoped_lobby_leave(service, arranged.context, lobby_second)
+	_capture_scoped_transport_leave(service, arranged.context, transport_second)
+	test._check(service.is_cleanup_pending()
+		and service.cleanup_readiness().state == PartyService.CLEANUP_CLEAR,
+		"ordinary scoped leaves use their existing wait path, not cleanup recovery")
+	_capture_global_leave(service, global_results)
+	await _frames(test, 2)
+	test._check(lobby.leaves == 1 and network.leaves == 1,
+		"first/coalesced callers dispatch one Lobby=%d transport=%d leave" % [
+			lobby.leaves, network.leaves])
+	test._check(lobby_first.is_empty() and lobby_second.is_empty()
+		and transport_first.is_empty() and transport_second.is_empty()
+		and global_results.is_empty(),
+		"all public waiters remain pending before recovery")
+	service.fake_clock.advance(NRConst.MATCH_CLEANUP_SECONDS)
+	await _frames(test, 6)
+	test._check(global_results.size() == 1,
+		"global recovery completes without raw leave signals results=%d" % \
+			global_results.size())
+	for entry: Dictionary in [
+		{"label": "lobby first", "results": lobby_first},
+		{"label": "lobby coalesced", "results": lobby_second},
+		{"label": "transport first", "results": transport_first},
+		{"label": "transport coalesced", "results": transport_second},
+	]:
+		var results: Array = entry.results
+		var result: PartyService.PartyResult = results[0] \
+			if results.size() == 1 else null
+		test._check(results.size() == 1,
+			"%s recovery results=%d" % [entry.label, results.size()])
+		test._check(result != null and result.ok(),
+			"%s recovery outcome=%s" % [
+				entry.label,
+				result.outcome if result != null else "missing",
+			])
+	test._check(service.context_is_quiescent(arranged.context)
+		and not service.has_owned_work(),
+		"confirmed recovery retires the captured context and lease")
+	lobby.block_leave = false
+	network.block_leave = false
+	lobby.leave_released.emit()
+	network.leave_released.emit()
+	await _frames(test, 3)
+	test._check(lobby_first.size() == 1 and lobby_second.size() == 1
+		and transport_first.size() == 1 and transport_second.size() == 1,
+		"late raw signals cannot re-settle public callers")
+	test._check(lobby.leaves == 1 and network.leaves == 1,
+		"late raw signals issue no extra leave calls")
+	await _drain_clock(test, service.fake_clock, "S5 recovered leave waiters")
+
+	var descriptor_service := Doubles.Party.new(ChatService.new())
+	descriptor_service.configure_clock(descriptor_service.fake_clock)
+	var descriptor_arranged: PartyService.PartyResult = await descriptor_service.join_arranged(
+			Doubles.User.new("leave-recovery-descriptor"),
+			"leave-recovery-descriptor-arranged",
+			{},
+			4,
+			1,
+			781,
+			1000)
+	var descriptor_lobby: Doubles.Lobby = descriptor_arranged.context.lobby
+	descriptor_lobby.properties[PartyService.DESCRIPTOR_KEY] = "held-descriptor"
+	descriptor_lobby.block_properties = true
+	var descriptor_results: Array = []
+	var descriptor_global: Array = []
+	_capture_scoped_lobby_leave(
+		descriptor_service,
+		descriptor_arranged.context,
+		descriptor_results)
+	_capture_global_leave(descriptor_service, descriptor_global)
+	descriptor_service.fake_clock.advance(NRConst.MATCH_CLEANUP_SECONDS)
+	await _frames(test, 6)
+	test._check(descriptor_results.size() == 1
+		and (descriptor_results[0] as PartyService.PartyResult).ok()
+		and not (descriptor_results[0] as PartyService.PartyResult).cleanup_pending
+		and descriptor_service.context_is_quiescent(descriptor_arranged.context),
+		"recovery settles a first caller blocked in descriptor clearing")
+	test._check(descriptor_lobby.leaves == 0,
+		"blocked descriptor continuation has not dispatched native leave")
+	descriptor_lobby.block_properties = false
+	descriptor_lobby.properties_released.emit()
+	await _frames(test, 3)
+	test._check(descriptor_lobby.leaves == 0,
+		"late descriptor clear cannot start old-lobby leave after recovery")
+	test._check(descriptor_global.size() == 1,
+		"descriptor-blocked global recovery completes")
+	await _drain_clock(
+		test, descriptor_service.fake_clock, "S5 descriptor recovery")
+
+	var failed := Doubles.Party.new(ChatService.new())
+	failed.configure_clock(failed.fake_clock)
+	var failed_arranged: PartyService.PartyResult = await failed.join_arranged(
+		Doubles.User.new("leave-recovery-failed"),
+		"leave-recovery-failed-arranged",
+		{},
+		4,
+		1,
+		79,
+		1000)
+	var failed_lobby: Doubles.Lobby = failed_arranged.context.lobby
+	failed_lobby.block_leave = true
+	failed.pf.multiplayer.next_shutdown_result = Doubles.Results.make(
+		false, null, "shutdown_failed", "Injected shutdown failure.")
+	var failed_first: Array = []
+	var failed_second: Array = []
+	var failed_global: Array = []
+	_capture_scoped_lobby_leave(failed, failed_arranged.context, failed_first)
+	await _frames(test, 1)
+	_capture_scoped_lobby_leave(failed, failed_arranged.context, failed_second)
+	_capture_global_leave(failed, failed_global)
+	failed.fake_clock.advance(NRConst.MATCH_CLEANUP_SECONDS)
+	await _frames(test, 6)
+	test._check(failed_first.size() == 1 and failed_second.size() == 1,
+		"failed recovery settles both public Lobby waiters")
+	var failed_result: PartyService.PartyResult = failed_first[0] \
+		if failed_first.size() == 1 else null
+	test._check(failed_result != null and not failed_result.ok()
+		and failed_result.reason_code == &"multiplayer_recovery_failed"
+		and failed_result.cleanup_pending
+		and failed_arranged.context.cleanup_pending
+		and not failed.context_is_quiescent(failed_arranged.context)
+		and failed.has_owned_work(),
+		"failed recovery cannot masquerade as successful release")
+	test._check(failed.recovery_error == PartyService.RECOVERY_FAILED,
+		"failed recovery keeps restart-required fence")
+	failed_lobby.block_leave = false
+	failed_lobby.leave_released.emit()
+	await _frames(test, 3)
+	test._check(failed_first.size() == 1 and failed_second.size() == 1,
+		"late failed-recovery native signal cannot re-settle callers")
+	await _drain_clock(test, failed.fake_clock, "S5 failed leave recovery")
+
+
+func _s5_native_leave_failure_cleanup_debt(test: Node) -> void:
+	print("CASE: failed native scoped leaves start prompt recovery without losing debt")
+	for resource: String in ["lobby", "transport"]:
+		for recovery: String in ["success", "failure"]:
+			await _native_leave_failure_cleanup_debt_case(
+				test, resource, recovery)
+
+
+func _native_leave_failure_cleanup_debt_case(
+	test: Node,
+	resource: String,
+	recovery: String
+) -> void:
+	var service := Doubles.Party.new(ChatService.new())
+	service.configure_clock(service.fake_clock)
+	var user := Doubles.User.new("leave-debt-" + resource + "-" + recovery)
+	var arranged: PartyService.PartyResult = await service.join_arranged(
+		user,
+		"leave-debt-arranged-" + resource + "-" + recovery,
+		{},
+		4,
+		1,
+		790,
+		service.fake_clock.now_msec() + 1000)
+	var prepared: PartyService.PartyResult = await service.prepare_transport(
+		arranged.context,
+		user,
+		service.fake_clock.now_msec() + 1000)
+	test._check(arranged.ok() and prepared.ok(),
+		"[%s/%s] leave-debt fixture creates both scoped resources" % [
+			resource, recovery])
+	if not arranged.ok() or not prepared.ok():
+		await service.leave()
+		return
+
+	var context: PartyService.LobbyContext = arranged.context
+	var lobby: Doubles.Lobby = context.lobby
+	var network: Doubles.Network = context.network
+	var cleanup_events: Array[bool] = []
+	service.cleanup_state_changed.connect(func() -> void:
+		cleanup_events.append(true))
+	var native_failure := Doubles.Results.make(
+		false,
+		null,
+		"lobby_leave_start_failed" if resource == "lobby" \
+			else "party_resource_not_ready",
+		"Injected native leave failure.",
+		-2147467259)
+	var failed_result: PartyService.PartyResult = null
+	if resource == "lobby":
+		lobby.next_leave_result = native_failure
+		failed_result = await service.leave_lobby(context)
+	else:
+		network.next_leave_result = native_failure
+		failed_result = await service.leave_transport(context)
+	test._check(failed_result != null
+		and failed_result.outcome == PartyService.PartyResult.Outcome.SERVICE_ERROR
+		and failed_result.cleanup_pending
+		and context.cleanup_pending
+		and service.has_owned_work()
+		and service.is_cleanup_pending()
+		and not service.is_cleanup_running()
+		and service.has_idle_cleanup_debt()
+		and not service.context_is_quiescent(context)
+		and service._contexts.get(context.context_id) == context
+		and (
+			(context.lobby == null and resource == "lobby")
+			or (context.network == null and resource == "transport")
+		),
+		"[%s/%s] failed native leave returns SERVICE_ERROR with retained debt" % [
+			resource, recovery])
+	var pending_readiness := service.cleanup_readiness()
+	test._check(pending_readiness.state == PartyService.CLEANUP_PENDING
+		and not String(pending_readiness.reason).is_empty()
+		and cleanup_events.size() >= 2,
+		"[%s/%s] Party readiness reports pending before caller completion" % [
+			resource, recovery])
+
+	var repeated: PartyService.PartyResult
+	var sibling: PartyService.PartyResult
+	if resource == "lobby":
+		repeated = await service.leave_lobby(context)
+		sibling = await service.leave_transport(context)
+	else:
+		repeated = await service.leave_transport(context)
+		sibling = await service.leave_lobby(context)
+	test._check(repeated != null
+		and repeated.outcome == PartyService.PartyResult.Outcome.SERVICE_ERROR
+		and repeated.cleanup_pending
+		and sibling != null and sibling.ok() and sibling.cleanup_pending
+		and context.cleanup_pending
+		and not service.context_is_quiescent(context),
+		"[%s/%s] repeat and sibling leave cannot erase the failed resource debt" % [
+			resource, recovery])
+	test._check((lobby.leaves if resource == "lobby" else network.leaves) == 1,
+		"[%s/%s] failed native resource is left exactly once" % [
+			resource, recovery])
+	var idle_drain: Array = []
+	_capture_party_drain(
+		service,
+		service.fake_clock.now_msec() + 1000,
+		idle_drain)
+	await _frames(test, 1)
+	test._check(idle_drain == [true],
+		"[%s/%s] drain does not spend its budget on inert failed-leave debt" % [
+			resource, recovery])
+
+	if recovery == "failure":
+		service.pf.multiplayer.next_shutdown_result = Doubles.Results.make(
+			false,
+			null,
+			"multiplayer_cleanup_failed",
+			"Injected recovery failure.")
+	var events_before_recovery := cleanup_events.size()
+	var recovery_start_msec := service.fake_clock.now_msec()
+	var global_results: Array = []
+	_capture_global_leave(service, global_results)
+	await _frames(test, 6)
+	test._check(global_results.size() == 1
+		and service.pf.party.shutdown_calls == 1
+		and service.pf.multiplayer.shutdown_calls == 1
+		and cleanup_events.size() > events_before_recovery
+		and service.fake_clock.now_msec() == recovery_start_msec,
+		"[%s/%s] debt-only leave reaches existing recovery without grace delay" % [
+			resource, recovery])
+	var final_readiness := service.cleanup_readiness()
+	if recovery == "success":
+		test._check(final_readiness.state == PartyService.CLEANUP_CLEAR
+			and String(final_readiness.reason).is_empty()
+			and service.context_is_quiescent(context)
+			and not service.has_owned_work()
+			and not service.is_cleanup_pending(),
+			"[%s/success] confirmed recovery alone clears the cleanup debt" % \
+				resource)
+	else:
+		test._check(final_readiness.state
+				== PartyService.CLEANUP_RESTART_REQUIRED
+			and String(final_readiness.reason) == PartyService.RECOVERY_FAILED
+			and context.cleanup_pending
+			and not service.context_is_quiescent(context)
+			and service.has_owned_work()
+			and service.is_cleanup_pending()
+			and not service.is_cleanup_running()
+			and not service.has_idle_cleanup_debt()
+			and service._contexts.get(context.context_id) == context,
+			"[%s/failure] failed recovery keeps the restart-required debt" % \
+				resource)
+		var terminal_drain: Array = []
+		var terminal_drain_msec := service.fake_clock.now_msec()
+		_capture_party_drain(
+			service,
+			terminal_drain_msec + 1000,
+			terminal_drain)
+		await _frames(test, 1)
+		test._check(terminal_drain == [true]
+			and service.fake_clock.now_msec() == terminal_drain_msec,
+			"[%s/failure] drain does not wait on terminal tracked debt" % resource)
+	test._check(failed_result.outcome
+			== PartyService.PartyResult.Outcome.SERVICE_ERROR,
+		"[%s/%s] later recovery never rewrites the caller's failed outcome" % [
+			resource, recovery])
+
+
+func _s5_cleanup_execution_and_idle_debt_facts(test: Node) -> void:
+	print("CASE: cleanup execution, idle debt, and terminal failure are distinct")
+	var clean := Doubles.Party.new(ChatService.new())
+	test._check(not clean.is_cleanup_running()
+		and not clean.has_idle_cleanup_debt(),
+		"an idle clean service reports neither running cleanup nor debt")
+
+	var healthy := Doubles.Party.new(ChatService.new())
+	healthy.configure_clock(healthy.fake_clock)
+	var user := Doubles.User.new("cleanup-facts")
+	var arranged: PartyService.PartyResult = await healthy.join_arranged(
+		user,
+		"cleanup-facts-arranged",
+		{},
+		4,
+		1,
+		795,
+		healthy.fake_clock.now_msec() + 1000)
+	var prepared: PartyService.PartyResult = await healthy.prepare_transport(
+		arranged.context,
+		user,
+		healthy.fake_clock.now_msec() + 1000)
+	test._check(arranged.ok() and prepared.ok()
+		and healthy.has_owned_work()
+		and not healthy.is_cleanup_running()
+		and not healthy.has_idle_cleanup_debt(),
+		"healthy retained Lobby and transport are owned but are not failed cleanup")
+
+	var healthy_lobby: Doubles.Lobby = arranged.context.lobby
+	healthy_lobby.block_leave = true
+	var healthy_leave: Array = []
+	var healthy_drain: Array = []
+	_capture_global_leave(healthy, healthy_leave)
+	_capture_party_drain(
+		healthy,
+		healthy.fake_clock.now_msec() + 1000,
+		healthy_drain)
+	await _frames(test, 2)
+	test._check(healthy.is_cleanup_running()
+		and not healthy.has_idle_cleanup_debt()
+		and healthy_leave.is_empty()
+		and healthy_drain.is_empty()
+		and healthy.pf.party.shutdown_calls == 0
+		and healthy.pf.multiplayer.shutdown_calls == 0,
+		"genuine native leave execution remains waited on without becoming idle debt")
+	healthy_lobby.block_leave = false
+	healthy_lobby.leave_released.emit()
+	healthy.fake_clock.advance(PartyService.POLL_INTERVAL)
+	await _frames(test, 4)
+	test._check(healthy_leave == [true] and healthy_drain == [true]
+		and not healthy.is_cleanup_running()
+		and not healthy.has_idle_cleanup_debt()
+		and healthy.pf.party.shutdown_calls == 0
+		and healthy.pf.multiplayer.shutdown_calls == 0,
+		"a genuine native answer completes leave and drain without recovery")
+
+	var establishing := Doubles.Party.new(ChatService.new())
+	establishing.configure_clock(establishing.fake_clock)
+	establishing.pf.party.block_create = true
+	var establishing_results: Array = []
+	_capture_create_staging(
+		establishing,
+		Doubles.User.new("cleanup-establishing"),
+		establishing_results)
+	await _frames(test, 1)
+	test._check(establishing.has_owned_work()
+		and not establishing.is_cleanup_running()
+		and not establishing.has_idle_cleanup_debt(),
+		"ordinary in-flight establishment is owned work, not idle failed cleanup")
+	establishing.cancel_pending_join()
+	establishing.pf.party.block_create = false
+	establishing.pf.party.create_released.emit()
+	await _frames(test, 4)
+	await establishing.leave()
+
+	var required := Doubles.Party.new(ChatService.new())
+	required.configure_clock(required.fake_clock)
+	var required_events: Array[bool] = []
+	required.cleanup_state_changed.connect(func() -> void:
+		required_events.append(true))
+	required.require_recovery(&"late_failed_leave")
+	test._check(not required.is_cleanup_running()
+		and required.has_idle_cleanup_debt()
+		and required.cleanup_readiness().state == PartyService.CLEANUP_PENDING
+		and not required_events.is_empty(),
+		"a required recovery is recoverable idle debt and not running execution")
+	await required.leave()
+	test._check(not required.is_cleanup_running()
+		and not required.has_idle_cleanup_debt()
+		and required.cleanup_readiness().state == PartyService.CLEANUP_CLEAR,
+		"confirmed recovery clears the required idle debt")
+
+
+func _s5_late_result_leave_failure_idle_debt(test: Node) -> void:
+	print("CASE: late stale leave failures publish idle cleanup debt synchronously")
+	for resource: String in ["lobby", "transport"]:
+		var service := Doubles.Party.new(ChatService.new())
+		service.configure_clock(service.fake_clock)
+		var failure := Doubles.Results.make(
+			false,
+			null,
+			"lobby_leave_start_failed" if resource == "lobby" \
+				else "party_resource_not_ready",
+			"Injected late-result leave failure.",
+			-2147467259)
+		if resource == "lobby":
+			service.pf.multiplayer.block_create = true
+			service.pf.multiplayer.next_created_lobby_leave_result = failure
+		else:
+			service.pf.party.block_create = true
+			service.pf.party.next_created_network_leave_result = failure
+		var creation_results: Array = []
+		_capture_create_staging(
+			service,
+			Doubles.User.new("late-debt-" + resource),
+			creation_results)
+		await _frames(test, 1)
+		test._check(service.has_owned_work()
+			and not service.is_cleanup_running()
+			and not service.has_idle_cleanup_debt(),
+			"[%s] held SDK creation is ordinary native work before retirement" % \
+				resource)
+
+		var initial_leave: Array = []
+		_capture_global_leave(service, initial_leave)
+		await _frames(test, 1)
+		service.fake_clock.advance(NRConst.MATCH_CLEANUP_SECONDS)
+		await _frames(test, 6)
+		test._check(initial_leave == [true]
+			and creation_results.size() == 1
+			and not service.is_cleanup_running()
+			and not service.has_idle_cleanup_debt(),
+			"[%s] old flow cleanup finishes before the late SDK result" % resource)
+
+		var debt_events: Array[bool] = []
+		service.cleanup_state_changed.connect(func() -> void:
+			debt_events.append(true))
+		var events_before_release := debt_events.size()
+		if resource == "lobby":
+			service.pf.multiplayer.block_create = false
+			service.pf.multiplayer.create_released.emit()
+		else:
+			service.pf.party.block_create = false
+			service.pf.party.create_released.emit()
+		test._check(debt_events.size() > events_before_release
+			and not service.is_cleanup_running()
+			and service.has_idle_cleanup_debt()
+			and service.cleanup_readiness().state == PartyService.CLEANUP_PENDING
+			and service.has_owned_work(),
+			"[%s] late leave failure synchronously publishes registered idle debt" % \
+				resource)
+		await _frames(test, 3)
+		var stale_context: PartyService.LobbyContext = \
+			(creation_results[0] as PartyService.PartyResult).context
+		test._check(stale_context != null
+			and not service.context_is_quiescent(stale_context),
+			"[%s] old-epoch context remains non-quiescent while debt is idle" % \
+				resource)
+		await service.leave()
+		test._check(not service.is_cleanup_running()
+			and not service.has_idle_cleanup_debt()
+			and not service.has_owned_work(),
+			"[%s] the existing recovery boundary clears late-result debt" % resource)
 
 
 func _s5_serialized_operations_stop_after_leave(test: Node) -> void:
@@ -1719,7 +3198,10 @@ func _s6_context_loss_and_admission(test: Node) -> void:
 
 	var losses: Array = []
 	service.context_lost.connect(func(reason: String, lost_context: Variant) -> void:
-		losses.append({"reason": reason, "context": lost_context}))
+		losses.append({
+			"reason": reason,
+			"context_id": int(lost_context.context_id) if lost_context != null else 0,
+		}))
 	var owner_change := Doubles.Change.new()
 	owner_change.kind = PartyService.LOBBY_CHANGE_OWNER_CHANGED
 	(context.lobby as Doubles.Lobby).owner_entity_key = {
@@ -1727,9 +3209,11 @@ func _s6_context_loss_and_admission(test: Node) -> void:
 		"type": "title_player_account",
 	}
 	(context.lobby as Doubles.Lobby).state_changed.emit(owner_change)
-	test._check(losses.size() == 1 and losses[0].context == context,
+	test._check(losses.size() == 1
+		and int(losses[0].context_id) == context.context_id,
 		"native owner change emits one scoped terminal loss count=%d" % losses.size())
-	test._check(String(losses[0].reason).contains("owner changed"),
+	test._check(String(losses[0].reason)
+			== "The group host changed, so the group was closed.",
 		"owner-change loss uses a title-owned reason=%s" % losses[0].reason)
 	await service.leave()
 
@@ -1745,18 +3229,51 @@ func _s6_context_loss_and_admission(test: Node) -> void:
 		peerless.fake_clock.now_msec() + 1000)
 	var peerless_losses: Array = []
 	peerless.context_lost.connect(func(reason: String, lost_context: Variant) -> void:
-		peerless_losses.append({"reason": reason, "context": lost_context}))
+		peerless_losses.append({
+			"reason": reason,
+			"context_id": int(lost_context.context_id) if lost_context != null else 0,
+		}))
 	var disconnected := Doubles.Change.new()
 	disconnected.kind = PartyService.LOBBY_CHANGE_DISCONNECTED
 	disconnected.result = Doubles.Results.make(
 		false, null, "dropped", "Injected native diagnostic.")
 	(arranged.context.lobby as Doubles.Lobby).state_changed.emit(disconnected)
 	test._check(peerless_losses.size() == 1
-		and peerless_losses[0].context == arranged.context
+		and int(peerless_losses[0].context_id) == arranged.context.context_id
 		and String(peerless_losses[0].reason)
 			== "The matchmaking lobby connection was lost.",
 		"peerless scoped Lobby loss is terminal with a title reason")
 	await peerless.leave()
+
+	var arranged_loss := Doubles.Party.new(ChatService.new())
+	arranged_loss.configure_clock(arranged_loss.fake_clock)
+	var arranged_owner_loss: PartyService.PartyResult = await arranged_loss.join_arranged(
+		Doubles.User.new("arranged-owner-loss"),
+		"arranged-owner-loss",
+		{},
+		4,
+		1,
+		305,
+		arranged_loss.fake_clock.now_msec() + 1000)
+	var arranged_losses: Array[String] = []
+	arranged_loss.context_lost.connect(func(reason: String, _context: Variant) -> void:
+		arranged_losses.append(reason))
+	var arranged_lobby: Doubles.Lobby = arranged_owner_loss.context.lobby
+	arranged_lobby.owner_entity_key = {}
+	var arranged_cleared := Doubles.Change.new()
+	arranged_cleared.kind = PartyService.LOBBY_CHANGE_OWNER_CHANGED
+	arranged_lobby.state_changed.emit(arranged_cleared)
+	test._check(arranged_losses.size() == 1,
+		"arranged owner clear loss count=%d" % arranged_losses.size())
+	test._check(arranged_losses[0]
+			== "The match host left or is no longer available, so the match was closed.",
+		"arranged owner clear reason=%s" % (
+			arranged_losses[0] if arranged_losses.size() == 1 else "missing"))
+	test._check(not String(arranged_losses[0] if arranged_losses.size() == 1 else "")
+			.contains("PlayFab"),
+		"arranged host-loss text contains no service-object jargon")
+	await arranged_loss.leave()
+	await _drain_clock(test, arranged_loss.fake_clock, "S6 arranged owner loss")
 
 	var staging_retirement := Doubles.Party.new(ChatService.new())
 	staging_retirement.configure_clock(staging_retirement.fake_clock)
@@ -2028,6 +3545,256 @@ func _s7_arranged_control_and_publication(test: Node) -> void:
 	await _drain_clock(test, unusable.fake_clock, "S7 unusable peer")
 
 
+func _s8_joined_owner_authority_without_flow(test: Node) -> void:
+	print("CASE: joined lobby authority is available before any MatchmakingFlow exists")
+	var service := Doubles.Party.new(ChatService.new())
+	service.configure_clock(service.fake_clock)
+	var owner := Doubles.User.new("owner-proof-host")
+	var guest := Doubles.User.new("owner-proof-guest")
+	var lobby := _arranged_lobby_fixture(
+		owner.entity_key, guest.entity_key, "owner-proof-arranged")
+	lobby.search_properties[PartyService.LOBBY_KIND_KEY] = \
+		PartyService.LOBBY_KIND_ARRANGED
+	lobby.properties.merge(PartyService.encode_arranged_control(
+		"owner-proof-match", 4, PartyService.ARRANGED_PHASE_REMATCH), true)
+	lobby.properties[PartyService.DESCRIPTOR_KEY] = "owner-proof-descriptor"
+	lobby.members[0].properties = {
+		MatchmakingService.PROTOCOL_MEMBER_KEY: NRProtocol.version_string(),
+		PartyService.MATCH_ID_MEMBER_KEY: "owner-proof-match",
+	}
+	lobby.members[1].properties = {
+		MatchmakingService.PROTOCOL_MEMBER_KEY: NRProtocol.version_string(),
+		PartyService.MATCH_ID_MEMBER_KEY: "owner-proof-match",
+	}
+	service.pf.multiplayer.next_arranged_result = Doubles.Results.make(true, lobby)
+	var arranged: PartyService.PartyResult = await service.join_arranged(
+		guest,
+		"owner-proof-arrangement",
+		lobby.members[1].properties,
+		4,
+		1,
+		701,
+		service.fake_clock.now_msec() + 1000)
+	var network := Doubles.Network.new()
+	network.local_peer.unique_id = 7
+	network.local_peer.keys[1] = owner.entity_key.duplicate()
+	network.local_peer.keys[7] = guest.entity_key.duplicate()
+	service.pf.party.queued_networks.append(network)
+	var joined: PartyService.PartyResult = await service.join_transport(
+		arranged.context, guest, service.fake_clock.now_msec() + 1000)
+	test._check(joined.ok(),
+		"pending-rematch fixture joins the arranged transport")
+
+	network.local_peer.keys.erase(1)
+	var pending := service.joined_owner_proof(arranged.context, 1)
+	test._check(not bool(pending.valid) and bool(pending.pending)
+		and String(pending.reason_code) == "party_identity_pending",
+		"the guest waits while the joined-lobby owner is not ready: %s" % \
+			pending.reason_code)
+	network.local_peer.keys[1] = owner.entity_key.duplicate()
+	var proven := service.joined_owner_proof(arranged.context, 1)
+	test._check(bool(proven.valid) and not bool(proven.pending)
+		and bool(proven.local_lobby_connected),
+		"the pending rematch accepts the current joined-lobby owner")
+	test._check((proven.owner_key as Dictionary) == owner.entity_key
+		and (proven.peer_key as Dictionary) == owner.entity_key,
+		"the accepted owner remains the current lobby owner=%s" % proven.owner_key)
+	test._check(String(proven.protocol) == NRProtocol.version_string()
+		and String(proven.match_id) == "owner-proof-match"
+		and int(proven.round) == 4
+		and String(proven.phase) == PartyService.ARRANGED_PHASE_REMATCH,
+		"arranged admission retains the current protocol and round=%s" % proven)
+	arranged.context.recovery_epoch -= 1
+	var stale_recovery := service.joined_owner_proof(arranged.context, 1)
+	test._check(not bool(stale_recovery.valid)
+		and String(stale_recovery.reason_code) == "context_unavailable",
+		"a stale recovery context is refused")
+	arranged.context.recovery_epoch += 1
+
+	var other_owner := {
+		"id": "owner-proof-other-owner",
+		"type": "title_player_account",
+	}
+	lobby.owner_entity_key = other_owner
+	network.local_peer.keys[1] = other_owner
+	lobby.members[0].entity_key = other_owner
+	var changed := service.joined_owner_proof(arranged.context, 1)
+	test._check(not bool(changed.valid) and not bool(changed.pending)
+		and String(changed.reason_code) == "owner_changed",
+		"a later owner change is refused: %s" % \
+			changed.reason_code)
+	await service.leave()
+	await _drain_clock(test, service.fake_clock, "S8 arranged owner authority")
+
+	var staging_service := Doubles.Party.new(ChatService.new())
+	staging_service.configure_clock(staging_service.fake_clock)
+	var staging_user := Doubles.User.new("owner-proof-staging")
+	var staging: PartyService.PartyResult = await staging_service.create_staging(
+		staging_user,
+		4,
+		"deathmatch",
+		1,
+		702,
+		staging_service.fake_clock.now_msec() + 1000)
+	var staging_proof := staging_service.joined_owner_proof(staging.context, 1)
+	test._check(bool(staging_proof.valid)
+		and bool(staging_proof.local_lobby_connected)
+		and String(staging_proof.protocol) == NRProtocol.version_string(),
+		"staging admission accepts the compatible lobby protocol")
+	await staging_service.leave()
+	await _drain_clock(test, staging_service.fake_clock, "S8 staging authority")
+
+	var hosted_service := Doubles.Party.new(ChatService.new())
+	hosted_service.configure_clock(hosted_service.fake_clock)
+	var hosted: Dictionary = await hosted_service.host(
+		Doubles.User.new("owner-proof-hosted"), 4, "deathmatch")
+	var hosted_proof := hosted_service.joined_owner_proof(null, 1)
+	test._check(bool(hosted.get("ok", false)) and bool(hosted_proof.valid)
+		and bool(hosted_proof.local_lobby_connected)
+		and String(hosted_proof.protocol) == NRProtocol.version_string(),
+		"hosted admission accepts the compatible lobby protocol")
+	await hosted_service.leave()
+	await _drain_clock(test, hosted_service.fake_clock, "S8 hosted authority")
+
+
+func _s8_legacy_guest_authority_changes(test: Node) -> void:
+	print("CASE: legacy guest handles local Lobby disconnect and owner changes")
+	var previous_matchmaking: MatchmakingService = Services._matchmaking
+	Services._matchmaking = Doubles.Matchmaking.new()
+	for scenario: String in [
+		"owner_cleared",
+		"owner_changed",
+		"owner_disconnected",
+		"owner_removed",
+		"protocol",
+		"peer_mismatch",
+		"local_disconnected",
+		"local_disconnected_owner_changed",
+		"local_disconnected_peer_mismatch",
+		"local_disconnected_identity_pending",
+		"local_disconnected_transport_missing",
+		"scoped_attached",
+	]:
+		var fixture: Dictionary = await _legacy_guest_session_fixture(
+			Doubles.User.new("legacy-proof-" + scenario),
+			"legacy-proof-" + scenario)
+		var service: Doubles.Party = fixture.service
+		var lobby: Doubles.Lobby = fixture.lobby
+		var network: Doubles.Network = fixture.network
+		var owner: Dictionary = fixture.owner
+		test._check(bool((fixture.joined as Dictionary).get("ok", false)),
+			"[%s] legacy guest fixture joined" % scenario)
+		match scenario:
+			"owner_cleared":
+				lobby.owner_entity_key = {}
+			"owner_changed":
+				lobby.owner_entity_key = {
+					"id": "legacy-proof-other-owner",
+					"type": "title_player_account",
+				}
+			"owner_disconnected":
+				(lobby.members[0] as Doubles.Member).connection_status = 0
+			"owner_removed":
+				lobby.members.remove_at(0)
+			"protocol":
+				lobby.search_properties[NRProtocol.LOBBY_KEY] = "1.3"
+			"peer_mismatch":
+				network.local_peer.keys[1] = {
+					"id": "legacy-proof-other-peer",
+					"type": "title_player_account",
+				}
+			"local_disconnected":
+				lobby.disconnected = true
+			"local_disconnected_owner_changed":
+				lobby.disconnected = true
+				lobby.owner_entity_key = {
+					"id": "legacy-proof-other-owner",
+					"type": "title_player_account",
+				}
+			"local_disconnected_peer_mismatch":
+				lobby.disconnected = true
+				network.local_peer.keys[1] = {
+					"id": "legacy-proof-other-peer",
+					"type": "title_player_account",
+				}
+			"local_disconnected_identity_pending":
+				lobby.disconnected = true
+				network.local_peer.keys.erase(1)
+			"local_disconnected_transport_missing":
+				lobby.disconnected = true
+				service._network = null
+			"scoped_attached":
+				service._attached_context = PartyService.LobbyContext.new()
+		var proof := service.joined_owner_proof(null, 1)
+		var expected := {
+			"owner_cleared": "owner_changed",
+			"owner_changed": "owner_changed",
+			"owner_disconnected": "owner_disconnected",
+			"owner_removed": "owner_member_missing",
+			"protocol": "owner_protocol_mismatch",
+			"peer_mismatch": "owner_peer_mismatch",
+			"local_disconnected": "local_lobby_disconnected",
+			"local_disconnected_owner_changed": "owner_changed",
+			"local_disconnected_peer_mismatch": "owner_peer_mismatch",
+			"local_disconnected_identity_pending": "party_identity_pending",
+			"local_disconnected_transport_missing": "transport_unavailable",
+			"scoped_attached": "context_unavailable",
+		}
+		var expected_pending := scenario == "local_disconnected_identity_pending"
+		test._check(not bool(proof.valid) and bool(proof.pending) == expected_pending,
+			"[%s] legacy guest is refused valid=%s pending=%s expected_pending=%s" % [
+				scenario, proof.valid, proof.pending, expected_pending])
+		test._check(String(proof.reason_code) == String(expected[scenario]),
+			"[%s] legacy guest reason=%s" % [scenario, proof.reason_code])
+		if scenario.begins_with("local_disconnected"):
+			test._check(not bool(proof.local_lobby_connected),
+				"[%s] every disconnected proof exposes local Lobby state" % scenario)
+		if scenario == "local_disconnected":
+			test._check(not bool(proof.local_lobby_connected)
+				and (proof.peer_key as Dictionary) == owner
+				and (proof.captured_owner_key as Dictionary) == owner,
+				"local-only disconnect remains distinct from a host change")
+		if scenario == "scoped_attached":
+			service._attached_context = null
+		if scenario == "local_disconnected_transport_missing":
+			service._network = network
+		await service.leave()
+		await _drain_clock(test, service.fake_clock, "S8 legacy authority " + scenario)
+	Services._matchmaking = previous_matchmaking
+
+
+func _legacy_guest_session_fixture(
+	guest: Doubles.User,
+	label: String
+) -> Dictionary:
+	var service := Doubles.Party.new(ChatService.new())
+	service.configure_clock(service.fake_clock)
+	var owner := Doubles.User.new(label + "-owner")
+	var lobby := _hosted_lobby(
+		String(owner.entity_key.id),
+		"ABCDE",
+		label + "-descriptor",
+		label + "-lobby")
+	lobby.connection_string = label + "-connection"
+	var network := Doubles.Network.new()
+	network.local_peer.unique_id = 7
+	network.local_peer.keys[1] = owner.entity_key.duplicate()
+	network.local_peer.keys[7] = guest.entity_key.duplicate()
+	service.pf.party.queued_networks.append(network)
+	service.pf.multiplayer.lobby_by_connection[lobby.connection_string] = lobby
+	var joined: Dictionary = await service.join_by_connection_string(
+		guest,
+		lobby.connection_string,
+		service.fake_clock.now_msec() + 1000)
+	return {
+		"service": service,
+		"lobby": lobby,
+		"network": network,
+		"owner": owner.entity_key.duplicate(),
+		"joined": joined,
+	}
+
+
 func _s8_invite_destinations(test: Node) -> void:
 	print("CASE: Phase 1 invite destinations preserve opaque strings and fence Party entry")
 	var previous_matchmaking: MatchmakingService = Services._matchmaking
@@ -2064,7 +3831,7 @@ func _s8_invite_destinations(test: Node) -> void:
 	test._check(rematch_service.pf.multiplayer.join_calls == [exact_connection]
 		and rematch_service.pf.multiplayer.find_calls.is_empty(),
 		"#16 connection string reaches Lobby byte-for-byte calls=%s" % \
-			rematch_service.pf.multiplayer.join_calls)
+			[rematch_service.pf.multiplayer.join_calls])
 	test._check(rematch_service.pf.party.join_calls.size() == 1
 		and String(rematch_service.pf.party.join_calls[0].invitation_id)
 			== PartyService.MATCHMAKING_INVITATION_ID
@@ -2275,7 +4042,7 @@ func _s9_multiplayer_invalidation(test: Node) -> void:
 		and recovered_leave.size() == 1
 		and recovered._contexts.is_empty(),
 		"successful Party/Lobby recovery emits once after scoped retirement=%s" % \
-			invalidations)
+			[invalidations])
 	recovered_lobby.block_leave = false
 	recovered_lobby.leave_released.emit()
 	await _frames(test, 2)
@@ -2319,6 +4086,93 @@ func _s9_multiplayer_invalidation(test: Node) -> void:
 	test._check(party_only_invalidations.is_empty(),
 		"Party-only shutdown is not evidence that tickets were invalidated")
 
+	var required := Doubles.Party.new(ChatService.new())
+	required.configure_clock(required.fake_clock)
+	var required_invalidations: Array[int] = []
+	required.multiplayer_invalidated.connect(func(epoch: int) -> void:
+		required_invalidations.append(epoch))
+	required.require_recovery(&"matched_cancel_waiter")
+	required.require_recovery(&"duplicate_request")
+	test._check(required.is_cleanup_pending(),
+		"required recovery fences online entry immediately")
+	test._check(required.pf.party.shutdown_calls == 0
+		and required.pf.multiplayer.shutdown_calls == 0,
+		"require_recovery starts no native work before global leave")
+	await required.leave()
+	test._check(required.pf.party.shutdown_calls == 1
+		and required.pf.multiplayer.shutdown_calls == 1,
+		"next global leave resets Party=%d Multiplayer=%d only" % [
+			required.pf.party.shutdown_calls,
+			required.pf.multiplayer.shutdown_calls])
+	test._check(required_invalidations == [1],
+		"required recovery emits one Multiplayer invalidation=%s" % \
+			[required_invalidations])
+	test._check(not required.is_cleanup_pending()
+		and required.recovery_error.is_empty(),
+		"confirmed required recovery clears its fence")
+	await _drain_clock(test, required.fake_clock, "S9 required recovery")
+
+	var previous_party: PartyService = Services._party
+	var previous_matchmaking: MatchmakingService = Services._matchmaking
+	var composed_party := Doubles.Party.new(ChatService.new())
+	var composed_matchmaking := Doubles.Matchmaking.new()
+	var composed_clock := Doubles.Clock.new()
+	composed_party.configure_clock(composed_clock)
+	composed_matchmaking.configure_clock(composed_clock)
+	Services._party = composed_party
+	Services._matchmaking = composed_matchmaking
+	Services.bind_party_signals()
+	var composed_ticket := Doubles.Ticket.new()
+	composed_ticket.block_cancel = true
+	composed_matchmaking.sdk.queued_create_results.append(
+		Doubles.Results.make(true, composed_ticket))
+	var composed_attempt := composed_matchmaking.begin_create(
+		_spec(Doubles.User.new("composed-recovery"), [{
+			"id": "composed-recovery",
+			"type": "title_player_account",
+		}], 505))
+	await _frames(test, 2)
+	composed_matchmaking.request_cancel(composed_attempt)
+	composed_matchmaking.retire(composed_attempt)
+	composed_ticket.match_id = "composed-match"
+	composed_ticket.arranged_lobby_connection_string = "composed-arrangement"
+	composed_ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+	await _frames(test, 1)
+	test._check(composed_matchmaking.has_orphaned_matched_cancel(),
+		"composed fixture exposes the real orphaned Matched cancel")
+	var composed_order: Array[String] = []
+	var composed_observer_recorded: Array[bool] = [false]
+	composed_matchmaking.cleanup_state_changed.connect(func() -> void:
+		if not composed_observer_recorded[0]:
+			composed_observer_recorded[0] = true
+			composed_order.append("cancel_observer_resumed"))
+	composed_party.pf.multiplayer.shutdown_hook = func() -> void:
+		composed_order.append("cancel_released")
+		composed_matchmaking.sdk.invalidate_runtime()
+	composed_party.multiplayer_invalidated.connect(func(_epoch: int) -> void:
+		composed_order.append("multiplayer_invalidated"))
+	composed_party.require_recovery(&"matchmaking_cancel_unresolved")
+	await composed_party.leave()
+	await _frames(test, 3)
+	test._check(composed_order == [
+		"cancel_released",
+		"cancel_observer_resumed",
+		"multiplayer_invalidated",
+	], "cancel observer resumes synchronously inside shutdown before invalidation=%s" % \
+		[composed_order])
+	test._check(not composed_matchmaking.has_pending_cleanup()
+		and not composed_matchmaking.has_orphaned_matched_cancel(),
+		"composed confirmed recovery discharges the old ticket epoch")
+	test._check(composed_matchmaking.fake_warnings.size() == 1
+		and composed_matchmaking.fake_warnings[0].contains(
+			"reason=cancel_released_by_reset"),
+		"composed reset release keeps distinct log provenance=%s" % \
+			[composed_matchmaking.fake_warnings])
+	composed_party.pf.multiplayer.shutdown_hook = Callable()
+	Services._party = previous_party
+	Services._matchmaking = previous_matchmaking
+	await _drain_clock(test, composed_clock, "S9 composed recovery")
+
 
 func _s10_staging_retirement_observation(test: Node) -> void:
 	print("CASE: staging retirement reports quiescence and suppresses loss only inside owned leave")
@@ -2333,7 +4187,10 @@ func _s10_staging_retirement_observation(test: Node) -> void:
 		active.fake_clock.now_msec() + 1000)
 	var active_losses: Array = []
 	active.context_lost.connect(func(reason: String, context: Variant) -> void:
-		active_losses.append({"reason": reason, "context": context}))
+		active_losses.append({
+			"reason": reason,
+			"context_id": int(context.context_id) if context != null else 0,
+		}))
 	var active_lobby: Doubles.Lobby = active_result.context.lobby
 	active_lobby.owner_entity_key = {}
 	var owner_cleared := Doubles.Change.new()
@@ -2349,10 +4206,13 @@ func _s10_staging_retirement_observation(test: Node) -> void:
 			active_losses.size())
 	var active_loss: Dictionary = active_losses[0] \
 		if active_losses.size() == 1 else {}
-	test._check(active_loss.get("context") == active_result.context,
-		"active loss retains its captured context=%s" % active_loss.get("context"))
-	test._check(String(active_loss.get("reason", "")).contains("owner changed"),
-		"active owner clear reports the owner-change reason=%s" % \
+	test._check(int(active_loss.get("context_id", 0))
+			== active_result.context.context_id,
+		"active loss retains its captured context id=%s" % \
+			active_loss.get("context_id"))
+	test._check(String(active_loss.get("reason", ""))
+			== "The group host left or is no longer available, so the group was closed.",
+		"active owner clear reports the host-loss reason=%s" % \
 			active_loss.get("reason", "missing"))
 	await active.leave()
 	await _drain_clock(test, active.fake_clock, "S10 active owner clear")
@@ -2386,7 +4246,10 @@ func _s10_staging_retirement_observation(test: Node) -> void:
 
 	var retirement_losses: Array = []
 	retiring.context_lost.connect(func(reason: String, lost_context: Variant) -> void:
-		retirement_losses.append({"reason": reason, "context": lost_context}))
+		retirement_losses.append({
+			"reason": reason,
+			"context_id": int(lost_context.context_id) if lost_context != null else 0,
+		}))
 	lobby.block_leave = true
 	var leave_results: Array = []
 	_capture_scoped_lobby_leave(retiring, context, leave_results)
@@ -2645,12 +4508,29 @@ func _capture_global_leave(service: Doubles.Party, results: Array) -> void:
 	results.append(true)
 
 
+func _capture_party_drain(
+	service: Doubles.Party,
+	deadline_msec: int,
+	results: Array
+) -> void:
+	await service.drain_owned_work(deadline_msec)
+	results.append(true)
+
+
 func _capture_scoped_lobby_leave(
 	service: Doubles.Party,
 	context: PartyService.LobbyContext,
 	results: Array
 ) -> void:
 	results.append(await service.leave_lobby(context))
+
+
+func _capture_scoped_transport_leave(
+	service: Doubles.Party,
+	context: PartyService.LobbyContext,
+	results: Array
+) -> void:
+	results.append(await service.leave_transport(context))
 
 
 func _capture_context_post(
@@ -2839,6 +4719,22 @@ func _full_party_failure(
 		and attempt.reason_code == MatchmakingService.FULL_PARTY_REASON_CODE
 		and attempt.reason == MatchmakingService.FULL_PARTY_REASON,
 		description)
+
+
+func _generic_full_party_failure(
+	test: Node,
+	attempt: MatchmakingService.TicketAttempt,
+	expected_code: StringName,
+	description: String
+) -> void:
+	test._check(attempt.outcome == MatchmakingService.Outcome.FAILED,
+		"%s outcome=%d" % [description, attempt.outcome])
+	test._check(attempt.reason_code == expected_code,
+		"%s reason_code=%s" % [description, attempt.reason_code])
+	test._check(attempt.reason.contains(MatchmakingService.FULL_PARTY_GUIDANCE),
+		"%s guidance=%s" % [description, attempt.reason])
+	test._check(attempt.reason_code != MatchmakingService.FULL_PARTY_REASON_CODE,
+		"%s does not claim confirmed queue-size cause" % description)
 
 
 func _frames(test: Node, count: int) -> void:
