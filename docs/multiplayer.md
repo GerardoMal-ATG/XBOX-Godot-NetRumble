@@ -7,9 +7,10 @@
 **PlayFab Lobby** discovers sessions and carries the Party descriptor. **PlayFab Party**
 authenticates peers and carries Godot gameplay traffic plus its separate voice/text channel.
 **XBOX multiplayer activity** makes that Lobby session discoverable through friends and invites.
-The menu shows a focusable **Matchmaking** row for PlayFab tickets, arranged lobbies and retained
-private rematches; [Matchmaking](matchmaking.md) documents that lifecycle. The row opens a group
-when its service/profile dependencies are available and otherwise explains the exact denial.
+The menu shows a focusable **Matchmaking** row for PlayFab tickets, automatic full-group Private
+Start and retained rematches; [Matchmaking](matchmaking.md) documents that lifecycle. The row
+opens a group when its service/profile dependencies are available and otherwise explains the
+exact denial.
 
 See also: [Architecture](architecture.md) · [Platform Services](platform-services.md) ·
 [Configuration](configuration.md) · [Matchmaking foundations](matchmaking.md) ·
@@ -178,8 +179,9 @@ native edit, fire-and-forget destruction or forced-exit workaround is included.
 *construction* is PlayFab-specific, and it lives entirely in
 `scripts/services/party_service.gd`.
 
-Build from the Sample addon revision pinned by this repository and record that revision with the
-validation results. See Known issues for the current package's Matchmaking cancellation behavior.
+Build from Sample addon revision
+`442d7908ab27e18b60d047f51eb2f342efa7df1d` pinned by this repository and record that revision
+with the rebuilt package validation results.
 
 ---
 
@@ -208,9 +210,38 @@ an abandoned ticket owned until native terminal truth and the cancel operation h
 or a confirmed Multiplayer reset invalidates that runtime. A Matched ticket is never relabelled
 Cancelled and never starts a match after the player has bound a leave/cancel intent.
 
-When the addon supplies a detailed HRESULT, the title can identify the fixed-four queue's
-ticket-size rejection. A generic wrapper `E_FAIL` remains a generic Matchmaking failure; the
-known full-four limitation is shown separately and is not inferred as the observed cause.
+The supported addon publishes one terminal ticket event and preserves the cached snapshot after
+native retirement. If Matched wins a cancel race, the completion returns that matched snapshot;
+the title preserves the player's stop intent, releases the observer and needs no routine service
+reset. Confirmed runtime recovery remains a bounded safety net for native work that is explicitly
+unanswered or fails.
+
+Terminal failure forwards its native HRESULT, so the title can identify the queue's ticket-size
+rejection. Generic early `E_FAIL` wrappers remain generic Matchmaking failures and are not
+relabelled from message text. A full group normally starts privately before ticket creation; an
+unexpected maximum-sized ticket failure remains a failure, not a late route-selection signal.
+
+For the first matchmade start, the arranged Lobby stays private and unlocked while matched callers
+arrive and join the fresh Party network. The owner starts with the current 2-4 present members
+only after every present member is connected, admitted, compatible and finished with staging
+cleanup. A present member still connecting blocks selection; a known incompatible present member
+ends the initial attempt. No timer waits for an unknown assigned total.
+
+A full ready group of four takes a different path before ticket creation. The title locks its
+current staging Lobby and changes only its access, kind and private owner control. The same Lobby,
+Party network, descriptor, peer and owner become the private play session; there is no
+arrangement, new transport or room code. All four remain required through the first countdown and
+loading.
+
+Once the owner selects a matchmade start set, admission closes, the native Lobby is locked and
+that exact set is rechecked through loading. Later arrivals cannot join that round and may need to
+search again. Private Start similarly keeps its captured four fixed through first `RUNNING`.
+
+Results return either origin to the same capacity-four play session for hosted ready-up rounds
+rather than automatically starting another search. Those rounds use two to four current humans,
+are invite-only while open, and accept compatible replacements through the retained Lobby and
+Party network. A private replacement carries the private session id before Party entry; a
+matchmade replacement carries the match id.
 
 ### `find_lobbies_async` resolves to `PlayFabLobbySearchResult`
 

@@ -85,25 +85,54 @@ to create a studio and a title. Background reading:
 You do **not** need your own title for the primary XBOX path; the committed sample title serves
 it. You need one for the custom-ID path below, and for any game of your own.
 
-Matchmaking uses queue `godotnr_q` and reads the exported `GameModeConfig.player_count` for
-Deathmatch at runtime. It is available only when that real configuration is four players,
-matching the independently configured queue, and uses one 600-second native ticket deadline.
-The PlayFab title must provision that matching queue in Game Manager; retuning the game mode
-without changing the queue makes Quick Match unavailable rather than silently matching a
-different cohort.
+Matchmaking uses queue `godotnr_q` and reads the exported `GameModeConfig.player_count` as the
+room/network capacity. The supported capacity remains four and each ticket has one 600-second
+native deadline. Quick Match is available only while the configured Deathmatch capacity is four.
+A ready group of one to three submits a ticket. A full group of four never submits one; it uses
+Private Start in the same lobby and network.
+
+### Supported MatchmakingQueue
+
+The provisioned queue is:
+
+```json
+{
+  "Name": "godotnr_q",
+  "MinMatchSize": 2,
+  "MaxMatchSize": 4,
+  "ServerAllocationEnabled": false,
+  "Rules": []
+}
+```
+
+See [Configuring matchmaking queues](https://learn.microsoft.com/en-us/xbox/playfab/multiplayer/matchmaking/config-queues)
+and [Matchmaking scenario and configuration examples](https://learn.microsoft.com/en-us/xbox/playfab/multiplayer/matchmaking/config-examples).
+
+This configuration permits two-, three- or four-player results as soon as compatible tickets
+exist; it does not prefer four and later expand downward. A ticket still needs at least one other
+ticket, even when its own premade already meets `MinMatchSize`. A ticket already at
+`MaxMatchSize` is rejected. The normal full-group path does not submit that ticket. If a
+maximum-sized ticket still reaches the service, its rejection remains a matchmaking result and
+never selects Private Start after the request.
+
+Preferring a full match first would require a `MatchTotalRule` with `MinOverrides` and a
+per-player count attribute. That rule, attribute, teams and server allocation are **not**
+part of this sample's supported queue.
 
 Quick Match validates the addon surface it requires before entry. Optional diagnostic fields are
 read only when present, and ordinary lobby-code search is not required for Quick Match. In particular,
 `PlayFabLobbyJoinConfig` must expose `max_member_count`, `access_policy`,
 `owner_migration_policy`, `restrict_invites_to_lobby_owner` and `member_properties`;
+`PlayFabLobbyUpdateConfig` must expose `access_policy`, `lobby_properties` and
+`search_properties`;
 `PlayFabMatchmakingMember` must expose both `user` and `attributes`; and the Lobby, Party
 network/peer and service methods used by staging, handoff, admission, updates, locks and cleanup
 must be present. `max_players` belongs to `PlayFabLobbyConfig` and is not an alias for the
 arranged join field.
 
-Build from the Sample addon revision pinned by this repository and record that revision and the
-rebuilt addon package with validation results. A gitlink by itself does not identify the loaded
-binaries; see Known issues for the current package's Matchmaking cancellation behavior.
+Build from Sample addon revision
+`442d7908ab27e18b60d047f51eb2f342efa7df1d` pinned by this repository and record the rebuilt
+addon package with validation results. A gitlink by itself does not identify the loaded binaries.
 
 ### 3. Get XBOX title and sandbox access
 

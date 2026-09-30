@@ -2,7 +2,8 @@ class_name MatchmakingFlow
 extends RefCounted
 
 ## One matchmaking attempt, from the staging lobby a group gathers in to the arranged
-## match the service puts them in.
+## match the service puts them in -- or, for a full group of four, to a private match played
+## in that same lobby, with no search at all.
 ##
 ## NetManager owns this object and remains the only place RPCs are declared; the flow
 ## owns what those RPCs mean. It holds everything that has to outlive a bound transport:
@@ -14,7 +15,8 @@ extends RefCounted
 ## Authority is the staging owner's until the match: guests adopt the owner's state through
 ## one reducer and act on their own ticket status, never on a lobby message claiming a
 ## match. From the arranged lobby on, authority is the arranged native owner's -- the
-## player whose fresh network makes it Godot peer 1, whichever premade role it had.
+## player whose fresh network makes it Godot peer 1, whichever premade role it had. A private
+## match keeps the group's own lobby, network and owner throughout.
 ##
 ## Not an autoload. It is created per attempt and dropped once its native cleanup has
 ## settled, which is what releases the lease.
@@ -46,13 +48,17 @@ enum Phase {
 	REMATCH_GATHERING,
 	LEAVING,
 	QUARANTINED,
+	# Appended, never inserted: these values cross the wire in the phase messages.
+	PRIVATE_PREPARING,
 }
 
 enum Role { OWNER, GUEST }
 
-## Staging lobby, staging Party network, activity and roster all hold four. A full group
-## of four is submitted as one ticket like any smaller group; see docs/known-issues.md
-## for why the fixed-four queue then rejects it.
+## Staging lobby, staging and arranged Party networks, activity and roster all hold four. A
+## match itself starts with the players who have arrived -- two, three or four -- and never
+## waits for a fixed count; see `selected_keys`. A full group of four never searches: the
+## queue takes no ticket that is already at its maximum, so once all four are ready they
+## start a private match in the same lobby instead (see PRIVATE_PREPARING).
 const CAPACITY := 4
 
 ## Phase budgets. Each is an absolute deadline taken when its phase begins; inner
@@ -67,6 +73,9 @@ const HANDOFF_SECONDS := 90.0
 const OWNER_TRANSPORT_SECONDS := 30.0
 const COMMIT_SECONDS := 30.0
 const HOST_RETURN_SECONDS := 45.0
+## A full group's private start: its freeze, lock, every member's acknowledgement and the
+## checked switch of the same lobby to a private match, on one budget that never renews.
+const PRIVATE_PREPARE_SECONDS := 15.0
 const POLL_SECONDS := 0.1
 
 ## Search-control envelope phases. PartyService owns the encoding; these are the values.
@@ -75,6 +84,7 @@ const ENVELOPE_FREEZING := "freezing"
 const ENVELOPE_SEARCHING := "searching"
 const ENVELOPE_CANCELLING := "cancelling"
 const ENVELOPE_MATCHED := "matched"
+const ENVELOPE_PRIVATE := "private"
 
 ## Session phases published with a transport descriptor.
 const SESSION_PHASE_GATHERING := "gathering"
@@ -87,6 +97,9 @@ const REASON_MEMBER_LEFT := &"member_left"
 const REASON_GUEST_JOIN_FAILED := &"guest_join_failed"
 const REASON_NO_MATCH := &"no_match"
 const REASON_SEARCH_FAILED := &"search_failed"
+const REASON_PRIVATE_GROUP_CHANGED := &"private_group_changed"
+const REASON_PRIVATE_FAILED := &"private_start_failed"
+const REASON_PRIVATE_CANCELLED := &"private_start_cancelled"
 
 const TEXT_CANCELLED := "The search was cancelled."
 const TEXT_GROUP_CHANGED := "The group changed, so the search was stopped. Press Ready to search again."
@@ -112,6 +125,15 @@ const TEXT_GROUP_NOT_RETIRED := "The previous group could not be left cleanly."
 const TEXT_OLD_NETWORK_NOT_LEFT := "The previous group's connection could not be closed."
 const TEXT_GROUP_HOST_LEFT := "The group host left or is no longer available, so the group was closed."
 const TEXT_MATCH_ABANDONED := "A match was found just as the search stopped, so the group was closed."
+const TEXT_MATCH_ALREADY_STARTED := "This match is already starting or in progress. Return to Matchmaking to search again."
+const TEXT_MATCH_JOIN_UNPROVEN := "This match could not be joined. It may already have started. Return to Matchmaking to search again."
+const TEXT_MATCH_FULL := "This match is already full. Return to Matchmaking to search again."
+const TEXT_MATCH_HOST_LEFT := "The match host left before the match began."
+const TEXT_GROUP_SEARCHING := "That matchmaking group has already started searching."
+const TEXT_PRIVATE_GROUP_CHANGED := "The group changed, so the private match was not started. Press Ready to try again."
+const TEXT_PRIVATE_FAILED := "The private match could not be started. Press Ready to try again."
+const TEXT_PRIVATE_CANCELLED := "The private match was cancelled."
+const TEXT_PRIVATE_NOT_STARTED := "The private match could not be started."
 
 ## Phases in which a ticket can still be searching, stopping or being let go of: a native
 ## match on a ticket this group already released is judged against these.
@@ -125,6 +147,7 @@ const _PRE_MATCH_PHASES := [
 const ENTRY_STAGING_OWNER := &"staging_owner"
 const ENTRY_STAGING_GUEST := &"staging_guest"
 const ENTRY_ARRANGED_REMATCH := &"arranged_rematch"
+const ENTRY_PRIVATE_REMATCH := &"private_rematch"
 
 ## Same-epoch order of a guest's staging state. Within one attempt the owner only moves
 ## forward -- frozen, searching, cancelling, restoring, restored -- so an older lobby
@@ -176,8 +199,8 @@ var cancel_unresolved := false
 var cleanup_error := ""
 ## Set once this member's arranged join has succeeded and a staging-transport loss is
 ## expected rather than fatal. See NetManager._on_server_disconnected(). It says nothing
-## about the staging *lobby*: arming does not prove the cohort barrier, so a lost lobby
-## still ends the group until the flow's own owned leave of it has begun.
+## about the staging *lobby*: arming does not prove this member's premade has arrived, so a
+## lost lobby still ends the group until the flow's own owned leave of it has begun.
 var armed := false
 var staging_reset := false
 ## Set immediately before this flow's owned leave_lobby of its staging lobby is invoked,
@@ -190,7 +213,7 @@ var staging_retiring := false
 ## pointer or a caller timeout is not this.
 var staging_retired := false
 ## Set once this member's `nr_staging_retired` marker is in the arranged lobby. The arranged
-## owner commits the first match only once every sealed member carries it.
+## owner starts the first match only once every member it starts with carries it.
 var retirement_reported := false
 var admission_request: JoinRequest = null
 var search_deadline_msec := 0
@@ -198,10 +221,9 @@ var phase_deadline_msec := 0
 var retired := false
 var native_release_started := false
 var native_release_finished := false
-## Players per match for this flow's mode, as the service validated it from the mode's
-## real configuration when the flow started. Tickets are built from a fresh validation;
-## this is what the flow was admitted with.
-var match_size := CAPACITY
+## Players the staging and arranged sessions hold, as the service validated it from the mode's
+## real configuration when the flow started. A ceiling, never the number a match waits for.
+var capacity := CAPACITY
 ## How this flow began; see ENTRY_*.
 var entry_kind: StringName = ENTRY_STAGING_OWNER
 ## The owner's 45-second establishment budget, taken before its first awaited work.
@@ -211,12 +233,33 @@ var entry_deadline_msec := 0
 var synced := false
 ## The arranged session's round: 0 for the matched game, then one more at each return.
 var match_round := 0
-## The four arranged members the handoff sealed. The initial start admits exactly these.
-var pinned_keys: Array[Dictionary] = []
+## The players the first match starts with: chosen by the arranged host from the members
+## who had arrived and were ready when it started, two to four of them, and published in the
+## arranged lobby. Not the service's complete match -- later arrivals are simply not in it.
+## Empty until the host selects it, and fixed from then until the first match runs.
+var selected_keys: Array[Dictionary] = []
+## The host's start attempt for the first match: 0 while players are still arriving, 1 once
+## the set above is chosen. Published with the set so a late or stale view is told apart.
+var start_generation := 0
 ## The arranged owner has returned to the lobby for a rematch; a guest waiting for it is
 ## told so by the arranged lobby, not by a message.
 var host_returned := false
 var last_admission_error := ""
+## The play session -- the lobby, network and roster the games are played in until the group
+## leaves -- once there is one: its origin (PartyService.PLAY_ORIGIN_MATCHMADE for the arranged
+## lobby, PLAY_ORIGIN_PRIVATE for the group's own lobby after a private start), its lobby
+## context, its identity (the service's match id, or the id this group's owner generated for a
+## private match -- never one for the other) and the owner every member answers to there.
+var session_origin: StringName = &""
+var play_context: Variant = null
+var session_id := ""
+var play_owner: Dictionary = {}
+## The owner's Gathering composition -- the identities of its admitted players -- and, per
+## member, the Gathering epoch it last acknowledged. A member's Ready counts only while its
+## acknowledgement is the current epoch: a change of who is in the group asks for new consent.
+var gathering_acks: Dictionary = {}
+## Members that have read and acknowledged the private start's published control: peer -> true.
+var commit_acks: Dictionary = {}
 
 var _clock: OnlineFlowClock = null
 var _restoring := false
@@ -242,12 +285,17 @@ var _stage := _STAGE_NONE
 var _acked_epoch := 0
 var _joined_epoch := 0
 var _budget_epoch := -1
-## The single state-sync request a guest may have in flight.
+## The single state-sync request a guest may have in flight, and the deadline it was sent with.
+## Its answer not taken while the owner could not be proven is noted, so a private start's member
+## can ask again once -- on what is left of that same deadline.
 var _sync_request_id := 0
 var _sync_pending_id := 0
 var _sync_sent_msec := 0
 var _sync_purpose: StringName = &""
 var _sync_alarm: OnlineFlowClock.Alarm = null
+var _sync_deadline_msec := 0
+var _sync_answer_missed := false
+var _sync_reissued := false
 ## Arranged members seen connected during the handoff, so one disappearing is a loss and
 ## not merely incomplete replication.
 var _seen_connected: Dictionary = {}
@@ -259,6 +307,29 @@ var _owned_leave_token := 0
 var _owned_leave_pending := false
 var _owned_leave_result: Variant = null
 var _owned_leave_alarm: OnlineFlowClock.Alarm = null
+## The fingerprint of the owner's Gathering composition, as last recorded.
+var _composition := ""
+## The epoch whose Gathering this guest last acknowledged.
+var _gathering_acked_epoch := -1
+## Set once the owner's private start has asked PartyService to switch the lobby: from then on
+## the transaction finishes or fails within its budget, and Cancel no longer applies. A stop
+## asked for meanwhile is kept for the transaction to act on after its await.
+var _promoting := false
+var _private_stop: Dictionary = {}
+## A guest's private start: the session id it read from the owner's published control, the
+## epoch it acknowledged that control for, and its own bound on the owner's preparation.
+var _adopted_session_id := ""
+var _commit_ack_epoch := 0
+var _private_bound_alarm: OnlineFlowClock.Alarm = null
+## A private start's guest: whether the private match's first STARTING has been applied here, and
+## whether a message from the owner went untaken while the owner could not be proven -- the
+## current state is then asked for once the owner is proven again, within this member's bound.
+var initial_start_seen := false
+var _private_catch_up_wanted := false
+## The four a private match started with, by identity, and the session they started it under.
+## Fixed at the commit and kept for as long as that session lasts, whatever the rounds after it.
+var private_members: Dictionary = {}
+var private_members_session := ""
 
 
 func _init(flow_id: int, flow_role: Role, generation: int, entry: int, flow_mode: NRTypes.GameModeType, clock: OnlineFlowClock) -> void:
@@ -297,7 +368,7 @@ func is_frozen() -> bool:
 		Phase.FREEZING, Phase.CREATING_TICKET, Phase.JOINING_TICKET, Phase.SEARCHING,
 		Phase.CANCELLING, Phase.RESTORING_STAGING, Phase.MATCHED, Phase.JOINING_ARRANGED,
 		Phase.ARMING_HANDOFF, Phase.SWITCHING_TRANSPORT, Phase.ADMITTING_COHORT,
-		Phase.COMMITTING_START,
+		Phase.COMMITTING_START, Phase.PRIVATE_PREPARING,
 	]
 
 
@@ -320,16 +391,17 @@ func is_searching() -> bool:
 	return phase in [Phase.FREEZING, Phase.CREATING_TICKET, Phase.JOINING_TICKET, Phase.SEARCHING, Phase.CANCELLING]
 
 
-## Whether the hosted-return "reopen the lobby" path may run. Only an arranged rematch
-## reopens; a staging lobby is reopened by its own restoration transaction and never by a
-## screen being rebuilt mid-search.
+## Whether the hosted-return "reopen the lobby" path may run. Only a play session's rematch
+## round reopens; a staging lobby is reopened by its own restoration transaction and never by
+## a screen being rebuilt mid-search.
 func allows_reopen() -> bool:
 	return phase == Phase.REMATCH_GATHERING
 
 
 ## The social activity this member should publish now. The flow's veto comes first: a
-## freezing, searching, bootstrapping or leaving session is never advertised, whatever the
-## local admission gate says and even across an activity handover.
+## freezing, searching, bootstrapping, privately starting or leaving session is never
+## advertised, whatever the local admission gate says and even across an activity handover. A
+## rematch round advertises the play session's own lobby, invite-only, whichever route made it.
 func social_snapshot(session_open: bool) -> Dictionary:
 	var snapshot := {
 		"joinable": false,
@@ -344,7 +416,7 @@ func social_snapshot(session_open: bool) -> Dictionary:
 			if not restoration_failed:
 				context = staging_context
 		Phase.REMATCH_GATHERING:
-			context = arranged_context
+			context = play_context
 			snapshot["audience"] = ActivityService.AUDIENCE_INVITE_ONLY
 	var party: PartyService = Services.party() if Services != null else null
 	if context == null or party == null:
@@ -364,14 +436,18 @@ func presentation() -> Dictionary:
 		"owner": role == Role.OWNER,
 		"entry_kind": String(entry_kind),
 		"arranged_host": arranged_owner,
-		"capacity": CAPACITY,
-		"match_size": match_size,
+		"capacity": capacity,
+		"selected_count": selected_keys.size(),
 		"round": match_round,
 		"synced": is_synced(),
 		"host_returned": host_returned,
 		"searching": is_searching(),
 		"frozen": is_frozen(),
-		"cancellable": role == Role.OWNER and phase in [Phase.FREEZING, Phase.CREATING_TICKET, Phase.SEARCHING],
+		"origin": String(session_origin),
+		"private": is_private_route(),
+		"private_outcome": reason_code in [REASON_PRIVATE_GROUP_CHANGED, REASON_PRIVATE_FAILED, REASON_PRIVATE_CANCELLED],
+		"cancellable": role == Role.OWNER and (phase in [Phase.FREEZING, Phase.CREATING_TICKET, Phase.SEARCHING]
+			or (phase == Phase.PRIVATE_PREPARING and not _promoting)),
 		"reason": reason,
 		"reason_code": String(reason_code),
 		"reason_epoch": reason_epoch,
@@ -382,20 +458,26 @@ func presentation() -> Dictionary:
 	}
 
 
+## Whether this group is on its way into, or already in, a private match: the private start
+## being prepared, or a play session whose origin is private.
+func is_private_route() -> bool:
+	return phase == Phase.PRIVATE_PREPARING or session_origin == PartyService.PLAY_ORIGIN_PRIVATE
+
+
 ## Records that a member's screen has shown this epoch's outcome, so a rebuilt screen
 ## does not show it twice.
 func mark_reason_presented(presented_epoch: int) -> void:
 	presented_reason_epoch = maxi(presented_reason_epoch, presented_epoch)
 
 
-## The lobby contexts this flow still holds, arranged first so the newer resource is
-## released before the one it replaced.
+## The lobby contexts this flow still holds, the play session's first so the newer resource is
+## released before the one it replaced. A private match's lobby is the group's own: it is held,
+## and released, once.
 func held_contexts() -> Array:
 	var contexts: Array = []
-	if arranged_context != null:
-		contexts.append(arranged_context)
-	if staging_context != null and staging_context != arranged_context:
-		contexts.append(staging_context)
+	for context: Variant in [play_context, arranged_context, staging_context]:
+		if context != null and not contexts.has(context):
+			contexts.append(context)
 	return contexts
 
 
@@ -485,6 +567,7 @@ func start_owner() -> bool:
 	if published == null or not published.ok():
 		NetManager._flow_start_failed(self, _result_reason(published, "Could not open the matchmaking lobby."))
 		return false
+	_record_composition()
 	_set_phase(Phase.GATHERING)
 	NetManager._flow_session_opened(self)
 	return true
@@ -539,29 +622,62 @@ func start_rematch_guest(context: Variant, arranged_match_id: String, arranged_r
 	match_round = maxi(arranged_round, 0)
 	arranged_owner_key = entity_key(owner_key)
 	arranged_owner = false
+	_enter_matchmade_session()
 	host_returned = true
 	synced = true
 	_set_phase(Phase.REMATCH_GATHERING)
 
 
+## A replacement invited into a private match's rematch round. It holds that match's lobby as
+## its play session -- never as a group's staging lobby -- joins no ticket and no arrangement,
+## and is a guest of the private match's owner for the session the invitation named.
+func start_private_rematch_guest(context: Variant, private_session_id: String, play_round: int, owner_key: Dictionary) -> void:
+	entry_kind = ENTRY_PRIVATE_REMATCH
+	play_context = context
+	arranged_context = null
+	staging_context = null
+	staging_session = 0
+	session_origin = PartyService.PLAY_ORIGIN_PRIVATE
+	session_id = private_session_id
+	match_round = maxi(play_round, 0)
+	play_owner = entity_key(owner_key)
+	host_returned = true
+	synced = true
+	_set_phase(Phase.REMATCH_GATHERING)
+
+
+## The arranged lobby becomes the play session, identified by the service's match id.
+func _enter_matchmade_session() -> void:
+	play_context = arranged_context
+	session_origin = PartyService.PLAY_ORIGIN_MATCHMADE
+	session_id = match_id
+	play_owner = arranged_owner_key.duplicate()
+
+
 # --- Gathering and the ready transaction -------------------------------------
 
-## Called on every roster or lobby change. The owner starts a search the moment the exact
-## admitted group is ready; during a search the same signals are how divergence is caught.
-## The staging owner is the lobby's actual native owner; losing that is terminal, because a
-## NONE-migration lobby does not stop another member from claiming it.
+## Called on every roster or lobby change. The owner starts a search -- or, for a full group,
+## a private match -- the moment the exact admitted group is ready; during either the same
+## signals are how divergence is caught. In Gathering a change of who is in the group is
+## recorded first, and asks for fresh consent (see _note_composition()). The staging owner is
+## the lobby's actual native owner; losing that is terminal, because a NONE-migration lobby
+## does not stop another member from claiming it.
 func on_group_changed() -> void:
 	if not is_current() or role != Role.OWNER:
 		return
-	if phase in [Phase.GATHERING, Phase.FREEZING, Phase.CREATING_TICKET, Phase.SEARCHING] \
+	if phase in [Phase.GATHERING, Phase.FREEZING, Phase.CREATING_TICKET, Phase.SEARCHING, Phase.PRIVATE_PREPARING] \
 			and _staging_owner_lost():
 		NetManager._flow_fail(self, TEXT_OWNER_CHANGED)
 		return
 	if phase == Phase.GATHERING:
+		_note_composition()
 		evaluate_ready()
 		return
 	if phase in [Phase.FREEZING, Phase.CREATING_TICKET, Phase.SEARCHING] and not _group_intact():
 		_stop_search(REASON_GROUP_CHANGED, TEXT_GROUP_CHANGED)
+		return
+	if phase == Phase.PRIVATE_PREPARING and not _group_intact():
+		_stop_private(REASON_PRIVATE_GROUP_CHANGED, TEXT_PRIVATE_GROUP_CHANGED)
 
 
 ## A replicated owner that is someone else. An owner not replicated yet is not a loss.
@@ -574,17 +690,26 @@ func _staging_owner_lost() -> bool:
 	return not owner.is_empty() and not bool(snapshot.get("is_local_owner", false))
 
 
-## Starts the freeze once every admitted human is ready. A group of one to four takes the
-## same path; four is not refused here or privately started.
+## The one dispatcher. Once every admitted human is ready -- each member's Ready given to the
+## group as it is now -- a group of one to three freezes for a search, and a full group of four
+## starts a private match in this same lobby instead: no search, no ticket and no new lobby or
+## network. Nobody chooses between the two; the group's size does, here, once, and the route
+## taken is never switched mid-await. A full group whose earlier search still owes native
+## cleanup waits for it, and is looked at again once the service reports that cleanup changed.
 func evaluate_ready() -> void:
 	if role != Role.OWNER or phase != Phase.GATHERING or _restoring or restoration_failed:
 		return
 	if not is_current():
 		return
 	var group := admitted_group()
-	if group.is_empty() or not _all_ready():
+	if group.is_empty() or not _all_ready() or not _all_consented(group):
 		return
-	_freeze(group)
+	if group.size() < CAPACITY:
+		_freeze(group)
+		return
+	if _cleanup_outstanding():
+		return
+	_prepare_private(group)
 
 
 ## The admitted group, peer id -> full entity key, when it equals the connected native
@@ -633,6 +758,68 @@ func _all_ready() -> bool:
 		if state == null or state.is_bot or not state.is_ready:
 			return false
 	return true
+
+
+## Whether every admitted member's readiness was given to the group as it is now.
+func _all_consented(group: Dictionary) -> bool:
+	for peer_id: int in group:
+		if not gathering_consented(peer_id):
+			return false
+	return true
+
+
+## Whether `peer_id`'s Ready counts now. Outside the owner's Gathering every Ready is judged by
+## the ordinary rules; in it, the owner's own always counts and a member's only while its last
+## acknowledgement is the current epoch.
+func gathering_consented(peer_id: int) -> bool:
+	if role != Role.OWNER or phase != Phase.GATHERING:
+		return true
+	if peer_id == NetManager.local_peer_id():
+		return true
+	return int(gathering_acks.get(peer_id, -1)) == epoch
+
+
+## Records the Gathering composition as it is now, with no new epoch: at entry, and on a return
+## to Gathering whose own attempt number already asks every member for fresh consent.
+func _record_composition() -> void:
+	_composition = _composition_fingerprint()
+	gathering_acks.clear()
+
+
+## A change of who is in the gathering group -- a join, a departure, one member swapped for
+## another -- asks for fresh consent. The attempt number moves on, every human is unready
+## again, the change is broadcast, and a Ready counts only from a member that has acknowledged
+## it: readiness given to a group of four is never consent to search with three. A member's
+## lobby connection coming and going is not such a change; it only holds the start until the
+## group is whole again.
+func _note_composition() -> void:
+	var current := _composition_fingerprint()
+	if current == _composition:
+		return
+	# Recorded before anything is reset, so the roster updates the reset raises find no change.
+	epoch += 1
+	_composition = current
+	gathering_acks.clear()
+	NetManager._flow_reset_readiness()
+	NetManager._flow_broadcast_phase(self, {})
+	changed.emit()
+
+
+## Who is in the group now, as one string: every admitted human's identity, sorted.
+func _composition_fingerprint() -> String:
+	var party := Services.party()
+	var marks := PackedStringArray()
+	var local_id := NetManager.local_peer_id()
+	for peer_id: int in NetManager.players:
+		var state: PlayerState = NetManager.players[peer_id]
+		if state == null or state.is_bot:
+			continue
+		var key: Dictionary = {}
+		if party != null:
+			key = entity_key(party.local_entity_key(staging_context) if peer_id == local_id else party.entity_key_for(peer_id))
+		marks.append(fingerprint(key) if not key.is_empty() else "peer:%d" % peer_id)
+	marks.sort()
+	return "\u001e".join(marks)
 
 
 ## The frozen group is still exactly the group in the lobby -- the admitted roster and
@@ -726,12 +913,24 @@ func _is_staging_owner() -> bool:
 	return bool(party.snapshot(staging_context).get("is_local_owner", false))
 
 
-## A member acknowledged the freeze, or asked for the search to stop.
+## A member's report to the owner for the current epoch: its acknowledgement of the group's
+## Gathering composition, of a freeze, of a private start being prepared or of that start's
+## published control -- or its request to stop the search.
 func on_member_report(sender: int, report_epoch: int, reported_phase: int) -> void:
-	if role != Role.OWNER or not is_current() or report_epoch != epoch or not frozen_peers.has(sender):
+	if role != Role.OWNER or not is_current() or report_epoch != epoch:
+		return
+	if reported_phase == Phase.GATHERING:
+		if phase == Phase.GATHERING and NetManager.players.has(sender):
+			gathering_acks[sender] = report_epoch
+		return
+	if not frozen_peers.has(sender):
 		return
 	if reported_phase == Phase.FREEZING and phase == Phase.FREEZING:
 		acks[sender] = true
+	elif reported_phase == Phase.PRIVATE_PREPARING and phase == Phase.PRIVATE_PREPARING:
+		acks[sender] = true
+	elif reported_phase == Phase.COMMITTING_START and phase == Phase.PRIVATE_PREPARING:
+		commit_acks[sender] = true
 	elif reported_phase == Phase.CANCELLING:
 		_stop_search(REASON_GUEST_JOIN_FAILED, TEXT_GUEST_JOIN_FAILED)
 
@@ -742,6 +941,250 @@ func on_member_leave(sender: int, leave_epoch: int) -> void:
 		return
 	if leave_epoch == epoch and is_searching():
 		_stop_search(REASON_MEMBER_LEFT, TEXT_MEMBER_LEFT)
+
+
+# --- Private Start: a full group plays in its own lobby ------------------------------
+#
+# A full group of four cannot search: the queue takes no ticket that is already at its maximum.
+# Once all four are ready their owner switches the same lobby to a private match instead, as
+# one transaction on a 15-second budget that never renews. The group freezes and every member
+# acknowledges; the lobby is locked; everything is read again; and PartyService switches the
+# lobby -- same lobby, same network, same players, no ticket -- and reads the switch back. Every
+# member then reads the private match's control from the lobby and acknowledges it, and only
+# then is the start committed: the lobby becomes the play session, and the first match starts
+# with exactly those four through the ordinary STARTING path, on its own 30-second budget.
+#
+# Nothing here falls back to a search. A failure before the switch was asked for restores the
+# group the way a stopped search does. Once it was asked for, only PartyService can prove the
+# lobby back to the group's Gathering state; an answer it cannot prove ends the group through
+# the ordinary cleanup.
+
+func _prepare_private(group: Dictionary) -> void:
+	# Re-entry is closed by the phase itself, as for the search: it leaves GATHERING before
+	# the first await, and only evaluate_ready() starts it, only from GATHERING.
+	epoch += 1
+	var attempt := epoch
+	acks.clear()
+	commit_acks.clear()
+	cancel_unresolved = false
+	_promoting = false
+	_private_stop = {}
+	frozen_peers = group.duplicate(true)
+	frozen_keys.clear()
+	for peer_id: int in frozen_peers:
+		frozen_keys.append((frozen_peers[peer_id] as Dictionary).duplicate())
+	frozen_keys.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return fingerprint(a) < fingerprint(b))
+	phase_deadline_msec = _clock.deadline_after(PRIVATE_PREPARE_SECONDS)
+	_clear_reason()
+	_set_phase(Phase.PRIVATE_PREPARING)
+	# The local gate closes before anything is awaited, and every member is told in the same
+	# frame: they freeze, hold their readiness, retire their own activity and acknowledge.
+	NetManager._flow_set_admission(false)
+	NetManager._flow_broadcast_phase(self, {})
+	var party := Services.party()
+	var posted: PartyService.PartyResult = await party.post_context_update(
+		staging_context, {PartyService.SEARCH_CONTROL_KEY: _envelope(ENVELOPE_PRIVATE, "")},
+		{}, {}, phase_deadline_msec)
+	if not _private_current(attempt):
+		return
+	if posted == null or not posted.ok():
+		await _restore(REASON_PRIVATE_FAILED, TEXT_PRIVATE_FAILED)
+		return
+	var locked: PartyService.PartyResult = await party.set_context_locked(staging_context, true, phase_deadline_msec)
+	if not _private_current(attempt):
+		return
+	if locked == null or not locked.ok() or not bool(party.snapshot(staging_context).get("membership_locked", false)):
+		await _restore(REASON_PRIVATE_FAILED, TEXT_PRIVATE_FAILED)
+		return
+	while not _acks_complete():
+		if _clock.has_expired(phase_deadline_msec):
+			await _restore(REASON_PRIVATE_FAILED, TEXT_PRIVATE_FAILED)
+			return
+		await _clock.sleep_seconds(minf(POLL_SECONDS, _clock.remaining_seconds(phase_deadline_msec)))
+		if not _private_current(attempt):
+			return
+	# Read again after every await: the group, its readiness, its owner, the mode's settings and
+	# any ticket cleanup can all have moved while the lock and the acknowledgements were out.
+	var problem := _private_problem()
+	if not problem.is_empty():
+		await _restore(StringName(problem.get("code", REASON_PRIVATE_FAILED)), String(problem.get("text", TEXT_PRIVATE_FAILED)))
+		return
+	_promoting = true
+	changed.emit()
+	var candidate := _new_private_session_id()
+	var promoted: PartyService.PartyResult = await party.promote_staging_to_private(
+		staging_context, candidate, frozen_keys, phase_deadline_msec)
+	_hold_operation(promoted)
+	if not _private_current(attempt):
+		return
+	if promoted == null or not promoted.ok():
+		# The service's own code goes to the log; the players read this title's words.
+		push_warning("[Matchmaking] private_start_not_switched flow=%d code=%s" % [
+			id, String(promoted.reason_code) if promoted != null else "none"])
+		var failed := _private_failure()
+		await _restore_private(candidate, StringName(failed.get("code", REASON_PRIVATE_FAILED)), String(failed.get("text", TEXT_PRIVATE_FAILED)))
+		return
+	var read_back := String(promoted.private_session_id)
+	if read_back != candidate:
+		await _restore_private(candidate, REASON_PRIVATE_FAILED, TEXT_PRIVATE_FAILED)
+		return
+	# Every member reads the private match's control from the lobby and acknowledges it, inside
+	# the same budget, before anything is committed.
+	while not _commit_acks_complete():
+		problem = _private_problem()
+		if not problem.is_empty():
+			await _restore_private(candidate, StringName(problem.get("code", REASON_PRIVATE_FAILED)), String(problem.get("text", TEXT_PRIVATE_FAILED)))
+			return
+		await _clock.sleep_seconds(minf(POLL_SECONDS, _clock.remaining_seconds(phase_deadline_msec)))
+		if not _private_current(attempt):
+			return
+	problem = _private_problem()
+	if not problem.is_empty():
+		await _restore_private(candidate, StringName(problem.get("code", REASON_PRIVATE_FAILED)), String(problem.get("text", TEXT_PRIVATE_FAILED)))
+		return
+	_commit_private(read_back)
+
+
+func _private_current(attempt: int) -> bool:
+	return is_current() and epoch == attempt and phase == Phase.PRIVATE_PREPARING
+
+
+## What stands between this private start and its next step, as the reason its restoration
+## keeps, or empty: a stop asked for meanwhile, the group changed or no longer all ready, this
+## player no longer the lobby's owner, the mode's settings refused, a ticket's cleanup still
+## owed, or the budget spent.
+func _private_problem() -> Dictionary:
+	if not _private_stop.is_empty():
+		return _private_stop
+	if not _same_group(admitted_group(), frozen_peers) or not _all_ready():
+		return {"code": REASON_PRIVATE_GROUP_CHANGED, "text": TEXT_PRIVATE_GROUP_CHANGED}
+	if not _is_staging_owner():
+		return {"code": REASON_PRIVATE_FAILED, "text": TEXT_PRIVATE_FAILED}
+	var matchmaking: MatchmakingService = Services.matchmaking() if Services != null else null
+	var profile: Dictionary = matchmaking.runtime_profile(mode) if matchmaking != null else {}
+	if not bool(profile.get("ok", false)):
+		return {"code": _profile_code(profile), "text": _profile_text(profile)}
+	if int(profile.get("capacity", 0)) != CAPACITY:
+		return {"code": REASON_PRIVATE_FAILED, "text": TEXT_PROFILE_CHANGED}
+	if _cleanup_outstanding() or _clock.has_expired(phase_deadline_msec):
+		return {"code": REASON_PRIVATE_FAILED, "text": TEXT_PRIVATE_FAILED}
+	return {}
+
+
+## Why a switch that did not succeed is being undone: what stood in its way, if anything did,
+## or that the private match could not be started.
+func _private_failure() -> Dictionary:
+	var problem := _private_problem()
+	if problem.is_empty():
+		return {"code": REASON_PRIVATE_FAILED, "text": TEXT_PRIVATE_FAILED}
+	return problem
+
+
+func _commit_acks_complete() -> bool:
+	var local_id := NetManager.local_peer_id()
+	for peer_id: int in frozen_peers:
+		if peer_id != local_id and not commit_acks.has(peer_id):
+			return false
+	return true
+
+
+## A fresh identity for one private match: 32 lowercase hexadecimal characters from 16 random
+## bytes. It names the session and never stands in for a match the service arranged.
+static func _new_private_session_id() -> String:
+	var random := RandomNumberGenerator.new()
+	random.randomize()
+	var bytes := PackedByteArray()
+	bytes.resize(16)
+	for index in bytes.size():
+		bytes[index] = random.randi_range(0, 255)
+	return bytes.hex_encode()
+
+
+## The private start is committed. The group's own lobby becomes the play session -- held once,
+## as the play context, and never again as a staging lobby -- identified by the id its switch
+## read back, and its first match starts with exactly the four who readied.
+func _commit_private(read_back: String) -> void:
+	play_context = staging_context
+	staging_context = null
+	session_origin = PartyService.PLAY_ORIGIN_PRIVATE
+	session_id = read_back
+	var party := Services.party()
+	play_owner = entity_key(party.local_entity_key(play_context)) if party != null else {}
+	match_round = 0
+	selected_keys = frozen_keys.duplicate(true)
+	start_generation = 1
+	host_returned = true
+	_promoting = false
+	_record_private_members()
+	_set_phase(Phase.COMMITTING_START)
+	NetManager._flow_commit_private_start(self)
+
+
+## Records the four this private session started with, once, for as long as the session lasts.
+func _record_private_members() -> void:
+	if not private_members_session.is_empty():
+		return
+	private_members = {}
+	for key: Dictionary in frozen_keys:
+		private_members[fingerprint(key)] = true
+	private_members_session = session_id
+
+
+## Whether `key` is one of the four this private session started with -- for this session only.
+func is_private_member(key: Dictionary) -> bool:
+	return session_origin == PartyService.PLAY_ORIGIN_PRIVATE and not session_id.is_empty() \
+		and private_members_session == session_id and not key.is_empty() \
+		and private_members.has(fingerprint(key))
+
+
+## Stops a private start that has not asked for the lobby's switch yet: the group is restored
+## the way a stopped search is. Once the switch is under way the stop is only kept; the
+## transaction acts on it after its await, through PartyService's own restoration.
+func _stop_private(code: StringName, text: String) -> void:
+	if role != Role.OWNER or not is_current() or phase != Phase.PRIVATE_PREPARING:
+		return
+	if _promoting:
+		if _private_stop.is_empty():
+			_private_stop = {"code": code, "text": text}
+		return
+	_restore(code, text)
+
+
+## A private start whose switch was asked for but that did not commit. PartyService alone can
+## prove the lobby back to the group's Gathering state -- or that it cannot -- so it is asked
+## whatever the switch answered, and only its confirmed answer reopens anything: then every
+## member is unready, the reason is kept, and admission and activity reopen, exactly as after a
+## stopped search. An answer it cannot prove ends the group through the ordinary cleanup.
+func _restore_private(candidate: String, code: StringName, text: String) -> void:
+	if role != Role.OWNER or not is_current() or _restoring:
+		return
+	_restoring = true
+	_promoting = false
+	_private_stop = {}
+	var restoring_epoch := epoch
+	_record_reason(code, text)
+	_set_phase(Phase.RESTORING_STAGING)
+	NetManager._flow_broadcast_phase(self, {"reason_code": String(code), "reason": text})
+	var party := Services.party()
+	var restored: PartyService.PartyResult = await party.restore_private_to_gathering(
+		staging_context, candidate, _envelope(ENVELOPE_GATHERING, ""), _clock.deadline_after(RESTORE_SECONDS))
+	_hold_operation(restored)
+	if not _restore_current(restoring_epoch):
+		return
+	_restoring = false
+	if restored == null or not restored.ok():
+		push_warning("[Matchmaking] private_start_not_restored flow=%d code=%s" % [
+			id, String(restored.reason_code) if restored != null else "none"])
+		NetManager._flow_fail(self, TEXT_PRIVATE_NOT_STARTED)
+		return
+	NetManager._flow_reset_readiness()
+	restoration_failed = false
+	_record_composition()
+	# Gathering is set before the gate opens, so the admission signal already sees a joinable
+	# phase and every activity is republished from one consistent state.
+	_set_phase(Phase.GATHERING)
+	NetManager._flow_set_admission(true)
+	NetManager._flow_broadcast_phase(self, {"reason_code": String(code), "reason": text})
 
 
 # --- Ticket lifecycle -------------------------------------------------------
@@ -768,7 +1211,7 @@ func _begin_ticket(attempt: int) -> void:
 	spec.owner = true
 	spec.frozen_members.assign(frozen_keys)
 	spec.mode = mode
-	spec.expected_match_count = int(profile.get("player_count", 0))
+	spec.capacity = int(profile.get("capacity", 0))
 	spec.deadline_msec = search_deadline_msec
 	_watch_ticket(matchmaking.begin_create(spec), attempt)
 
@@ -827,7 +1270,7 @@ func _reconcile_guest_ticket() -> void:
 	spec.owner = false
 	spec.frozen_members.assign(members)
 	spec.mode = mode
-	spec.expected_match_count = int(profile.get("player_count", 0))
+	spec.capacity = int(profile.get("capacity", 0))
 	spec.deadline_msec = search_deadline_msec
 	spec.ticket_id = ticket_id
 	_watch_ticket(matchmaking.begin_join(spec), epoch)
@@ -1087,8 +1530,14 @@ func _stop_search(code: StringName, text: String) -> void:
 			_cancel_and_restore(code, text)
 
 
-## The owner's Cancel Search.
+## The owner's Cancel. A search stops once the service confirms; a private start stops only
+## while it has not yet asked for the lobby's switch -- after that it finishes or fails within
+## its own budget.
 func cancel_search() -> void:
+	if phase == Phase.PRIVATE_PREPARING:
+		if not _promoting:
+			_stop_private(REASON_PRIVATE_CANCELLED, TEXT_PRIVATE_CANCELLED)
+		return
 	_stop_search(REASON_CANCELLED, TEXT_CANCELLED)
 
 
@@ -1104,19 +1553,30 @@ func _cancel_and_restore(code: StringName, text: String) -> void:
 		party.post_context_update(staging_context, {PartyService.SEARCH_CONTROL_KEY: _envelope(ENVELOPE_CANCELLING, "")}, {}, {}, _clock.deadline_after(CANCEL_GRACE_SECONDS))
 	Services.matchmaking().request_cancel(ticket)
 	# Cancellation is confirmed by the ticket, not by this request. The grace below only
-	# decides when the lobby admits that confirmation is taking a while.
+	# decides when the lobby admits that confirmation is taking a while. A match the service
+	# has already observed on this ticket ends the group here even while the cancel's own
+	# answer is still outstanding -- the ticket's native status is enough, and the stop stays
+	# binding -- so an answer that never comes cannot keep the group waiting on it.
 	var cancelling_epoch := epoch
-	await _clock.sleep_seconds(CANCEL_GRACE_SECONDS)
-	if is_current() and epoch == cancelling_epoch and phase == Phase.CANCELLING:
-		cancel_unresolved = true
-		changed.emit()
+	var cancelling: Variant = ticket
+	var grace_ends := _clock.deadline_after(CANCEL_GRACE_SECONDS)
+	while is_current() and epoch == cancelling_epoch and phase == Phase.CANCELLING:
+		if _any_matched([cancelling]):
+			_abandon_matched()
+			return
+		if not cancel_unresolved and _clock.has_expired(grace_ends):
+			cancel_unresolved = true
+			changed.emit()
+		await _clock.sleep_seconds(POLL_SECONDS)
 
 
 # --- Restoration ------------------------------------------------------------
 
-## Returns every survivor to the same staging lobby after a search stops before a match:
-## usable ticket metadata removed, everyone unready, the lobby unlocked and reopened,
-## every member's activity restored, and the reason kept for the players to read.
+## Returns every survivor to the same staging lobby after a search stops before a match, or a
+## private start stops before it asked for the lobby's switch: usable ticket metadata removed,
+## everyone unready, the lobby unlocked and reopened, every member's activity restored, and
+## the reason kept for the players to read. Readiness counts again only from members that
+## acknowledge the restored group.
 ##
 ## Fails closed. An unconfirmed write or unlock leaves the group locked with Retry and
 ## Leave rather than advertising a lobby the service still refuses.
@@ -1125,6 +1585,8 @@ func _restore(code: StringName, text: String) -> void:
 		return
 	_restoring = true
 	_pending_stop = {}
+	_promoting = false
+	_private_stop = {}
 	cancel_unresolved = false
 	_retire_ticket()
 	var restoring_epoch := epoch
@@ -1149,6 +1611,7 @@ func _restore(code: StringName, text: String) -> void:
 		return
 	restoration_failed = false
 	_restoring = false
+	_record_composition()
 	# Gathering is set before the gate opens, so the admission signal already sees a
 	# joinable phase and every activity is republished from one consistent state.
 	_set_phase(Phase.GATHERING)
@@ -1193,28 +1656,44 @@ func on_owner_phase(owner_epoch: int, next_phase: int, detail: Dictionary) -> vo
 
 ## The owner's answer to this guest's own state request. Unmatched or stale answers are
 ## dropped. The budget it carries is anchored to when the request was sent, which can
-## only make it shorter than the owner's.
+## only make it shorter than the owner's. A member following a private start also takes the
+## owner's answer after the commit: see _catch_up_private_start().
 func on_state_reply(owner_epoch: int, next_phase: int, detail: Dictionary) -> void:
-	if not _reduces_staging():
+	var private_start := _follows_private_start()
+	if not _reduces_staging() and not private_start:
 		return
 	var request_id := int(detail.get("request_id", 0))
 	if request_id <= 0 or request_id != _sync_pending_id:
 		return
 	var anchor := _sync_sent_msec
 	_finish_sync()
+	# The owner's answer is the state this member asked for: nothing more is owed to it.
+	_private_catch_up_wanted = false
 	if owner_epoch < 0:
+		return
+	if private_start and next_phase == Phase.COMMITTING_START:
+		_catch_up_private_start(owner_epoch, detail)
+		return
+	if not _reduces_staging():
 		return
 	if owner_epoch == 0:
 		if next_phase == Phase.GATHERING and epoch == 0:
-			_adopt_gathering(0, "", "", false)
+			_adopt_gathering(0, "", "", false, true)
 		return
 	_apply_owner_state(owner_epoch, next_phase, detail, anchor)
 	# The lobby may already hold what the answer points at -- a ticket id, most often.
 	reconcile_staging()
+	# An owner that answers while still preparing the private start is alive, but has not
+	# finished it within this member's own bound: once that bound has passed, the private start
+	# has failed. Before then this member keeps waiting on the bound it already has.
+	if is_current() and phase == Phase.PRIVATE_PREPARING and next_phase == Phase.PRIVATE_PREPARING \
+			and owner_epoch == epoch and _clock.has_expired(phase_deadline_msec):
+		NetManager._flow_fail(self, TEXT_PRIVATE_NOT_STARTED)
 
 
-## Reduces the staging lobby's own state: its search envelope, and whether its native
-## owner is still the host this guest's transport answers to.
+## Reduces the staging lobby's own state: its search envelope, the private match control an
+## owner's private start publishes in it, and whether its native owner is still the host this
+## guest's transport answers to.
 func reconcile_staging() -> void:
 	if not _reduces_staging():
 		return
@@ -1226,28 +1705,31 @@ func reconcile_staging() -> void:
 		NetManager._flow_fail(self, TEXT_OWNER_CHANGED)
 		return
 	var envelope: Variant = snapshot.get("search_control", {})
-	if typeof(envelope) != TYPE_DICTIONARY or not bool((envelope as Dictionary).get("valid", false)):
-		return
-	var control := envelope as Dictionary
-	var control_epoch := int(control.get("epoch", 0))
-	if control_epoch <= 0 or control_epoch < epoch:
-		return
-	match String(control.get("phase", "")):
-		ENVELOPE_FREEZING:
-			_adopt_freeze(control_epoch)
-		ENVELOPE_SEARCHING:
-			_adopt_search(control_epoch, -1, 0)
-		ENVELOPE_CANCELLING:
-			_adopt_cancelling(control_epoch)
-		ENVELOPE_GATHERING:
-			_adopt_gathering(control_epoch, String(control.get("reason_code", "")),
-				String(control.get("reason", "")), false)
+	if typeof(envelope) == TYPE_DICTIONARY and bool((envelope as Dictionary).get("valid", false)):
+		var control := envelope as Dictionary
+		var control_epoch := int(control.get("epoch", 0))
+		if control_epoch > 0 and control_epoch >= epoch:
+			match String(control.get("phase", "")):
+				ENVELOPE_FREEZING:
+					_adopt_freeze(control_epoch)
+				ENVELOPE_SEARCHING:
+					_adopt_search(control_epoch, -1, 0)
+				ENVELOPE_CANCELLING:
+					_adopt_cancelling(control_epoch)
+				ENVELOPE_GATHERING:
+					_adopt_gathering(control_epoch, String(control.get("reason_code", "")),
+						String(control.get("reason", "")), false)
+				ENVELOPE_PRIVATE:
+					_adopt_private(control_epoch, control.get("group", []))
+	if is_current() and phase == Phase.PRIVATE_PREPARING:
+		_reconcile_private_control(party, party.snapshot(staging_context))
+	_try_private_catch_up()
 
 
 func _reduces_staging() -> bool:
 	return role == Role.GUEST and is_current() and staging_context != null \
 		and phase in [Phase.GATHERING, Phase.FREEZING, Phase.JOINING_TICKET, Phase.SEARCHING,
-			Phase.CANCELLING, Phase.RESTORING_STAGING]
+			Phase.CANCELLING, Phase.RESTORING_STAGING, Phase.PRIVATE_PREPARING]
 
 
 func _apply_owner_state(owner_epoch: int, next_phase: int, detail: Dictionary, anchor_msec: int) -> void:
@@ -1260,7 +1742,11 @@ func _apply_owner_state(owner_epoch: int, next_phase: int, detail: Dictionary, a
 			_adopt_cancelling(owner_epoch)
 		Phase.RESTORING_STAGING, Phase.GATHERING:
 			_adopt_gathering(owner_epoch, String(detail.get("reason_code", "")),
-				String(detail.get("reason", "")), next_phase == Phase.RESTORING_STAGING)
+				String(detail.get("reason", "")), next_phase == Phase.RESTORING_STAGING, true)
+		Phase.PRIVATE_PREPARING:
+			_adopt_private(owner_epoch, [])
+		Phase.COMMITTING_START:
+			_adopt_private_commit(owner_epoch, String(detail.get("session_id", "")))
 
 
 ## The staging lobby's native owner is no longer the host this guest's transport answers
@@ -1277,13 +1763,17 @@ func _staging_owner_moved(party: PartyService, snapshot: Dictionary) -> bool:
 
 
 ## Starts reducing a newer attempt, or a later stage of the current one: any ticket held
-## for the old state goes back to the service first.
+## for the old state goes back to the service first, and a private start this guest was
+## following is let go of with it.
 func _begin_stage(new_epoch: int, stage: int) -> void:
 	epoch = new_epoch
 	_stage = stage
 	_retire_ticket()
 	cancel_unresolved = false
 	synced = true
+	_cancel_private_bound()
+	_adopted_session_id = ""
+	_private_catch_up_wanted = false
 
 
 func _adopt_freeze(new_epoch: int) -> void:
@@ -1325,18 +1815,241 @@ func _adopt_cancelling(new_epoch: int) -> void:
 
 ## A restoration, or a restored group. The retained outcome travels with it, so a guest
 ## that never obtained a ticket -- or missed every message of the attempt -- is restored
-## with the reason too.
-func _adopt_gathering(new_epoch: int, code: String, text: String, restoring: bool) -> void:
+## with the reason too. A guest acknowledges a Gathering it adopts from the lobby once per
+## epoch, and the owner's own Gathering for the epoch it holds every time that message arrives,
+## live or in answer to its request: the lobby can bring it back to Gathering while the owner is
+## still restoring, before the owner takes any acknowledgement. That acknowledgement is what lets
+## its next Ready count. An earlier Ready is never sent again.
+func _adopt_gathering(new_epoch: int, code: String, text: String, restoring: bool, from_owner: bool = false) -> void:
 	var stage: int = _STAGE_RESTORING if restoring else _STAGE_RESTORED
-	if new_epoch < epoch or (new_epoch == epoch and _stage >= stage):
+	var adopted := false
+	if new_epoch > epoch or (new_epoch == epoch and _stage < stage):
+		_begin_stage(new_epoch, stage)
+		var shown := text
+		if shown.is_empty() and not code.is_empty():
+			shown = MatchmakingService.reason_for_code(code)
+		if not shown.is_empty() and (reason_epoch != epoch or reason != shown):
+			_record_reason(StringName(code), shown)
+		_set_phase(Phase.RESTORING_STAGING if restoring else Phase.GATHERING)
+		adopted = true
+	if restoring or not is_current() or new_epoch != epoch or phase != Phase.GATHERING:
 		return
-	_begin_stage(new_epoch, stage)
-	var shown := text
-	if shown.is_empty() and not code.is_empty():
-		shown = MatchmakingService.reason_for_code(code)
-	if not shown.is_empty() and (reason_epoch != epoch or reason != shown):
-		_record_reason(StringName(code), shown)
-	_set_phase(Phase.RESTORING_STAGING if restoring else Phase.GATHERING)
+	if from_owner or (adopted and _gathering_acked_epoch != epoch):
+		_gathering_acked_epoch = epoch
+		NetManager._flow_send_report(epoch, Phase.GATHERING)
+
+
+## The owner is preparing a private start for this epoch: this member freezes, holds its
+## readiness, retires its activity and acknowledges, once. It keeps the full group's
+## identities from the lobby's envelope, and bounds its own wait for the owner: past it, it
+## asks the owner for its state, and silence then ends the group.
+func _adopt_private(new_epoch: int, group: Variant) -> void:
+	if new_epoch < epoch or (new_epoch == epoch and _stage >= _STAGE_FROZEN):
+		_note_private_group(new_epoch, group)
+		return
+	_begin_stage(new_epoch, _STAGE_FROZEN)
+	_clear_reason()
+	frozen_keys.clear()
+	_note_private_group(new_epoch, group)
+	phase_deadline_msec = _clock.deadline_after(PRIVATE_PREPARE_SECONDS)
+	_set_phase(Phase.PRIVATE_PREPARING)
+	_arm_private_bound()
+	if _acked_epoch != epoch:
+		_acked_epoch = epoch
+		NetManager._flow_send_report(epoch, Phase.PRIVATE_PREPARING)
+	# The lobby may already hold the group and the owner's published control.
+	reconcile_staging()
+
+
+## The full group a private start is for, read from the owner's envelope for this epoch.
+func _note_private_group(group_epoch: int, group: Variant) -> void:
+	if group_epoch != epoch or not frozen_keys.is_empty() or typeof(group) != TYPE_ARRAY:
+		return
+	var keys: Array[Dictionary] = []
+	for raw: Variant in group as Array:
+		var key := entity_key(raw)
+		if key.is_empty():
+			return
+		keys.append(key)
+	frozen_keys.assign(keys)
+
+
+## Reads the private match control the owner's switch publishes in the lobby, while this member
+## is following a private start. It is taken only while the owner is proven, now, the owner of
+## this lobby: until then it waits for the next change, and a known disagreement ends this
+## member's attempt. A control for the first round, starting, that names this member and its
+## whole group is acknowledged, once, and its session id kept. One that leaves either out ends
+## this member's attempt. Nothing is taken on until the owner commits it.
+func _reconcile_private_control(party: PartyService, snapshot: Dictionary) -> void:
+	if role != Role.GUEST or phase != Phase.PRIVATE_PREPARING or not _adopted_session_id.is_empty():
+		return
+	var raw_control: Variant = snapshot.get("private_control", {})
+	var control: Dictionary = raw_control as Dictionary if typeof(raw_control) == TYPE_DICTIONARY else {}
+	if not bool(control.get("valid", false)) or int(control.get("round", -1)) != 0 \
+			or String(control.get("phase", "")) != PartyService.ARRANGED_PHASE_STARTING \
+			or int(control.get("start_generation", 0)) != 1:
+		return
+	if frozen_keys.is_empty():
+		return
+	if not NetManager._authority_trusted() or not is_current() or phase != Phase.PRIVATE_PREPARING:
+		return
+	var selected: Variant = control.get("selected_members", [])
+	var local_key := entity_key(party.local_entity_key(staging_context))
+	if local_key.is_empty() or not selection_includes(selected, [local_key]) \
+			or not selection_includes(selected, frozen_keys):
+		NetManager._flow_fail(self, TEXT_MATCH_MISMATCH)
+		return
+	_adopted_session_id = String(control.get("session_id", ""))
+	if _adopted_session_id.is_empty():
+		return
+	if _commit_ack_epoch != epoch:
+		_commit_ack_epoch = epoch
+		NetManager._flow_send_report(epoch, Phase.COMMITTING_START)
+	changed.emit()
+
+
+## The owner committed its private start for this epoch. The session it names must be the one
+## this member read from the lobby, and the owner must be proven again as it is taken; then the
+## group's lobby becomes this member's play session, this session answers to its owner there,
+## and the start that follows is judged as the private match's first. The commit's own budget is
+## taken here, once. Nothing was taken on before this, so a restoration never has anything to undo.
+func _adopt_private_commit(owner_epoch: int, committed: String) -> void:
+	if role != Role.GUEST or owner_epoch != epoch or phase != Phase.PRIVATE_PREPARING:
+		return
+	if not NetManager._authority_trusted():
+		if is_current() and phase == Phase.PRIVATE_PREPARING:
+			_private_catch_up_wanted = true
+		return
+	if _adopted_session_id.is_empty():
+		reconcile_staging()
+		if not is_current() or phase != Phase.PRIVATE_PREPARING:
+			return
+	if committed.is_empty() or committed != _adopted_session_id:
+		NetManager._flow_fail(self, TEXT_MATCH_MISMATCH)
+		return
+	var party := Services.party()
+	var owner: Dictionary = {}
+	if party != null:
+		owner = entity_key(party.snapshot(staging_context).get("owner_key", {}))
+	play_context = staging_context
+	staging_context = null
+	session_origin = PartyService.PLAY_ORIGIN_PRIVATE
+	session_id = committed
+	play_owner = owner
+	match_round = 0
+	selected_keys = frozen_keys.duplicate(true)
+	start_generation = 1
+	host_returned = true
+	_cancel_private_bound()
+	_finish_sync()
+	phase_deadline_msec = _clock.deadline_after(COMMIT_SECONDS)
+	_set_phase(Phase.COMMITTING_START)
+	NetManager._flow_private_committed(self)
+
+
+func _arm_private_bound() -> void:
+	_cancel_private_bound()
+	_private_bound_alarm = _clock.alarm_at(phase_deadline_msec, _on_private_bound.bind(epoch))
+
+
+func _cancel_private_bound() -> void:
+	if _private_bound_alarm != null:
+		_private_bound_alarm.cancel()
+	_private_bound_alarm = null
+
+
+## This member's own bound on the owner's private start ran out with nothing committed or
+## restored: it asks the owner for its state, once. An owner that does not answer ends the
+## group; one that answers still preparing has not finished within the bound.
+func _on_private_bound(bound_epoch: int) -> void:
+	_private_bound_alarm = null
+	if not is_current() or role != Role.GUEST or epoch != bound_epoch or phase != Phase.PRIVATE_PREPARING:
+		return
+	_private_catch_up_wanted = false
+	_request_sync(&"private")
+
+
+## Whether this member is a guest following its group's private start: preparing it, or its
+## first match committed and not yet running.
+func _follows_private_start() -> bool:
+	if role != Role.GUEST or not is_current() or match_round != 0:
+		return false
+	return phase == Phase.PRIVATE_PREPARING \
+		or (phase == Phase.COMMITTING_START and session_origin == PartyService.PLAY_ORIGIN_PRIVATE)
+
+
+## A message from the owner was not taken, while this member follows a private start, because
+## the owner could not be proven at that moment -- `answer_id` names the request it answered, if
+## it was an answer. Until the private match's first start has been applied here, the need to ask
+## the owner for its state is kept -- and acted on only once the owner is proven again, within
+## this member's own bound.
+func note_owner_message_missed(answer_id: int = 0) -> void:
+	if _follows_private_start() and not initial_start_seen:
+		_private_catch_up_wanted = true
+		if answer_id > 0 and answer_id == _sync_pending_id:
+			_sync_answer_missed = true
+		_try_private_catch_up()
+
+
+## Asks the owner for its current state, once, when a private start's message went untaken, the
+## owner is proven again and this member's own bound has not passed. A request already out is
+## waited for -- unless its own answer was the message not taken; then it is asked again, once,
+## on what is left of its deadline (see _reissue_sync()).
+func _try_private_catch_up() -> void:
+	if not _private_catch_up_wanted or not _follows_private_start() or initial_start_seen:
+		return
+	if phase_deadline_msec <= 0 or _clock.has_expired(phase_deadline_msec):
+		return
+	if _sync_pending_id != 0 and (not _sync_answer_missed or _sync_reissued):
+		return
+	if NetManager._authority_verdict() != &"proven":
+		return
+	_private_catch_up_wanted = false
+	if _sync_pending_id != 0:
+		_reissue_sync()
+	else:
+		_request_sync(&"private")
+
+
+## The owner's answer while this member follows a private start and the owner has committed it:
+## the private match's session, its first round and start, and the match state the owner has
+## reached -- the first STARTING or its loading after it, and nothing else. A member that missed
+## the commit takes it now, once, exactly as it would have taken the live one; then the first
+## start is applied as the live one would have been -- through this member's own admission and
+## the owner proven again -- unless it already was, so an answer overtaken by the live messages
+## changes nothing. A session other than the one this member read from the lobby ends its
+## attempt; an answer for any other round, start or state is not taken at all.
+func _catch_up_private_start(owner_epoch: int, detail: Dictionary) -> void:
+	if owner_epoch != epoch:
+		return
+	var committed := String(detail.get("session_id", ""))
+	if committed.is_empty() or int(detail.get("round", -1)) != 0 or int(detail.get("start_generation", 0)) != 1:
+		return
+	var reached := int(detail.get("match_state", -1))
+	if reached != int(NRTypes.MatchState.STARTING) and reached != int(NRTypes.MatchState.PLAYERS_JOINING):
+		return
+	if phase == Phase.PRIVATE_PREPARING:
+		_adopt_private_commit(owner_epoch, committed)
+		if not is_current() or phase != Phase.COMMITTING_START:
+			return
+	elif committed != session_id:
+		NetManager._flow_fail(self, TEXT_MATCH_MISMATCH)
+		return
+	if initial_start_seen:
+		return
+	NetManager._flow_catch_up_initial_start(self, reached)
+
+
+## The owner's own account of its private match's first start, for one of its four that asks
+## while that start is still under way: the session committed, the first round and its start
+## generation, and the match state reached so far.
+func private_start_reply() -> Dictionary:
+	return {
+		"session_id": session_id,
+		"round": match_round,
+		"start_generation": start_generation,
+		"match_state": int(NetManager.match_state),
+	}
 
 
 ## The owner's remaining budget, anchored locally. A later copy of the same epoch's budget
@@ -1363,7 +2076,35 @@ func _request_sync(purpose: StringName) -> void:
 	_sync_pending_id = request_id
 	_sync_sent_msec = _clock.now_msec()
 	_sync_purpose = purpose
-	_sync_alarm = _clock.alarm_after(SYNC_SECONDS, _on_sync_timeout.bind(request_id))
+	_sync_deadline_msec = _clock.deadline_after(SYNC_SECONDS)
+	_sync_answer_missed = false
+	_sync_reissued = false
+	_sync_alarm = _clock.alarm_at(_sync_deadline_msec, _on_sync_timeout.bind(request_id))
+
+
+## The owner's answer to the request still out was not taken, the owner not being provable at
+## that moment. The owner proven again, the request is asked again, once, under a new id -- a
+## late answer to the old id is not taken -- on what is left of the old request's own deadline,
+## and never past this member's bound: no time is added. Past either, nothing is asked again and
+## the old request's deadline ends the wait as it always would.
+func _reissue_sync() -> void:
+	if _sync_pending_id == 0 or _sync_reissued:
+		return
+	var deadline := mini(_sync_deadline_msec, phase_deadline_msec)
+	if _sync_deadline_msec <= 0 or phase_deadline_msec <= 0 or _clock.has_expired(deadline):
+		return
+	_sync_request_id += 1
+	var request_id := _sync_request_id
+	if not NetManager._flow_request_state(self, request_id, epoch):
+		return
+	if _sync_alarm != null:
+		_sync_alarm.cancel()
+	_sync_pending_id = request_id
+	_sync_sent_msec = _clock.now_msec()
+	_sync_deadline_msec = deadline
+	_sync_answer_missed = false
+	_sync_reissued = true
+	_sync_alarm = _clock.alarm_at(deadline, _on_sync_timeout.bind(request_id))
 
 
 func _on_sync_timeout(request_id: int) -> void:
@@ -1378,6 +2119,10 @@ func _on_sync_timeout(request_id: int) -> void:
 		NetManager._flow_fail(self, TEXT_HOST_SILENT)
 	elif purpose == &"ticket" and phase in [Phase.JOINING_TICKET, Phase.SEARCHING] and ticket == null:
 		_refuse_ticket()
+	elif purpose == &"private" and _follows_private_start() and not initial_start_seen:
+		# The owner's private start neither committed, restored nor started here, and the
+		# owner did not answer.
+		NetManager._flow_fail(self, TEXT_HOST_SILENT)
 
 
 func _finish_sync() -> void:
@@ -1386,9 +2131,14 @@ func _finish_sync() -> void:
 	_sync_alarm = null
 	_sync_pending_id = 0
 	_sync_purpose = &""
+	_sync_deadline_msec = 0
+	_sync_answer_missed = false
+	_sync_reissued = false
 
 
-## What the owner would broadcast for its current state, for a guest that asked.
+## What the owner would broadcast for its current state, for a guest that asked. A private
+## match's first start, once committed, is answered with the owner's own account of it (see
+## private_start_reply()); NetManager answers that only for one of the four it started with.
 func replay_state() -> Dictionary:
 	var reported := phase
 	var detail := {}
@@ -1401,12 +2151,15 @@ func replay_state() -> Dictionary:
 			if not reason.is_empty():
 				detail["reason_code"] = String(reason_code)
 				detail["reason"] = reason
+		Phase.COMMITTING_START:
+			if session_origin == PartyService.PLAY_ORIGIN_PRIVATE and role == Role.OWNER:
+				detail = private_start_reply()
 	return {"epoch": epoch, "phase": int(reported), "detail": detail}
 
 
 ## Lobby state moved: a newly replicated envelope may carry the ticket id this guest was
-## waiting for, any member change is the owner's cue to re-check its group, and the
-## arranged lobby says whether its host has returned.
+## waiting for, any member change is the owner's cue to re-check its group, and the play
+## session's lobby says whether its host has returned.
 func on_lobby_changed(context: Variant) -> void:
 	if not is_current() or context == null:
 		return
@@ -1415,20 +2168,23 @@ func on_lobby_changed(context: Variant) -> void:
 			reconcile_staging()
 		else:
 			on_group_changed()
+	elif context == play_context and session_origin == PartyService.PLAY_ORIGIN_PRIVATE:
+		reconcile_private()
 	elif context == arranged_context:
 		reconcile_arranged()
 
 
 # --- Matched handoff ------------------------------------------------------------
 #
-# Two barriers, in this order. The cohort barrier: the match's full member count connected
-# in the arranged lobby, every member compatible and carrying this match's id, this
-# member's own premade among them, and every member's acknowledgement -- published only
-# after its own arranged join, once it had armed its old-transport-loss handling. Only then
-# does the actual arranged owner lock the lobby, and only a confirmed lock over the same set
-# and owner seals the handoff. Nobody tears a transport down before the seal, so no staging
-# host leaves Party while a member could still take that for a failure, and a later matched
-# caller is never locked out by an early lock.
+# Each member's own group first. After its own arranged join, a member arms its handling of
+# the old transport going away and publishes its acknowledgement; then it waits only for its
+# own frozen premade -- every one of them in the arranged lobby, connected, compatible,
+# carrying this match's id and acknowledged -- never for four, a count or another ticket's
+# players. Only then does it leave its old staging transport, so no group host closes that
+# network under a member that has not armed. The actual arranged owner then creates the
+# fresh network and publishes it with the arranged lobby still open, so matched players who
+# are still on their way can come in; the lobby is locked only when the first match starts,
+# around the players who had arrived by then.
 
 ## A match. From here every failure is terminal: a partly dispersed group cannot be put
 ## back together, so the players are returned to the menu with the reason.
@@ -1449,13 +2205,13 @@ func _join_arranged() -> void:
 	_set_phase(Phase.JOINING_ARRANGED)
 	phase_deadline_msec = _clock.deadline_after(ARRANGED_JOIN_SECONDS)
 	# Revalidated now rather than trusted from the start: the arranged lobby is configured
-	# from the mode's real player count, which must still be the queue's four.
+	# from the mode's real player count, which must still be the capacity of four.
 	var matchmaking: MatchmakingService = Services.matchmaking() if Services != null else null
 	var profile: Dictionary = matchmaking.runtime_profile(mode) if matchmaking != null else {}
 	if not bool(profile.get("ok", false)):
 		NetManager._flow_fail(self, _profile_text(profile))
 		return
-	if int(profile.get("player_count", 0)) != match_size:
+	if int(profile.get("capacity", 0)) != capacity:
 		NetManager._flow_fail(self, TEXT_PROFILE_CHANGED)
 		return
 	var party := Services.party()
@@ -1465,14 +2221,14 @@ func _join_arranged() -> void:
 		PartyService.MATCH_ORIGIN_MEMBER_KEY: PartyService.MATCH_ORIGIN_VALUE,
 	}
 	var joined: PartyService.PartyResult = await party.join_arranged(
-		Services.playfab_user(), arrangement, properties, match_size, account_generation, id, phase_deadline_msec)
+		Services.playfab_user(), arrangement, properties, capacity, account_generation, id, phase_deadline_msec)
 	_hold_operation(joined)
 	if not is_current():
 		if joined != null and joined.context != null:
 			await _release_context(joined.context)
 		return
 	if joined == null or not joined.ok() or joined.context == null:
-		NetManager._flow_fail(self, _result_reason(joined, "The match could not be joined."))
+		NetManager._flow_fail(self, _arranged_join_failure_text(joined))
 		return
 	arranged_context = joined.context
 	arranged_owner_key = {}
@@ -1484,6 +2240,16 @@ func _join_arranged() -> void:
 	await _arm_handoff()
 
 
+## Why this member could not enter the arranged match. A native join that failed or ran out of
+## time before any lobby could be read proves nothing about why -- the match may simply have
+## started without it -- so it is told that plainly; every other failure keeps its own reason.
+static func _arranged_join_failure_text(joined: Variant) -> String:
+	var code: StringName = joined.reason_code if joined != null else &""
+	if joined == null or code in [&"arranged_join_failed", &"arranged_join_timeout"]:
+		return TEXT_MATCH_JOIN_UNPROVEN
+	return _result_reason(joined, "The match could not be joined.")
+
+
 ## Pins the first valid native owner of the arranged lobby. Its creator of the fresh
 ## network is whoever this is -- staging owner or staging guest alike.
 func _pin_arranged_owner(party: PartyService, owner: Dictionary) -> void:
@@ -1493,11 +2259,12 @@ func _pin_arranged_owner(party: PartyService, owner: Dictionary) -> void:
 
 
 ## Arms intentional old-transport loss handling before announcing readiness, then waits for
-## the cohort barrier, the owner's lock and the seal. Only then does anyone deliberately
-## retire the staging transport.
+## this member's own frozen premade in the arranged lobby. Only then does it deliberately
+## retire its staging transport. Nothing here waits for a count or another ticket's players.
 func _arm_handoff() -> void:
-	# The cohort, transport and admission budget: 90 seconds from this member's own
-	# arranged success, separate from the 30 the join itself had.
+	# The premade, transport and admission budget: 90 seconds from this member's own arranged
+	# success, separate from the 30 the join itself had. For the arranged owner it also bounds
+	# the wait for enough players to start.
 	phase_deadline_msec = _clock.deadline_after(HANDOFF_SECONDS)
 	# Armed before the acknowledgement exists: once another member can read it, this
 	# member already treats its old staging transport going away as expected.
@@ -1512,27 +2279,9 @@ func _arm_handoff() -> void:
 	if ready_post == null or not ready_post.ok():
 		NetManager._flow_fail(self, _result_reason(ready_post, "The match could not be prepared."))
 		return
-	var cohort_ready: bool = await _await_cohort(false)
-	if not cohort_ready:
+	var premade_ready: bool = await _await_premade()
+	if not premade_ready:
 		return
-	if arranged_owner:
-		var locked: PartyService.PartyResult = await party.set_context_locked(arranged_context, true, phase_deadline_msec)
-		_hold_operation(locked)
-		if not _arming_current():
-			return
-		if locked == null or not locked.ok():
-			NetManager._flow_fail(self, _result_reason(locked, TEXT_MATCH_UNSEALED))
-			return
-		# Rechecked after the await: what was sealed must be the set and owner proven.
-		var verdict := _cohort_verdict(false)
-		if verdict != &"ready":
-			NetManager._flow_fail(self, _cohort_failure_text(verdict))
-			return
-	else:
-		var sealed: bool = await _await_cohort(true)
-		if not sealed:
-			return
-	pinned_keys = _cohort_keys()
 	await switch_transport()
 
 
@@ -1540,33 +2289,40 @@ func _arming_current() -> bool:
 	return is_current() and phase == Phase.ARMING_HANDOFF
 
 
-## Waits, within the handoff budget, for the cohort barrier -- and with `sealed`, the
-## owner's confirmed lock on top of it. Incomplete replication waits; a known loss, a
-## changed owner or an incompatible value is final at once.
-func _await_cohort(sealed: bool) -> bool:
-	var verdict := _cohort_verdict(sealed)
+## Waits, within the handoff budget, for this member's own frozen premade and the pinned owner
+## in the arranged lobby, while the flow is still in `expected` -- the arming, the transport
+## switch reading them again after one of its awaits, or a guest whose joined network is already
+## its session, before its admission is taken. Incomplete replication waits; a known loss, a
+## changed or departed owner, an incompatible member or a match already starting without this
+## member is final at once.
+func _await_premade(expected: Phase = Phase.ARMING_HANDOFF) -> bool:
+	var verdict := _premade_verdict()
 	while verdict == &"waiting":
 		if _clock.has_expired(phase_deadline_msec):
 			NetManager._flow_fail(self, TEXT_MATCH_LATE)
 			return false
 		await _clock.sleep_seconds(minf(POLL_SECONDS, _clock.remaining_seconds(phase_deadline_msec)))
-		if not _arming_current():
+		if not is_current() or phase != expected:
 			return false
-		verdict = _cohort_verdict(sealed)
+		verdict = _premade_verdict()
 	if verdict != &"ready":
 		NetManager._flow_fail(self, _cohort_failure_text(verdict))
 		return false
 	return true
 
 
-## The cohort barrier, and with `sealed` the confirmed lock too.
+## This member's own frozen premade and the arranged lobby's pinned owner, and nothing about a
+## count or about any other group.
 ##
-## Ready: the arranged lobby holds exactly this match's member count, every member
-## connected, compatible and carrying this match's id, every acknowledgement published,
-## this member's own frozen premade among them, and the pinned owner still the owner and a
-## member. What has not replicated yet is waiting; a member seen and then gone, a changed
-## owner, a wrong capacity or an incompatible value is final.
-func _cohort_verdict(sealed: bool) -> StringName:
+## Ready: every key of the frozen premade -- this member's among them -- is present,
+## connected, carrying a compatible protocol, this match's id and this match's
+## acknowledgement; and the pinned owner is still the owner, present, connected and carrying a
+## compatible protocol and this match's id. What has not replicated yet is waiting. Final at
+## once: a premade member or the owner seen connected and then gone or disconnected, a changed
+## owner, a present member of any group on another protocol or match, a wrong capacity, and an
+## owner control showing this match already starting without this member or past its first
+## round.
+func _premade_verdict() -> StringName:
 	var party := Services.party()
 	if party == null or arranged_context == null:
 		return &"lost"
@@ -1579,14 +2335,56 @@ func _cohort_verdict(sealed: bool) -> StringName:
 			_pin_arranged_owner(party, owner)
 		elif fingerprint(owner) != fingerprint(arranged_owner_key):
 			return &"owner_changed"
-	if int(snapshot.get("max_members", match_size)) != match_size \
-			or int(snapshot.get("expected_count", match_size)) != match_size:
+	if int(snapshot.get("max_members", capacity)) != capacity:
 		return &"incompatible"
+	if _start_control_excludes_self(party, snapshot):
+		return &"late"
+	# A key listed twice is a snapshot still settling: it is never a set anybody starts with,
+	# and the budget bounds the wait.
+	var roll := _member_states(snapshot)
+	if bool(roll.get("duplicate", false)):
+		return &"waiting"
+	var members: Dictionary = roll.get("members", {})
+	if members.size() > capacity:
+		return &"incompatible"
+	for mark: String in members:
+		if bool((members[mark] as Dictionary).get("incompatible", false)):
+			return &"incompatible"
+	var incomplete := owner.is_empty() or arranged_owner_key.is_empty()
+	if not arranged_owner_key.is_empty():
+		var owner_mark := fingerprint(arranged_owner_key)
+		var owner_state: Dictionary = members.get(owner_mark, {})
+		if owner_state.is_empty() or not bool(owner_state.get("connected", false)):
+			if _seen_connected.has(owner_mark):
+				return &"owner_lost"
+			incomplete = true
+		else:
+			_seen_connected[owner_mark] = true
+			if not bool(owner_state.get("known", false)):
+				incomplete = true
+	for key: Dictionary in frozen_keys:
+		var mark := fingerprint(key)
+		var state: Dictionary = members.get(mark, {})
+		if state.is_empty() or not bool(state.get("connected", false)):
+			if _seen_connected.has(mark):
+				return &"member_lost"
+			incomplete = true
+			continue
+		_seen_connected[mark] = true
+		if not bool(state.get("known", false)) or not bool(state.get("acknowledged", false)):
+			incomplete = true
+	return &"waiting" if incomplete else &"ready"
+
+
+## The arranged lobby's native members by fingerprint -- `{"members": {mark: state},
+## "duplicate": bool}` -- each with its connection, whether its protocol and match id are known
+## and compatible, and the two handoff marks. A key listed twice sets `duplicate`: a duplicated
+## native member is never a set anybody starts with.
+func _member_states(snapshot: Dictionary) -> Dictionary:
+	var states := {}
 	var raw_members: Variant = snapshot.get("members", [])
 	if typeof(raw_members) != TYPE_ARRAY:
-		return &"waiting"
-	var present := {}
-	var incomplete := owner.is_empty()
+		return {"members": states, "duplicate": false}
 	for raw: Variant in raw_members as Array:
 		if typeof(raw) != TYPE_DICTIONARY:
 			continue
@@ -1595,65 +2393,74 @@ func _cohort_verdict(sealed: bool) -> StringName:
 		if key.is_empty():
 			continue
 		var mark := fingerprint(key)
-		present[mark] = key
-		if not bool(member.get("connected", false)):
-			if _seen_connected.has(mark):
-				return &"member_lost"
-			incomplete = true
-			continue
-		_seen_connected[mark] = true
+		if states.has(mark):
+			return {"members": {}, "duplicate": true}
 		var raw_properties: Variant = member.get("properties", {})
 		var properties: Dictionary = raw_properties as Dictionary if typeof(raw_properties) == TYPE_DICTIONARY else {}
 		var protocol := String(properties.get(MatchmakingService.PROTOCOL_MEMBER_KEY, ""))
 		var member_match := String(properties.get(PartyService.MATCH_ID_MEMBER_KEY, ""))
-		if (not protocol.is_empty() and not NRProtocol.is_compatible(protocol)) \
-				or (not member_match.is_empty() and member_match != match_id):
-			return &"incompatible"
-		if protocol.is_empty() or member_match.is_empty() \
-				or String(properties.get(PartyService.HANDOFF_READY_MEMBER_KEY, "")) != match_id:
-			incomplete = true
-	for seen: Variant in _seen_connected:
-		if not present.has(seen):
-			return &"member_lost"
-	if present.size() > match_size:
-		return &"incompatible"
-	if present.size() < match_size or incomplete:
-		return &"waiting"
-	if not present.has(fingerprint(arranged_owner_key)):
-		return &"owner_changed"
-	for key: Dictionary in frozen_keys:
-		if not present.has(fingerprint(key)):
-			return &"premade_missing"
-	if sealed and not bool(snapshot.get("membership_locked", false)):
-		return &"waiting"
-	return &"ready"
+		states[mark] = {
+			"key": key,
+			"connected": bool(member.get("connected", false)),
+			"known": not protocol.is_empty() and not member_match.is_empty(),
+			"incompatible": (not protocol.is_empty() and not NRProtocol.is_compatible(protocol))
+				or (not member_match.is_empty() and member_match != match_id),
+			"acknowledged": String(properties.get(PartyService.HANDOFF_READY_MEMBER_KEY, "")) == match_id,
+			"retired": String(properties.get(PartyService.STAGING_RETIRED_MEMBER_KEY, "")) == match_id,
+		}
+	return {"members": states, "duplicate": false}
 
 
-## The connected arranged members' full keys, in fingerprint order: the set the initial
-## start admits exactly.
-func _cohort_keys() -> Array[Dictionary]:
-	var keys: Array[Dictionary] = []
-	var party := Services.party()
-	if party == null or arranged_context == null:
-		return keys
-	var snapshot: Dictionary = party.snapshot(arranged_context)
-	var raw_members: Variant = snapshot.get("members", [])
-	if typeof(raw_members) != TYPE_ARRAY:
-		return keys
-	for raw: Variant in raw_members as Array:
-		if typeof(raw) != TYPE_DICTIONARY or not bool((raw as Dictionary).get("connected", false)):
-			continue
-		var key := entity_key((raw as Dictionary).get("key", {}))
+## The arranged owner's control, decoded, when it is this match's own; otherwise empty.
+func _match_control(snapshot: Dictionary) -> Dictionary:
+	var raw_control: Variant = snapshot.get("arranged_control", {})
+	if typeof(raw_control) != TYPE_DICTIONARY:
+		return {}
+	var control := raw_control as Dictionary
+	if not bool(control.get("valid", false)) or String(control.get("match_id", "")) != match_id:
+		return {}
+	return control
+
+
+## Whether the owner's control says this match is already under way without this member: its
+## first start chosen without it, or the session already past its first round. Either way the
+## member arrived after the cutoff and joins nothing.
+func _start_control_excludes_self(party: PartyService, snapshot: Dictionary) -> bool:
+	var control := _match_control(snapshot)
+	if control.is_empty():
+		return false
+	if int(control.get("round", 0)) > 0:
+		return true
+	if String(control.get("phase", "")) != PartyService.ARRANGED_PHASE_STARTING:
+		return false
+	var local_key := entity_key(party.local_entity_key(arranged_context))
+	return not selection_includes(control.get("selected_members", []), [local_key])
+
+
+## Whether every one of `keys` is in the selected set `selected`, compared as fingerprints.
+static func selection_includes(selected: Variant, keys: Array) -> bool:
+	if typeof(selected) != TYPE_ARRAY:
+		return false
+	var marks := {}
+	for raw: Variant in selected as Array:
+		var key := entity_key(raw)
 		if not key.is_empty():
-			keys.append(key)
-	keys.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return fingerprint(a) < fingerprint(b))
-	return keys
+			marks[fingerprint(key)] = true
+	if marks.is_empty():
+		return false
+	for raw: Variant in keys:
+		var key := entity_key(raw)
+		if key.is_empty() or not marks.has(fingerprint(key)):
+			return false
+	return true
 
 
 static func _cohort_failure_text(verdict: StringName) -> String:
 	match verdict:
 		&"owner_changed":
 			return TEXT_MATCH_HOST_CHANGED
+		&"owner_lost":
+			return TEXT_MATCH_HOST_LEFT
 		&"incompatible":
 			return TEXT_MATCH_INCOMPATIBLE
 		&"member_lost":
@@ -1662,31 +2469,14 @@ static func _cohort_failure_text(verdict: StringName) -> String:
 			return TEXT_MATCH_MISMATCH
 		&"lost":
 			return TEXT_ARRANGED_CHANGED
+		&"late":
+			return TEXT_MATCH_ALREADY_STARTED
 	return TEXT_MATCH_LATE
 
 
-## The arranged owner's own member protocol is this build's, read from the lobby before
-## any Party entry rather than discovered through RPCs that depend on it.
-func _arranged_owner_compatible(party: PartyService) -> bool:
-	var snapshot: Dictionary = party.snapshot(arranged_context)
-	var raw_members: Variant = snapshot.get("members", [])
-	if typeof(raw_members) != TYPE_ARRAY or arranged_owner_key.is_empty():
-		return false
-	for raw: Variant in raw_members as Array:
-		if typeof(raw) != TYPE_DICTIONARY:
-			continue
-		var member := raw as Dictionary
-		if fingerprint(entity_key(member.get("key", {}))) != fingerprint(arranged_owner_key):
-			continue
-		var raw_properties: Variant = member.get("properties", {})
-		if typeof(raw_properties) != TYPE_DICTIONARY:
-			return false
-		return NRProtocol.is_compatible(String((raw_properties as Dictionary).get(MatchmakingService.PROTOCOL_MEMBER_KEY, "")))
-	return false
-
-
 ## An involuntary loss of the old staging transport after arming. The local session ends
-## now, but the replacement network is still prepared only once the seal is reached.
+## now, but the replacement network is still prepared only once this member's own premade and
+## the pinned owner are ready in the arranged lobby.
 func on_armed_staging_loss() -> void:
 	if not is_current() or phase != Phase.ARMING_HANDOFF or staging_reset:
 		return
@@ -1699,9 +2489,20 @@ func on_armed_staging_loss() -> void:
 ## completely before anything is awaited (see NetManager._end_local_session_for_handoff);
 ## this flow keeps the identity, lease and both lobby contexts across the gap. Only the
 ## actual arranged owner creates the fresh network that makes it Godot peer 1.
+##
+## Nothing is dismantled until this member's own premade and the pinned owner are ready (see
+## _premade_verdict()), read again at that last moment; and they are read again after every
+## await -- the old network's leave, the privilege check, and the replacement network's own
+## creation or join. The owner's network becomes its session only while they still hold; a
+## guest's joined network is taken on in the join's own step (see _take_joined_network()). An
+## old transport that already went on its own changes nothing about that.
 func switch_transport() -> void:
 	if not is_current():
 		return
+	if not staging_reset:
+		var premade_ready: bool = await _await_premade()
+		if not premade_ready or not is_current():
+			return
 	_set_phase(Phase.SWITCHING_TRANSPORT)
 	if not staging_reset:
 		staging_reset = NetManager._end_local_session_for_handoff(self)
@@ -1719,10 +2520,16 @@ func switch_transport() -> void:
 		if left == null or not left.ok():
 			NetManager._flow_fail(self, _result_reason(left, TEXT_OLD_NETWORK_NOT_LEFT))
 			return
+		var still_armed: bool = await _await_premade(Phase.SWITCHING_TRANSPORT)
+		if not still_armed:
+			return
 	# The platform reset cleared the previous session's communications verdict; it is
 	# resolved again before any network exists, exactly as hosting and joining do.
 	await NetManager._platform.apply_chat_privilege(_handoff_still_current)
 	if not is_current():
+		return
+	var still_ready: bool = await _await_premade(Phase.SWITCHING_TRANSPORT)
+	if not still_ready:
 		return
 	var user: Variant = Services.playfab_user()
 	var prepared: PartyService.PartyResult = null
@@ -1730,9 +2537,6 @@ func switch_transport() -> void:
 		var slice := mini(phase_deadline_msec, _clock.deadline_after(OWNER_TRANSPORT_SECONDS))
 		prepared = await party.prepare_transport(arranged_context, user, slice)
 	else:
-		if not _arranged_owner_compatible(party):
-			NetManager._flow_fail(self, TEXT_MATCH_INCOMPATIBLE)
-			return
 		prepared = await party.join_transport(arranged_context, user, phase_deadline_msec)
 	_hold_operation(prepared)
 	if not is_current():
@@ -1740,30 +2544,61 @@ func switch_transport() -> void:
 	if prepared == null or not prepared.ok():
 		NetManager._flow_fail(self, _result_reason(prepared, "The match network could not be reached."))
 		return
+	if not arranged_owner:
+		await _take_joined_network(prepared.peer)
+		return
+	# The arranged lobby kept moving while the network was created. A handoff that stops here
+	# uses nothing it got -- no peer, no descriptor -- and the flow's own cleanup leaves that
+	# network. Nobody can reach it before its descriptor is published, so it can wait here.
+	var network_ready: bool = await _await_premade(Phase.SWITCHING_TRANSPORT)
+	if not network_ready:
+		return
 	# Copied before activation: nothing inside the synchronous block below may ask
 	# PartyService anything.
 	var permit := prepared.publication_permit
 	var peer: Variant = prepared.peer
+	_enter_matchmade_session()
 	_set_phase(Phase.ADMITTING_COHORT)
-	if not NetManager._flow_activate_transport(self, peer, arranged_owner):
+	if not NetManager._flow_activate_transport(self, peer, true):
 		NetManager._flow_fail(self, "PlayFab Party did not return a usable network peer.")
 		return
-	if arranged_owner:
-		NetManager._flow_arm_cohort_deadline(self)
-		# The descriptor goes out last, with the round's owner control in the same checked
-		# batch, into a lobby already locked with exactly the cohort inside.
-		var published: PartyService.PartyResult = await party.publish_transport(
-			arranged_context, permit, PartyService.ARRANGED_PHASE_BOOTSTRAP,
-			PartyService.encode_arranged_control(match_id, match_round, PartyService.ARRANGED_PHASE_BOOTSTRAP),
-			{}, phase_deadline_msec)
-		_hold_operation(published)
-		if not is_current():
-			return
-		if published == null or not published.ok():
-			NetManager._flow_fail(self, _result_reason(published, "The match could not be opened."))
-			return
-		await _retire_staging()
+	NetManager._flow_arm_cohort_deadline(self)
+	# The descriptor goes out last, with the round's owner control in the same checked
+	# batch, into a lobby still open: matched players still on their way can come in, and
+	# the lobby is locked only when the first match starts.
+	var published: PartyService.PartyResult = await party.publish_transport(
+		arranged_context, permit, PartyService.ARRANGED_PHASE_BOOTSTRAP,
+		PartyService.encode_arranged_control(match_id, match_round, PartyService.ARRANGED_PHASE_BOOTSTRAP),
+		{}, phase_deadline_msec)
+	_hold_operation(published)
+	if not is_current():
 		return
+	if published == null or not published.ok():
+		NetManager._flow_fail(self, _result_reason(published, "The match could not be opened."))
+		return
+	await _retire_staging()
+
+
+## A guest's joined network becomes its session in the same step as the join itself: the
+## host's connection is announced right after, and a network taken on any later would never
+## hear of it. So this member's own premade and the pinned owner are read once, at once. A known
+## loss ends the handoff with nothing of the network used, and the flow's own cleanup leaves
+## it. Anything still settling is waited for -- within the handoff budget -- once the network
+## is this member's session and before its admission is taken.
+func _take_joined_network(peer: Variant) -> void:
+	var verdict := _premade_verdict()
+	if verdict != &"ready" and verdict != &"waiting":
+		NetManager._flow_fail(self, _cohort_failure_text(verdict))
+		return
+	_enter_matchmade_session()
+	_set_phase(Phase.ADMITTING_COHORT)
+	if not NetManager._flow_activate_transport(self, peer, false):
+		NetManager._flow_fail(self, "PlayFab Party did not return a usable network peer.")
+		return
+	if verdict == &"waiting":
+		var settled: bool = await _await_premade(Phase.ADMITTING_COHORT)
+		if not settled:
+			return
 	await _drive_admission()
 
 
@@ -1935,6 +2770,10 @@ func _drive_admission() -> void:
 		NetManager._settle_pending_authority()
 		if not is_current() or request != admission_request or not request.is_pending():
 			return
+		# So is a first start already held for this guest: it waits for this admission.
+		NetManager._flow_reconcile_pending_start(self)
+		if not is_current() or request != admission_request:
+			return
 		if request.admitted:
 			# Still waiting only while the host's proof settles; otherwise answered either way.
 			if NetManager._consume_flow_admission(self, request):
@@ -1949,30 +2788,51 @@ func _drive_admission() -> void:
 
 # --- Initial start, gameplay and rematches --------------------------------------
 
-## The arranged host has admitted exactly the sealed four, so the start is committed: the
-## lobby's lock is confirmed again and the set and owner rechecked before NetManager starts
-## the match through the ordinary STARTING path.
+## The arranged host has chosen the players the first match starts with -- the members who had
+## arrived and were ready -- and closed its admission. The start is then one checked
+## transaction on the commit budget taken at that choice: the lobby is locked; after the lock
+## the chosen players, the owner and the session are read again; the choice is published in
+## the arranged lobby; and only then does NetManager start the match through the ordinary
+## STARTING path. A chosen player lost, or the lock or the publication not confirmed, ends the
+## attempt. The choice is never recalculated into a smaller one, and its budget never renews.
 func begin_initial_commit(deadline_msec: int) -> void:
-	if not is_current() or not arranged_owner or phase != Phase.ADMITTING_COHORT:
+	if not is_current() or not arranged_owner or phase != Phase.ADMITTING_COHORT or selected_keys.is_empty():
 		return
 	_set_phase(Phase.COMMITTING_START)
 	var party := Services.party()
 	var locked: PartyService.PartyResult = await party.set_context_locked(arranged_context, true, deadline_msec)
 	_hold_operation(locked)
-	if not is_current() or phase != Phase.COMMITTING_START:
+	if not _committing_current():
 		return
-	if locked == null or not locked.ok():
+	if locked == null or not locked.ok() or not bool(party.snapshot(arranged_context).get("membership_locked", false)):
 		NetManager._flow_fail(self, _result_reason(locked, TEXT_MATCH_UNSEALED))
 		return
-	var verdict := _cohort_verdict(false)
-	if verdict != &"ready":
-		NetManager._flow_fail(self, _cohort_failure_text(verdict))
+	var problem := NetManager._initial_commit_problem(self)
+	if problem != &"":
+		NetManager.fail_initial_cohort(NetManager._commit_problem_text(problem))
+		return
+	var control := PartyService.encode_arranged_control(
+		match_id, match_round, PartyService.ARRANGED_PHASE_STARTING, start_generation, selected_keys)
+	if control.is_empty():
+		NetManager._flow_fail(self, TEXT_MATCH_UNSEALED)
+		return
+	var published: PartyService.PartyResult = await party.post_context_update(
+		arranged_context, control, {}, {}, deadline_msec)
+	_hold_operation(published)
+	if not _committing_current():
+		return
+	if published == null or not published.ok():
+		NetManager._flow_fail(self, _result_reason(published, TEXT_MATCH_UNSEALED))
 		return
 	NetManager._flow_start_initial_match(self)
 
 
+func _committing_current() -> bool:
+	return is_current() and phase == Phase.COMMITTING_START
+
+
 ## NetManager's match state moved. STARTING commits an initial start or begins a hosted
-## rematch round; RUNNING is where the first match's exact-cohort requirement ends.
+## rematch round; RUNNING is where the first match's hold on its chosen players ends.
 func on_match_state(state: NRTypes.MatchState) -> void:
 	if not is_current():
 		return
@@ -1981,32 +2841,41 @@ func on_match_state(state: NRTypes.MatchState) -> void:
 			_set_phase(Phase.COMMITTING_START)
 		elif phase == Phase.REMATCH_GATHERING:
 			_set_phase(Phase.GAMEPLAY)
+		elif phase == Phase.COMMITTING_START and role == Role.GUEST \
+				and session_origin == PartyService.PLAY_ORIGIN_PRIVATE and match_round == 0:
+			initial_start_seen = true
+			_private_catch_up_wanted = false
 	elif NRTypes.has_match_state(state, NRTypes.MatchState.RUNNING):
 		if phase == Phase.COMMITTING_START:
 			_set_phase(Phase.GAMEPLAY)
 
 
-## The match ended and this player is back in the lobby. The arranged host opens the next
-## round -- its reopen publishes the rematch phase and confirms the unlock before it takes
+## The match ended and this player is back in the lobby. The play session's host opens the
+## next round -- its reopen publishes the rematch phase and confirms the unlock before it takes
 ## anyone -- while a guest waits, at most 45 seconds, for the host to have done so, and may
-## leave at any moment.
+## leave at any moment. Matchmade or private, the session is the same one it played in.
 func on_returned_to_lobby() -> void:
-	if not is_current() or phase != Phase.GAMEPLAY or arranged_context == null:
+	if not is_current() or phase != Phase.GAMEPLAY or play_context == null:
 		return
-	if arranged_owner:
+	if hosts_play_session():
 		match_round += 1
 		host_returned = true
 		_set_phase(Phase.REMATCH_GATHERING)
 		return
 	host_returned = false
 	changed.emit()
-	reconcile_arranged()
+	if session_origin == PartyService.PLAY_ORIGIN_PRIVATE:
+		reconcile_private()
+	else:
+		reconcile_arranged()
 	if not host_returned:
 		NetManager._flow_wait_for_host_return(self)
 
 
-## Reduces the arranged lobby: its native owner, and the round and phase the owner
-## publishes. The owner leaving or changing is terminal in every arranged phase.
+## Reduces the arranged lobby: its native owner, and the round, phase and first-match choice the
+## owner publishes. The owner leaving or changing is terminal in every arranged phase. Before
+## the first match starts, one of this member's own premade known gone ends its attempt, host
+## or guest; and a guest the owner's published choice leaves out arrived after the cutoff.
 func reconcile_arranged() -> void:
 	if not is_current() or arranged_context == null:
 		return
@@ -2021,16 +2890,23 @@ func reconcile_arranged() -> void:
 			and fingerprint(owner) != fingerprint(arranged_owner_key):
 		NetManager._flow_fail(self, TEXT_MATCH_HOST_CHANGED)
 		return
+	if phase == Phase.ADMITTING_COHORT and _premade_member_lost(snapshot):
+		NetManager._flow_fail(self, TEXT_MATCH_MEMBER_LOST)
+		return
 	if arranged_owner:
 		return
-	var raw_properties: Variant = snapshot.get("properties", {})
-	if typeof(raw_properties) != TYPE_DICTIONARY:
-		return
-	var control: Dictionary = PartyService.decode_arranged_control(raw_properties as Dictionary)
+	var raw_control: Variant = snapshot.get("arranged_control", {})
+	var control: Dictionary = raw_control as Dictionary if typeof(raw_control) == TYPE_DICTIONARY else {}
 	if not bool(control.get("valid", false)):
 		return
 	if String(control.get("match_id", "")) != match_id:
 		NetManager._flow_fail(self, TEXT_ARRANGED_CHANGED)
+		return
+	if phase == Phase.ADMITTING_COHORT:
+		if _start_control_excludes_self(party, snapshot):
+			NetManager._flow_fail(self, TEXT_MATCH_ALREADY_STARTED)
+			return
+		NetManager._flow_reconcile_pending_start(self)
 		return
 	var control_round := int(control.get("round", 0))
 	if control_round < match_round:
@@ -2047,21 +2923,91 @@ func reconcile_arranged() -> void:
 	NetManager._flow_host_returned(self)
 
 
-## The arranged host's lobby admission for a rematch round, as one checked transaction:
+## Whether a member of this member's own frozen premade, once seen connected in the arranged
+## lobby, is gone or disconnected now. A key listed twice is a snapshot still settling, not a
+## loss: it is judged again on the next update, and the budget bounds the wait.
+func _premade_member_lost(snapshot: Dictionary) -> bool:
+	var roll := _member_states(snapshot)
+	if bool(roll.get("duplicate", false)):
+		return false
+	var members: Dictionary = roll.get("members", {})
+	for key: Dictionary in frozen_keys:
+		var mark := fingerprint(key)
+		if not _seen_connected.has(mark):
+			continue
+		var state: Dictionary = members.get(mark, {})
+		if state.is_empty() or not bool(state.get("connected", false)):
+			return true
+	return false
+
+
+## Reduces a private match's own lobby: its native owner, and the round and phase its owner
+## publishes. The owner leaving or changing is terminal. A guest waiting for the first match
+## reads its published start again; a guest back from a match learns from the round control
+## that the owner has opened the next round. A control naming another session means the lobby
+## is no longer this match's.
+func reconcile_private() -> void:
+	if not is_current() or play_context == null or session_origin != PartyService.PLAY_ORIGIN_PRIVATE:
+		return
+	if phase not in [Phase.COMMITTING_START, Phase.GAMEPLAY, Phase.REMATCH_GATHERING]:
+		return
+	var party := Services.party()
+	if party == null:
+		return
+	var snapshot: Dictionary = party.snapshot(play_context)
+	var owner := entity_key(snapshot.get("owner_key", {}))
+	if not owner.is_empty() and not play_owner.is_empty() and fingerprint(owner) != fingerprint(play_owner):
+		NetManager._flow_fail(self, TEXT_MATCH_HOST_CHANGED)
+		return
+	if role == Role.OWNER:
+		return
+	var raw_control: Variant = snapshot.get("private_control", {})
+	var control: Dictionary = raw_control as Dictionary if typeof(raw_control) == TYPE_DICTIONARY else {}
+	if not bool(control.get("valid", false)):
+		return
+	if String(control.get("session_id", "")) != session_id:
+		NetManager._flow_fail(self, TEXT_ARRANGED_CHANGED)
+		return
+	if phase == Phase.COMMITTING_START:
+		NetManager._flow_reconcile_pending_start(self)
+		_try_private_catch_up()
+		return
+	var control_round := int(control.get("round", 0))
+	if control_round < match_round:
+		return
+	if String(control.get("phase", "")) != PartyService.ARRANGED_PHASE_REMATCH \
+			or phase not in [Phase.GAMEPLAY, Phase.REMATCH_GATHERING]:
+		return
+	match_round = control_round
+	if host_returned and phase == Phase.REMATCH_GATHERING:
+		return
+	host_returned = true
+	_set_phase(Phase.REMATCH_GATHERING)
+	changed.emit()
+	NetManager._flow_host_returned(self)
+
+
+## The play session host's lobby admission for a rematch round, as one checked transaction:
 ## the owner-published phase first -- so an invite read after it is admitted or refused on
 ## the right side -- then the lock. Reopening publishes the rematch phase and confirms the
-## unlock; closing publishes gameplay and confirms the lock. The local gate is NetManager's.
-## A refusal is told in this title's words: the service's own are for its log.
+## unlock; closing publishes gameplay and confirms the lock. A matchmade session publishes its
+## own round control, a private one PartyService's private round control for its session; the
+## local gate is NetManager's. A refusal is told in this title's words: the service's own are
+## for its log.
 func set_rematch_open(open: bool) -> bool:
 	last_admission_error = ""
-	if not is_current() or not arranged_owner or arranged_context == null or phase != Phase.REMATCH_GATHERING:
+	if not is_current() or not hosts_play_session() or play_context == null or phase != Phase.REMATCH_GATHERING:
 		last_admission_error = "The match can only be reopened between rounds."
 		return false
 	var party := Services.party()
 	var deadline := _clock.deadline_after(RESTORE_SECONDS)
 	var target: String = PartyService.ARRANGED_PHASE_REMATCH if open else PartyService.ARRANGED_PHASE_GAMEPLAY
-	var posted: PartyService.PartyResult = await party.post_context_update(
-		arranged_context, PartyService.encode_arranged_control(match_id, match_round, target), {}, {}, deadline)
+	var posted: PartyService.PartyResult = null
+	if session_origin == PartyService.PLAY_ORIGIN_PRIVATE:
+		posted = await party.set_private_round_control(play_context, session_id, match_round, target, deadline)
+	else:
+		posted = await party.post_context_update(
+			play_context, PartyService.encode_arranged_control(match_id, match_round, target), {}, {}, deadline)
 	_hold_operation(posted)
 	if not is_current() or phase != Phase.REMATCH_GATHERING:
 		last_admission_error = "The match has ended."
@@ -2069,7 +3015,7 @@ func set_rematch_open(open: bool) -> bool:
 	if posted == null or not posted.ok():
 		last_admission_error = "The match could not be updated."
 		return false
-	var locked: PartyService.PartyResult = await party.set_context_locked(arranged_context, not open, deadline)
+	var locked: PartyService.PartyResult = await party.set_context_locked(play_context, not open, deadline)
 	_hold_operation(locked)
 	if not is_current() or phase != Phase.REMATCH_GATHERING:
 		last_admission_error = "The match has ended."
@@ -2092,6 +3038,49 @@ func in_arranged_session() -> bool:
 		Phase.ADMITTING_COHORT, Phase.COMMITTING_START, Phase.GAMEPLAY, Phase.REMATCH_GATHERING]
 
 
+## Whether the bound session is the flow's play session, whichever route made it: the arranged
+## lobby from its admissions on, or the group's own lobby from a private start's commit on.
+func in_play_session() -> bool:
+	if play_context == null:
+		return false
+	if phase == Phase.ADMITTING_COHORT:
+		return session_origin == PartyService.PLAY_ORIGIN_MATCHMADE
+	return phase in [Phase.COMMITTING_START, Phase.GAMEPLAY, Phase.REMATCH_GATHERING]
+
+
+## Whether this instance hosts the play session: the arranged native owner of a matchmade one,
+## the group's own owner of a private one.
+func hosts_play_session() -> bool:
+	if not in_play_session():
+		return false
+	if session_origin == PartyService.PLAY_ORIGIN_PRIVATE:
+		return role == Role.OWNER
+	return arranged_owner
+
+
+## The owner every member of the play session answers to.
+func play_owner_key() -> Dictionary:
+	if session_origin == PartyService.PLAY_ORIGIN_PRIVATE:
+		return play_owner.duplicate()
+	return arranged_owner_key.duplicate()
+
+
+## Whether this member is a guest waiting for its play session's first match to start: a
+## matchmade guest while the arranged host admits and chooses, or a private start's guest from
+## the owner's preparation until that match runs.
+func awaits_initial_start() -> bool:
+	if role == Role.OWNER and phase == Phase.PRIVATE_PREPARING:
+		return false
+	if hosts_play_session() or match_round != 0:
+		return false
+	if phase == Phase.ADMITTING_COHORT:
+		return session_origin == PartyService.PLAY_ORIGIN_MATCHMADE and not arranged_owner
+	if phase == Phase.PRIVATE_PREPARING:
+		return role == Role.GUEST
+	return phase == Phase.COMMITTING_START and role == Role.GUEST \
+		and session_origin == PartyService.PLAY_ORIGIN_PRIVATE
+
+
 # --- Retirement ---------------------------------------------------------------
 
 ## Ends this flow for good. Synchronous, so account loss and suspend can call it from
@@ -2108,6 +3097,7 @@ func retire(defer_native: bool = false) -> void:
 	retired = true
 	_restoring = false
 	_finish_sync()
+	_cancel_private_bound()
 	# A retired flow waits on nothing: an owned staging leave still in flight resumes its
 	# waiter now, and its late answer stays the service's to clean up.
 	_settle_owned_leave(null)
@@ -2177,14 +3167,14 @@ func note_cleanup_failed(failure: String) -> void:
 	changed.emit()
 
 
-## The pinned binding never answers a cancel that lost its race to a match, so that waiter
-## would hold the lease for good. It is native cleanup trouble, not a search still being
-## cancelled: once it has stood for the cancellation grace, with this flow's own lobbies
-## and transports already released, Party's bounded recovery resets the Party and Lobby
-## runtime -- never PlayFab itself, the account or its saves -- and the confirmed reset
-## discharges the old ticket. Asked again at the same pace for as long as it stands, until
-## Party reports that its recovery failed. Returns when the current stand began, or -1 while
-## nothing is orphaned.
+## A cancel that lost its race to a match is normally answered at once, and then nothing is
+## owed. One that is not answered would hold the lease for good. That is native cleanup
+## trouble, not a search still being cancelled: once it has stood for the cancellation grace,
+## with this flow's own lobbies and transports already released, Party's bounded recovery
+## resets the Party and Lobby runtime -- never PlayFab itself, the account or its saves -- and
+## the confirmed reset discharges the old ticket. Asked again at the same pace for as long as
+## it stands, until Party reports that its recovery failed. Returns when the current stand
+## began, or -1 while nothing is orphaned.
 func _recover_orphaned_cancel(since_msec: int) -> int:
 	var orphaned := false
 	for attempt: Variant in _unresolved_attempts:

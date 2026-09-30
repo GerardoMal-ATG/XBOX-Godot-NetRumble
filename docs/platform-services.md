@@ -230,8 +230,13 @@ once and never renewed by an event: **45 seconds** for the owner to open the gro
 chat, native lobby and Party creation, descriptor), the ordinary 45-second join budget for an
 invited member, **15 seconds** each for a freeze, a restoration and a member's state request,
 **600 seconds** for the search, then **30 seconds** for the arranged join, a separate **90** for
-the cohort, fresh network and admission -- with a 30-second slice for the arranged owner's
-network preparation -- and **30** from the exact four's admission to the first running game. A
+this member's own group, the fresh network and admission -- with a 30-second slice for the arranged
+owner's network preparation, and for the arranged owner also the wait for enough players to
+start -- and **30** from the moment the players the first match starts with are chosen to its first
+running game. A guest that is told the match is starting before it can read those chosen players
+waits at most until the earlier of its own 90-second budget and 30 seconds after it was told. A
+full group's private start has **15 seconds** from the moment all four are ready to its commit,
+and the same **30** from that commit to its first running game. A
 Matchmaking press is refused before any work while an earlier group's scoped Party work is still
 draining, while a ticket's cancellation is unconfirmed, while Party cleanup or recovery stands,
 and while the console is definitively offline.
@@ -244,7 +249,7 @@ member is connected in it, because PlayFab clears a lobby's owner when its owner
 member still inside would read that as the group's owner lost. That wait is not retirement: a
 loss during it still ends the group, and a wait past the handoff budget fails. Retirement counts
 only once the leave answered OK and the old lobby's work is finished; each member then marks it
-in the arranged lobby, and the first match commits only once all four have.
+in the arranged lobby, and the first match starts only once every player present has.
 
 The Multiplayer runtime owns lobbies and tickets alike. Only a **confirmed** Multiplayer shutdown
 during recovery is taken as proof that every old lobby and ticket is gone: the flow is retired
@@ -255,23 +260,24 @@ A stop is binding. Once a group has let a search go -- its owner cancelled, a me
 search timed out or failed, or an invitation replaced it -- a native match on that ticket is
 terminal proof but not a match to join: the old group joins nothing, reopens nothing and searches
 nothing again, and ends with *"A match was found just as the search stopped, so the group was
-closed."* The lease stays held while the ticket's native cleanup is owed. The addon this sample is
-built with never answers a cancel that loses this race, so once that waiter has stood for the
-five-second cancellation grace, with the old group's lobbies and transport already released, the
-flow hands it to Party's bounded recovery -- Party and Lobby only, never PlayFab itself, the
-account or its saves -- and the confirmed reset discharges it. A binding that answers the cancel
-releases the lease with no recovery at all. The obligation belongs to the multiplayer runtime,
-not to the flow or its account: if the account is removed or the title suspended before that
-grace ends, the deferred account teardown claims the same recovery before its global leave, and
-a match that lands on the old ticket after that teardown's first look -- even while its last step
-is still finishing -- is recovered before the teardown finishes. Online entry stays refused until
-the old ticket is discharged, and an invitation received meanwhile is kept, under the time it
-arrived, and joined once that cleanup has settled. A recovery that fails is not asked for again:
-the lease stays held, since the cleanup it guards never finished, and the retired flow and every
-entry the lease refuses -- Quick Match, Host, Join, Practice and a received invitation -- report
-Party's restart-required reason instead of a session still finishing. A received invitation is
-answered with it once. The outcome that ended the group is kept as it was, and quitting stays
-bounded by the one budget.
+closed."* The lease stays held while the ticket's native cleanup is owed. A cancel that loses this
+race is still answered -- the service reports the match that won it -- so it completes without any
+recovery: the group's ordinary cleanup of its lobbies and transport then finishes, and the lease is
+released with it. Only a cancel still unanswered once it has
+stood for the five-second cancellation grace, with the old group's lobbies and transport already
+released, is handed to Party's bounded recovery -- Party and Lobby only, never PlayFab itself, the
+account or its saves -- and the confirmed reset discharges it. That obligation belongs to the
+multiplayer runtime, not to the flow or its account: if the account is removed or the title
+suspended before that grace ends, the deferred account teardown claims the same recovery before its
+global leave, and an unanswered cancel on a ticket matched after that teardown's first look -- even
+while its last step is still finishing -- is recovered before the teardown finishes. Online entry
+stays refused until the old ticket is discharged, and an invitation received meanwhile is kept,
+under the time it arrived, and joined once that cleanup has settled. A recovery that fails is not
+asked for again: the lease stays held, since the cleanup it guards never finished, and the retired
+flow and every entry the lease refuses -- Quick Match, Host, Join, Practice and a received
+invitation -- report Party's restart-required reason instead of a session still finishing. A
+received invitation is answered with it once. The outcome that ended the group is kept as it was,
+and quitting stays bounded by the one budget.
 
 A lobby or Party transport whose native leave fails is cleanup still owed, not cleanup done. The
 group that left it keeps the lease until Party's recovery confirms the reset, and online entry

@@ -11,11 +11,13 @@ signal cleanup_state_changed()
 const QUEUE_NAME := "godotnr_q"
 const PROTOCOL_MEMBER_KEY := "nr_protocol"
 const SEARCH_TIMEOUT_SECONDS := 600
-const EXPECTED_MATCH_COUNT := 4
+const QUEUE_MIN_MATCH_SIZE := 2
+const QUEUE_MAX_MATCH_SIZE := 4
+const SESSION_CAPACITY := 4
 
 const FULL_PARTY_REASON_CODE := &"full_party_queue_max_rejected"
-const FULL_PARTY_REASON := "A full group of four cannot match in this four-player queue."
-const FULL_PARTY_GUIDANCE := "A full group of four also cannot match in this four-player queue. Use Host Match to play together."
+const FULL_PARTY_REASON := "Matchmaking rejected this full four-player ticket."
+const FULL_PARTY_GUIDANCE := "Return to the group and ready up to start a private match without searching."
 const TICKET_TOO_LARGE_HRESULT := 0x89235652
 const E_FAIL_HRESULT := 0x80004005
 const E_ABORT_HRESULT := 0x80004004
@@ -58,6 +60,7 @@ const REQUIRED_LOBBY_CONFIG_PROPERTIES := [
 	"restrict_invites_to_lobby_owner",
 ]
 const REQUIRED_LOBBY_UPDATE_PROPERTIES := [
+	"access_policy",
 	"lobby_properties",
 	"search_properties",
 ]
@@ -164,13 +167,14 @@ const REQUIRED_PARTY_METHODS := [
 const REQUIRED_PLAYFAB_METHODS := ["is_initialized"]
 const SAFE_NATIVE_CODES := [
 	"match_ticket_create_failed",
-	"match_ticket_failed",
 	"match_ticket_join_failed",
 	"match_ticket_create_start_failed",
 	"match_ticket_join_start_failed",
 	"match_ticket_cancel_start_failed",
 	"match_ticket_completed_failed",
+	"match_ticket_create_cancelled",
 	"match_ticket_join_cancelled",
+	"match_ticket_cancel_lost_race",
 	"invalid_match_ticket_config",
 	"invalid_match_ticket_member",
 	"invalid_join_match_ticket",
@@ -210,7 +214,7 @@ class SearchSpec extends RefCounted:
 	var owner := false
 	var mode: NRTypes.GameModeType = NRTypes.GameModeType.DEATHMATCH
 	var frozen_members: Array[Dictionary] = []
-	var expected_match_count := 4
+	var capacity := SESSION_CAPACITY
 	var deadline_msec := 0
 	var ticket_id := ""
 
@@ -229,7 +233,7 @@ class TicketAttempt extends RefCounted:
 	var mode: NRTypes.GameModeType = NRTypes.GameModeType.DEATHMATCH
 	var user: Variant = null
 	var frozen_members: Array[Dictionary] = []
-	var expected_match_count := 4
+	var capacity := SESSION_CAPACITY
 	var deadline_msec := 0
 	var clock: OnlineFlowClock = null
 	var ticket: Variant = null
@@ -336,7 +340,7 @@ func runtime_profile(
 			mode,
 			&"profile_missing")
 	var player_count := int(config.player_count)
-	if player_count != EXPECTED_MATCH_COUNT:
+	if player_count != SESSION_CAPACITY:
 		return _profile_failure(
 			mode,
 			&"profile_count_mismatch",
@@ -344,7 +348,10 @@ func runtime_profile(
 	return {
 		"ok": true,
 		"mode": int(mode),
+		"capacity": player_count,
 		"player_count": player_count,
+		"queue_min_match_size": QUEUE_MIN_MATCH_SIZE,
+		"queue_max_match_size": QUEUE_MAX_MATCH_SIZE,
 		"reason_code": "",
 		"reason": "",
 	}
@@ -598,7 +605,7 @@ static func failure_outcome(
 			base_reason = "Could not join the group's matchmaking ticket."
 	var hresult := int(_failure_value(result, &"hresult", 0)) & 0xFFFFFFFF
 	if hresult == TICKET_TOO_LARGE_HRESULT:
-		if owner and member_count == EXPECTED_MATCH_COUNT:
+		if owner and member_count == QUEUE_MAX_MATCH_SIZE:
 			return {
 				"reason_code": FULL_PARTY_REASON_CODE,
 				"reason": FULL_PARTY_REASON,
@@ -616,7 +623,7 @@ static func failure_outcome(
 	var native_code := String(_failure_value(result, &"code", "")).strip_edges()
 	var cause_available := _failure_cause_available(
 		result, hresult, native_code)
-	if not cause_available and owner and member_count == EXPECTED_MATCH_COUNT:
+	if not cause_available and owner and member_count == QUEUE_MAX_MATCH_SIZE:
 		base_reason = "%s %s" % [base_reason, FULL_PARTY_GUIDANCE]
 	return {
 		"reason_code": base_code,
@@ -654,7 +661,7 @@ static func _failure_cause_available(
 			and normalized_code in [
 				"",
 				"match_ticket_create_failed",
-				"match_ticket_failed",
+				"match_ticket_completed_failed",
 				"match_ticket_join_failed",
 			]:
 		return false
@@ -688,6 +695,9 @@ func _cancel_completion_reason(result: Variant) -> StringName:
 	var hresult := _normalized_hresult(result)
 	if code == "cancelled" and hresult == E_ABORT_HRESULT:
 		return &"cancel_released_by_reset"
+	if code == "match_ticket_cancel_lost_race" \
+			and hresult == E_ABORT_HRESULT:
+		return &"cancel_lost_race"
 	return &"cancel_observer_aborted"
 
 
@@ -755,7 +765,7 @@ func _new_attempt(spec: SearchSpec, owner: bool) -> TicketAttempt:
 	attempt.flow_epoch = spec.flow_epoch
 	attempt.mode = spec.mode
 	attempt.frozen_members = _copy_member_keys(spec.frozen_members)
-	attempt.expected_match_count = spec.expected_match_count
+	attempt.capacity = spec.capacity
 	attempt.deadline_msec = spec.deadline_msec
 	attempt.ticket_id = spec.ticket_id.strip_edges()
 	if attempt.deadline_msec <= 0:
@@ -771,12 +781,13 @@ func _validate_attempt(attempt: TicketAttempt, owner: bool) -> Dictionary:
 	var profile := runtime_profile(attempt.mode)
 	if not bool(profile.get("ok", false)):
 		return profile
-	if attempt.expected_match_count != int(profile.get("player_count", 0)) \
-		or attempt.expected_match_count != EXPECTED_MATCH_COUNT:
+	if attempt.capacity != int(profile.get("capacity", 0)) \
+		or attempt.capacity != SESSION_CAPACITY:
 		return _validation_failure(
-			"The matchmaking request does not match the configured four-player profile.",
+		"The matchmaking request does not match the configured capacity-four profile.",
 			&"profile_request_mismatch")
-	if attempt.frozen_members.size() < 1 or attempt.frozen_members.size() > EXPECTED_MATCH_COUNT:
+	if attempt.frozen_members.size() < 1 \
+		or attempt.frozen_members.size() > attempt.capacity:
 		return _validation_failure("Matchmaking groups must contain between one and four players.")
 	if _now_msec(attempt.clock) >= attempt.deadline_msec:
 		return _validation_failure("The matchmaking deadline has already expired.")
@@ -836,9 +847,12 @@ func _profile_failure(
 	return {
 		"ok": false,
 		"mode": int(mode),
+		"capacity": player_count,
 		"player_count": player_count,
+		"queue_min_match_size": QUEUE_MIN_MATCH_SIZE,
+		"queue_max_match_size": QUEUE_MAX_MATCH_SIZE,
 		"reason_code": String(code),
-		"reason": "Quick Match needs the four-player Deathmatch settings.",
+		"reason": "Quick Match needs the capacity-four Deathmatch settings.",
 	}
 
 
@@ -871,12 +885,12 @@ func _create_ticket(attempt: TicketAttempt) -> void:
 			"The PlayFab matchmaking service is unavailable.", null, &"create")
 		return
 
-	# REVIEW: Full-party submission is deliberate for xplat parity.
+	# A full group normally starts without matchmaking. Keep this service-boundary
+	# classification for any maximum-sized ticket that still reaches the queue.
 	# Microsoft Learn, "Configuring matchmaking queues":
 	# "If a ticket already meets the maximum requirement for a match, however, it is rejected."
-	# godotnr_q has MaxMatchSize = 4: a full party of four is submitted and will be rejected.
-	# Follow-up proposal: "Private Start" starts a full party directly, with no ticket.
-	# Until that change is approved, recover this rejection to gathering; do not silently host.
+	# godotnr_q has MaxMatchSize = 4, so this remains a matchmaking failure rather than
+	# a signal to choose a different route after the request has already been submitted.
 	var result: Variant = await multiplayer.create_match_ticket_async(attempt.user, config)
 	attempt.create_in_flight = false
 	cleanup_state_changed.emit()
@@ -888,6 +902,11 @@ func _create_ticket(attempt: TicketAttempt) -> void:
 		_cleanup_late_result(attempt, result)
 		return
 	if not _result_ok(result):
+		if _observe_result_ticket(attempt, result, &"create"):
+			return
+		if _result_code(result) == "match_ticket_create_cancelled":
+			_finish_cancelled(attempt)
+			return
 		_finish_create_failure(attempt, result)
 		return
 	var ticket: Variant = _result_data(result)
@@ -932,6 +951,8 @@ func _join_ticket(attempt: TicketAttempt) -> void:
 		_cleanup_late_result(attempt, result)
 		return
 	if not _result_ok(result):
+		if _observe_result_ticket(attempt, result, &"join"):
+			return
 		_finish_failed(attempt, &"ticket_join_failed",
 			"Could not join the group's matchmaking ticket.", result, &"join")
 		return
@@ -1010,7 +1031,11 @@ func _on_ticket_changed(change: Variant, attempt: TicketAttempt) -> void:
 func _reconcile_ticket(attempt: TicketAttempt, terminal_result: Variant = null) -> void:
 	if attempt == null or attempt.ticket == null or not _attempt_epoch_current(attempt):
 		return
-	var observed := _observe_terminal_snapshot(attempt, terminal_result)
+	var observed := _observe_terminal_snapshot(
+		attempt,
+		terminal_result,
+		attempt.ticket,
+		&"terminal")
 	if bool(observed.get("terminal", false)):
 		return
 	var changed := bool(observed.get("changed", false))
@@ -1025,12 +1050,17 @@ func _reconcile_ticket(attempt: TicketAttempt, terminal_result: Variant = null) 
 
 func _observe_terminal_snapshot(
 	attempt: TicketAttempt,
-	terminal_result: Variant = null
+	terminal_result: Variant = null,
+	ticket_snapshot: Variant = null,
+	failure_stage: StringName = &"terminal"
 ) -> Dictionary:
-	if attempt == null or attempt.ticket == null:
+	if attempt == null:
 		return {"terminal": false, "changed": false, "status": -1}
-	var status := int(_object_value(attempt.ticket, &"status", -1))
-	var ticket_id := String(_object_value(attempt.ticket, &"ticket_id", attempt.ticket_id))
+	var ticket: Variant = ticket_snapshot if ticket_snapshot != null else attempt.ticket
+	if ticket == null:
+		return {"terminal": false, "changed": false, "status": -1}
+	var status := int(_object_value(ticket, &"status", -1))
+	var ticket_id := String(_object_value(ticket, &"ticket_id", attempt.ticket_id))
 	var changed := status != attempt.status or ticket_id != attempt.ticket_id
 	attempt.status = status
 	attempt.ticket_id = ticket_id
@@ -1045,15 +1075,15 @@ func _observe_terminal_snapshot(
 		attempt.progress_changed.emit(attempt)
 	match status:
 		STATUS_MATCHED:
-			attempt.match_id = String(_object_value(attempt.ticket, &"match_id", ""))
+			attempt.match_id = String(_object_value(ticket, &"match_id", ""))
 			attempt.arrangement = String(_object_value(
-				attempt.ticket, &"arranged_lobby_connection_string", ""))
+				ticket, &"arranged_lobby_connection_string", ""))
 			attempt.native_terminal = true
 			_cancel_deadline_alarm(attempt)
-			_notify_native_terminal(attempt)
-			if attempt.is_pending():
-				attempt.settle(Outcome.MATCHED)
-			_complete_native_cleanup(attempt)
+			if attempt.cancel_in_flight:
+				cleanup_state_changed.emit()
+			else:
+				_finalize_matched_terminal(attempt)
 		STATUS_CANCELLED:
 			attempt.native_terminal = true
 			_cancel_deadline_alarm(attempt)
@@ -1062,12 +1092,12 @@ func _observe_terminal_snapshot(
 				attempt.settle(Outcome.CANCELLED)
 			_complete_native_cleanup(attempt)
 		STATUS_FAILED:
-			var diagnostic := _ticket_diagnostic(attempt.ticket, terminal_result)
+			var diagnostic := _ticket_diagnostic(ticket, terminal_result)
 			attempt.native_terminal = true
 			_cancel_deadline_alarm(attempt)
 			var failure := failure_outcome(
 				terminal_result,
-				&"terminal",
+				failure_stage,
 				attempt.owner,
 				attempt.frozen_members.size())
 			var failure_code := StringName(failure.get(
@@ -1075,7 +1105,7 @@ func _observe_terminal_snapshot(
 			var failure_reason := String(failure.get(
 				"reason", "Matchmaking failed before a match was found."))
 			_log_ticket_failure(
-				attempt, &"terminal", failure_code, terminal_result, status)
+				attempt, failure_stage, failure_code, terminal_result, status)
 			_notify_native_terminal(attempt)
 			if attempt.is_pending():
 				attempt.settle(
@@ -1088,6 +1118,15 @@ func _observe_terminal_snapshot(
 					else "%s | terminal=%s" % [attempt.diagnostic, diagnostic]
 			_complete_native_cleanup(attempt)
 	return {"terminal": true, "changed": changed, "status": status}
+
+
+func _finalize_matched_terminal(attempt: TicketAttempt) -> void:
+	if attempt == null or not attempt.native_terminal:
+		return
+	_notify_native_terminal(attempt)
+	if attempt.is_pending():
+		attempt.settle(Outcome.MATCHED)
+	_complete_native_cleanup(attempt)
 
 
 func _complete_native_cleanup(attempt: TicketAttempt) -> void:
@@ -1104,18 +1143,26 @@ func _cancel_ticket(attempt: TicketAttempt) -> void:
 	if attempt == null or attempt.ticket == null or attempt.cancel_in_flight \
 		or not _attempt_epoch_current(attempt):
 		return
-	if bool(_observe_terminal_snapshot(attempt).get("terminal", false)):
+	if bool(_observe_terminal_snapshot(
+		attempt, null, attempt.ticket, &"terminal").get("terminal", false)):
 		return
+	var captured_ticket: Variant = attempt.ticket
 	attempt.cancel_in_flight = true
 	_set_cleanup_pending(attempt, true)
-	var result: Variant = await attempt.ticket.cancel_async()
+	var result: Variant = await captured_ticket.cancel_async()
 	attempt.cancel_in_flight = false
 	cleanup_state_changed.emit()
 	if not _attempt_epoch_current(attempt):
 		_prune_attempts()
 		return
-	if attempt.ticket != null:
-		_observe_terminal_snapshot(attempt, result)
+	var result_ticket: Variant = _ticket_snapshot_from_result(result)
+	var snapshot: Variant = result_ticket if result_ticket != null else captured_ticket
+	if snapshot != null:
+		_observe_terminal_snapshot(attempt, result, snapshot, &"terminal")
+	var result_code := _result_code(result)
+	if result_code == "invalid_match_ticket" and attempt.native_terminal:
+		_complete_native_cleanup(attempt)
+		return
 	if attempt.native_terminal:
 		if not _result_ok(result) and attempt.status == STATUS_MATCHED:
 			_log_ticket_failure(
@@ -1223,8 +1270,20 @@ func _cleanup_late_result(attempt: TicketAttempt, result: Variant) -> void:
 	if not _attempt_epoch_current(attempt):
 		_prune_attempts()
 		return
+	var ticket: Variant = _ticket_snapshot_from_result(result)
+	if ticket != null:
+		var observed := _observe_terminal_snapshot(
+			attempt,
+			result,
+			ticket,
+			&"join" if not attempt.owner else &"create")
+		if bool(observed.get("terminal", false)):
+			_prune_attempts()
+			return
+	if _result_code(result) == "match_ticket_create_cancelled":
+		_finish_cancelled(attempt)
+		return
 	if _result_ok(result):
-		var ticket: Variant = _result_data(result)
 		if ticket != null:
 			_attach_ticket(attempt, ticket)
 			_set_cleanup_pending(attempt, true)
@@ -1235,6 +1294,18 @@ func _cleanup_late_result(attempt: TicketAttempt, result: Variant) -> void:
 		attempt.native_terminal = true
 		_set_cleanup_pending(attempt, false)
 	_prune_attempts()
+
+
+func _finish_cancelled(attempt: TicketAttempt) -> void:
+	if attempt == null:
+		return
+	attempt.status = STATUS_CANCELLED
+	attempt.native_terminal = true
+	_cancel_deadline_alarm(attempt)
+	_notify_native_terminal(attempt)
+	if attempt.is_pending():
+		attempt.settle(Outcome.CANCELLED)
+	_complete_native_cleanup(attempt)
 
 
 func _finish_create_failure(attempt: TicketAttempt, result: Variant) -> void:
@@ -1454,6 +1525,34 @@ func _result_ok(result: Variant) -> bool:
 
 func _result_data(result: Variant) -> Variant:
 	return _object_value(result, &"data", null)
+
+
+func _result_code(result: Variant) -> String:
+	return String(_object_value(result, &"code", "")).strip_edges().to_lower()
+
+
+func _observe_result_ticket(
+	attempt: TicketAttempt,
+	result: Variant,
+	failure_stage: StringName
+) -> bool:
+	var ticket: Variant = _ticket_snapshot_from_result(result)
+	if ticket == null:
+		return false
+	var observed := _observe_terminal_snapshot(
+		attempt,
+		result,
+		ticket,
+		failure_stage)
+	return bool(observed.get("terminal", false))
+
+
+func _ticket_snapshot_from_result(result: Variant) -> Variant:
+	var data: Variant = _result_data(result)
+	if not (data is Object) or not _object_has_property(data, &"status") \
+		or not _object_has_property(data, &"ticket_id"):
+		return null
+	return data
 
 
 func _diagnostic(result: Variant) -> String:

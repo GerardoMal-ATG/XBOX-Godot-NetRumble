@@ -33,7 +33,15 @@ extends RefCounted
 ##
 ## 2: the matchmaking phase detail gained `request_id`, the correlation a staging
 ## owner echoes when it answers a guest's state-replay request.
-const WIRE_VERSION := 2
+## 3: the arranged match owner's lobby control gained the start generation and the set of
+## players the first match starts with, and a `starting` phase: a match starts with the
+## players who have arrived rather than a fixed four. A full group's private match uses the
+## same control under its own origin and session id; its group's search envelope gained a
+## `private` phase; the phase messages gained the private start's preparation and commit, the
+## commit carrying the session id; a member's report also acknowledges a Gathering epoch; and
+## the answer to a member's state request during the private match's first start carries its
+## session, round, start generation and match state.
+const WIRE_VERSION := 3
 
 ## Bump when the @rpc method set on NetManager changes in any way -- one added, one
 ## removed, one renamed, or the signature of an existing one altered.

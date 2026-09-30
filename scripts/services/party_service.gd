@@ -66,9 +66,16 @@ const GAME_MODE_KEY := "string_key2"
 const LOBBY_KIND_KEY := "string_key4"
 const LOBBY_KIND_STAGING := "matchmaking_staging"
 const LOBBY_KIND_ARRANGED := "arranged"
+const LOBBY_KIND_PRIVATE := "private_group"
+const PLAY_ORIGIN_MATCHMADE := &"matchmade"
+const PLAY_ORIGIN_PRIVATE := &"private"
+const PLAY_ORIGIN_KEY := "nr_play_origin"
+const PRIVATE_SESSION_ID_KEY := "nr_session_id"
 const SEARCH_CONTROL_KEY := "nr_search"
 const SESSION_PHASE_KEY := "nr_phase"
 const ROUND_GENERATION_KEY := "nr_round"
+const START_GENERATION_KEY := "nr_start_generation"
+const START_MEMBERS_KEY := "nr_start_members"
 const MATCH_ID_MEMBER_KEY := "nr_match_id"
 const MATCH_ORIGIN_MEMBER_KEY := "nr_matchmaking_origin"
 const MATCH_ORIGIN_VALUE := "matchmaking"
@@ -77,6 +84,7 @@ const STAGING_RETIRED_MEMBER_KEY := "nr_staging_retired"
 const MATCHMAKING_INVITATION_ID := "NetRumble"
 const SEARCH_CONTROL_SCHEMA := 1
 const ARRANGED_PHASE_BOOTSTRAP := "bootstrap"
+const ARRANGED_PHASE_STARTING := "starting"
 const ARRANGED_PHASE_GAMEPLAY := "gameplay"
 const ARRANGED_PHASE_REMATCH := "rematch_gathering"
 const CLEANUP_CLEAR := &"clear"
@@ -94,6 +102,10 @@ const POLL_INTERVAL := 0.1
 ## Variant, so the addon's own constants are not visible to the parser.
 const MEMBERSHIP_LOCK_UNLOCKED := 0
 const MEMBERSHIP_LOCK_LOCKED := 1
+const ACCESS_POLICY_PUBLIC := 0
+const ACCESS_POLICY_PRIVATE := 2
+const OWNER_MIGRATION_AUTOMATIC := 0
+const OWNER_MIGRATION_NONE := 2
 
 ## How long a membership-lock update is waited on before the title stops waiting on it.
 ## A lock is on the path between pressing ready and the match starting, so it cannot be
@@ -219,6 +231,8 @@ const SAFE_NATIVE_CODES := [
 	"party_descriptor_invalid",
 	"party_transport_create_failed",
 	"party_peer_not_connected",
+	"party_handshake_endpoint_entity_unavailable",
+	"party_handshake_entity_mismatch",
 	"party_not_initialized",
 	"party_already_initialized",
 	"party_invalid_options",
@@ -274,7 +288,10 @@ class LobbyContext extends RefCounted:
 	var flow_epoch: int = 0
 	var recovery_epoch: int = 0
 	var operation_id: int = 0
-	var expected_count: int = 0
+	var capacity: int = 0
+	var selected_start_count: int = 0
+	var play_origin: StringName = &""
+	var private_session_id := ""
 	var local_creator: bool = false
 	var owner_key: Dictionary = {}
 	var active_permit: int = 0
@@ -371,6 +388,8 @@ class PartyResult extends RefCounted:
 	var descriptor_ready := false
 	var descriptor := ""
 	var publication_permit := 0
+	var play_origin: StringName = &""
+	var private_session_id := ""
 	var cleanup_pending := false
 	var operation: ScopedOperation = null
 
@@ -825,7 +844,11 @@ func _join_lobby_by_connection_string(user: Variant, connection_string: String, 
 	var search_properties: Dictionary = search_value as Dictionary \
 		if typeof(search_value) == TYPE_DICTIONARY else {}
 	var kind := String(search_properties.get(LOBBY_KIND_KEY, ""))
-	if kind == LOBBY_KIND_STAGING or kind == LOBBY_KIND_ARRANGED:
+	if kind in [
+		LOBBY_KIND_STAGING,
+		LOBBY_KIND_ARRANGED,
+		LOBBY_KIND_PRIVATE,
+	]:
 		var unavailable_reason := _matchmaking_join_unavailable_reason()
 		if not unavailable_reason.is_empty():
 			await _leave_lobby_instance(joined_lobby)
@@ -869,7 +892,11 @@ func _join_scoped_lobby(
 	kind: String,
 	operation: int
 ) -> Dictionary:
-	var role := &"staging" if kind == LOBBY_KIND_STAGING else &"arranged"
+	var role := &"staging"
+	if kind == LOBBY_KIND_ARRANGED:
+		role = &"arranged"
+	elif kind == LOBBY_KIND_PRIVATE:
+		role = &"private_rematch"
 	var context := _new_context(
 		role, kind, user, _operation_account_generation, 0)
 	var context_operation := context.operation_id
@@ -879,10 +906,13 @@ func _join_scoped_lobby(
 		NRProtocol.LOBBY_KEY, ""))
 	var destination := "staging_gathering"
 	var match_id := ""
+	var private_session_id := ""
+	var play_origin: StringName = &""
 	var round := 0
 	var owner_key: Dictionary = state.owner_key
-	context.expected_count = int(state.max_members)
-	if bool(state.disconnected) or context.expected_count != MatchmakingService.EXPECTED_MATCH_COUNT:
+	context.capacity = int(state.max_members)
+	if bool(state.disconnected) \
+			or context.capacity != MatchmakingService.SESSION_CAPACITY:
 		await leave_lobby(context)
 		return _kind_refusal(
 			"That matchmaking lobby is no longer available.",
@@ -905,6 +935,21 @@ func _join_scoped_lobby(
 		owner_key = (arranged.get("owner_key", {}) as Dictionary).duplicate()
 		context.owner_key = owner_key.duplicate()
 		destination = "arranged_rematch"
+		play_origin = PLAY_ORIGIN_MATCHMADE
+	elif kind == LOBBY_KIND_PRIVATE:
+		var private := _validate_private_rematch_state(state, true)
+		if not bool(private.get("ok", false)):
+			await leave_lobby(context)
+			return _kind_refusal(String(private.get(
+				"error",
+				"That private match is not accepting rematch players.")), kind)
+		protocol = String(private.get("protocol", ""))
+		private_session_id = String(private.get("private_session_id", ""))
+		round = int(private.get("round", 0))
+		owner_key = (private.get("owner_key", {}) as Dictionary).duplicate()
+		context.owner_key = owner_key.duplicate()
+		destination = "private_rematch"
+		play_origin = PLAY_ORIGIN_PRIVATE
 	else:
 		var search_control: Dictionary = state.search_control
 		if bool(search_control.get("valid", false)) \
@@ -921,10 +966,13 @@ func _join_scoped_lobby(
 
 	var member_properties := {
 		MatchmakingService.PROTOCOL_MEMBER_KEY: NRProtocol.version_string(),
-		MATCH_ORIGIN_MEMBER_KEY: MATCH_ORIGIN_VALUE,
 	}
+	if kind != LOBBY_KIND_PRIVATE:
+		member_properties[MATCH_ORIGIN_MEMBER_KEY] = MATCH_ORIGIN_VALUE
 	if kind == LOBBY_KIND_ARRANGED:
 		member_properties[MATCH_ID_MEMBER_KEY] = match_id
+	elif kind == LOBBY_KIND_PRIVATE:
+		member_properties[PRIVATE_SESSION_ID_KEY] = private_session_id
 	var member_post := await post_context_update(
 		context, {}, {}, member_properties, _operation_deadline_msec)
 	if not member_post.ok():
@@ -945,6 +993,20 @@ func _join_scoped_lobby(
 			await leave_lobby(context)
 			return _kind_refusal(
 				"That arranged match changed while the invitation was being accepted.",
+				kind)
+	elif kind == LOBBY_KIND_PRIVATE:
+		state = snapshot(context)
+		var confirmed_private := _validate_private_rematch_state(state)
+		if not bool(confirmed_private.get("ok", false)) \
+			or String(confirmed_private.get(
+				"private_session_id", "")) != private_session_id \
+			or int(confirmed_private.get("round", -1)) != round \
+			or not _entity_keys_match(
+				confirmed_private.get("owner_key", {}) as Dictionary,
+				owner_key):
+			await leave_lobby(context)
+			return _kind_refusal(
+				"That private match changed while the invitation was being accepted.",
 				kind)
 
 	var descriptor_result := await _await_context_transport_properties(
@@ -967,6 +1029,32 @@ func _join_scoped_lobby(
 		or not _context_operation_current(context, context_operation):
 		await leave_lobby(context)
 		return _kind_refusal("Join cancelled.", kind)
+	state = snapshot(context)
+	if kind == LOBBY_KIND_ARRANGED:
+		var final_arranged := _validate_arranged_rematch_state(state)
+		if not bool(final_arranged.get("ok", false)) \
+				or String(final_arranged.get("match_id", "")) != match_id \
+				or int(final_arranged.get("round", -1)) != round \
+				or not _entity_keys_match(
+					final_arranged.get("owner_key", {}) as Dictionary,
+					owner_key):
+			await leave_lobby(context)
+			return _kind_refusal(
+				"That arranged match changed while the invitation was being accepted.",
+				kind)
+	elif kind == LOBBY_KIND_PRIVATE:
+		var final_private := _validate_private_rematch_state(state)
+		if not bool(final_private.get("ok", false)) \
+				or String(final_private.get(
+					"private_session_id", "")) != private_session_id \
+				or int(final_private.get("round", -1)) != round \
+				or not _entity_keys_match(
+					final_private.get("owner_key", {}) as Dictionary,
+					owner_key):
+			await leave_lobby(context)
+			return _kind_refusal(
+				"That private match changed while the invitation was being accepted.",
+				kind)
 	_begin_owned_call(context)
 	var network: Variant = await party.join_network_async(
 		user, descriptor_result.descriptor, cfg)
@@ -988,6 +1076,9 @@ func _join_scoped_lobby(
 		return _kind_refusal(
 			"The Party service did not return a usable transport.",
 			kind)
+	context.play_origin = play_origin
+	context.private_session_id = private_session_id
+	context.selected_start_count = 0
 	_end_owned_call(context)
 	join_code = ""
 	var joined := {
@@ -1000,10 +1091,19 @@ func _join_scoped_lobby(
 		"destination": destination,
 	}
 	if kind == LOBBY_KIND_ARRANGED:
+		joined["play_origin"] = String(PLAY_ORIGIN_MATCHMADE)
 		joined["match_id"] = match_id
 		joined["round"] = round
 		joined["owner_key"] = owner_key
-		joined["expected_count"] = context.expected_count
+		joined["capacity"] = context.capacity
+		joined["selected_start_count"] = context.selected_start_count
+	elif kind == LOBBY_KIND_PRIVATE:
+		joined["play_origin"] = String(PLAY_ORIGIN_PRIVATE)
+		joined["private_session_id"] = private_session_id
+		joined["round"] = round
+		joined["owner_key"] = owner_key
+		joined["capacity"] = context.capacity
+		joined["selected_start_count"] = 0
 	return joined
 
 
@@ -1012,7 +1112,7 @@ func _validate_arranged_rematch_state(
 	allow_local_unwritten: bool = false
 ) -> Dictionary:
 	if bool(state.get("disconnected", true)) \
-		or int(state.get("max_members", 0)) != MatchmakingService.EXPECTED_MATCH_COUNT \
+		or int(state.get("max_members", 0)) != MatchmakingService.SESSION_CAPACITY \
 		or int(state.get("access_policy", -1)) != 2 \
 		or int(state.get("owner_migration", -1)) != 0 \
 		or bool(state.get("restrict_invites_to_owner", true)) \
@@ -1082,6 +1182,97 @@ func _validate_arranged_rematch_state(
 	return {
 		"ok": true,
 		"match_id": match_id,
+		"round": int(control.get("round", 0)),
+		"owner_key": owner_key,
+		"protocol": owner_protocol,
+	}
+
+
+func _validate_private_rematch_state(
+	state: Dictionary,
+	allow_local_unwritten: bool = false
+) -> Dictionary:
+	if bool(state.get("disconnected", true)) \
+			or int(state.get("max_members", 0)) \
+				!= MatchmakingService.SESSION_CAPACITY \
+			or int(state.get("access_policy", -1)) != ACCESS_POLICY_PRIVATE \
+			or int(state.get("owner_migration", -1)) != OWNER_MIGRATION_NONE \
+			or bool(state.get("membership_locked", true)):
+		return {
+			"ok": false,
+			"error": "That private match is not accepting rematch players.",
+		}
+	var control_value: Variant = state.get("private_control", {})
+	var control: Dictionary = control_value as Dictionary \
+		if typeof(control_value) == TYPE_DICTIONARY else {}
+	if not bool(control.get("valid", false)) \
+			or String(control.get("phase", "")) != ARRANGED_PHASE_REMATCH \
+			or int(control.get("round", 0)) < 1 \
+			or int(control.get("start_generation", -1)) != 0 \
+			or int(control.get("selected_count", -1)) != 0:
+		return {
+			"ok": false,
+			"error": "That private match is not in rematch gathering.",
+		}
+	var owner_value: Variant = state.get("owner_key", {})
+	var owner_key := _copy_entity_key(owner_value as Dictionary) \
+		if typeof(owner_value) == TYPE_DICTIONARY else {}
+	if owner_key.is_empty():
+		return {
+			"ok": false,
+			"error": "That private match has no current owner.",
+		}
+	var session_id := String(control.get("session_id", ""))
+	var owner_protocol := ""
+	var owner_present := false
+	var local_value: Variant = state.get("local_key", {})
+	var local_key := _copy_entity_key(local_value as Dictionary) \
+		if typeof(local_value) == TYPE_DICTIONARY else {}
+	var members_value: Variant = state.get("members", [])
+	var members: Array = members_value as Array \
+		if typeof(members_value) == TYPE_ARRAY else []
+	for member_value: Variant in members:
+		if typeof(member_value) != TYPE_DICTIONARY:
+			continue
+		var member := member_value as Dictionary
+		if not bool(member.get("connected", false)):
+			continue
+		var key_value: Variant = member.get("key", {})
+		var key := _copy_entity_key(key_value as Dictionary) \
+			if typeof(key_value) == TYPE_DICTIONARY else {}
+		var properties_value: Variant = member.get("properties", {})
+		var properties: Dictionary = properties_value as Dictionary \
+			if typeof(properties_value) == TYPE_DICTIONARY else {}
+		var member_protocol := String(properties.get(
+			MatchmakingService.PROTOCOL_MEMBER_KEY, ""))
+		var member_session := String(properties.get(
+			PRIVATE_SESSION_ID_KEY, ""))
+		if allow_local_unwritten and _entity_keys_match(key, local_key) \
+				and member_protocol.is_empty() \
+				and member_session.is_empty():
+			continue
+		if not NRProtocol.is_compatible(member_protocol):
+			return {
+				"ok": false,
+				"error": "That private match has incompatible member metadata.",
+			}
+		if _entity_keys_match(key, local_key) \
+				and member_session != session_id:
+			return {
+				"ok": false,
+				"error": "That private match invitation is no longer current.",
+			}
+		if _entity_keys_match(key, owner_key):
+			owner_present = true
+			owner_protocol = member_protocol
+	if not owner_present:
+		return {
+			"ok": false,
+			"error": "That private match owner is not connected.",
+		}
+	return {
+		"ok": true,
+		"private_session_id": session_id,
 		"round": int(control.get("round", 0)),
 		"owner_key": owner_key,
 		"protocol": owner_protocol,
@@ -1805,7 +1996,8 @@ func create_staging(
 	flow_epoch: int,
 	deadline_msec: int = 0
 ) -> PartyResult:
-	if user == null or capacity != 4 or mode_name.strip_edges().is_empty():
+	if user == null or capacity != MatchmakingService.SESSION_CAPACITY \
+			or mode_name.strip_edges().is_empty():
 		return _context_failure(
 			PartyResult.Outcome.INVALID,
 			&"invalid_staging_spec",
@@ -1828,7 +2020,7 @@ func create_staging(
 				else "The previous online session is still being cleaned up.")
 
 	var context := _new_context(&"staging", LOBBY_KIND_STAGING, user, account_generation, flow_epoch)
-	context.expected_count = capacity
+	context.capacity = capacity
 	var operation := _begin_scoped_operation(
 		context,
 		&"create_staging",
@@ -2085,12 +2277,12 @@ func join_arranged(
 	user: Variant,
 	arrangement: String,
 	member_properties: Dictionary,
-	expected_count: int,
+	capacity: int,
 	account_generation: int,
 	flow_epoch: int,
 	deadline_msec: int = 0
 ) -> PartyResult:
-	if expected_count != MatchmakingService.EXPECTED_MATCH_COUNT:
+	if capacity != MatchmakingService.SESSION_CAPACITY:
 		return _context_failure(
 			PartyResult.Outcome.INVALID,
 			&"arranged_profile_mismatch",
@@ -2119,14 +2311,15 @@ func join_arranged(
 			&"arranged_join_unavailable",
 			"This build cannot configure an arranged lobby.")
 
-	config.max_member_count = expected_count
+	config.max_member_count = capacity
 	config.access_policy = 2
 	config.owner_migration_policy = 0
 	config.restrict_invites_to_lobby_owner = false
 	config.member_properties = member_properties.duplicate(true)
 	var context := _new_context(
 		&"arranged", LOBBY_KIND_ARRANGED, user, account_generation, flow_epoch)
-	context.expected_count = expected_count
+	context.capacity = capacity
+	context.play_origin = PLAY_ORIGIN_MATCHMADE
 	var operation := _begin_scoped_operation(
 		context,
 		&"join_arranged",
@@ -2191,7 +2384,7 @@ func _run_join_arranged(
 	var state := snapshot(context)
 	var owner_key: Dictionary = state.owner_key
 	if bool(state.disconnected) \
-		or int(state.max_members) != context.expected_count \
+		or int(state.max_members) != context.capacity \
 		or int(state.access_policy) != 2 \
 		or int(state.owner_migration) != 0 \
 		or bool(state.restrict_invites_to_owner) \
@@ -2215,7 +2408,7 @@ func prepare_transport(
 ) -> PartyResult:
 	if not _context_is_current(context) or context.kind != LOBBY_KIND_ARRANGED \
 		or context.lobby == null or not _context_local_is_owner(context) \
-		or context.expected_count != MatchmakingService.EXPECTED_MATCH_COUNT:
+		or context.capacity != MatchmakingService.SESSION_CAPACITY:
 		return _context_failure(
 			PartyResult.Outcome.INVALID,
 			&"arranged_transport_not_owner",
@@ -2270,7 +2463,7 @@ func _run_prepare_transport(
 			ready_error)
 		return
 	var cfg: Variant = _make_party_config(
-		context.expected_count, MATCHMAKING_INVITATION_ID)
+		context.capacity, MATCHMAKING_INVITATION_ID)
 	var party: Variant = _party_sdk()
 	if cfg == null or party == null:
 		_finish_scoped_operation(
@@ -2351,7 +2544,7 @@ func join_transport(
 ) -> PartyResult:
 	if not _context_is_current(context) or context.kind != LOBBY_KIND_ARRANGED \
 		or context.lobby == null \
-		or context.expected_count != MatchmakingService.EXPECTED_MATCH_COUNT:
+		or context.capacity != MatchmakingService.SESSION_CAPACITY:
 		return _context_failure(
 			PartyResult.Outcome.INVALID,
 			&"invalid_arranged_context",
@@ -2519,13 +2712,302 @@ func post_context_update(
 		0)
 
 
+func promote_staging_to_private(
+	context: LobbyContext,
+	session_id: String,
+	selected_members: Array[Dictionary],
+	deadline_msec: int = 0
+) -> PartyResult:
+	var normalized_session_id := session_id.strip_edges()
+	var selected := _canonical_entity_keys(selected_members)
+	if not _valid_private_session_id(normalized_session_id) \
+			or not bool(selected.get("valid", false)) \
+			or (selected.get("keys", []) as Array).size() \
+				!= MatchmakingService.SESSION_CAPACITY:
+		return _context_failure(
+			PartyResult.Outcome.INVALID,
+			&"private_promotion_invalid",
+			"The private match request is invalid.",
+			context)
+	if not _context_is_current(context) or context.kind != LOBBY_KIND_STAGING \
+			or context.lobby == null or context.network == null or context.peer == null:
+		return _context_failure(
+			PartyResult.Outcome.INVALID,
+			&"private_promotion_invalid",
+			"The matchmaking group is no longer available.",
+			context)
+	if not context.local_creator or not _context_local_is_owner(context) \
+			or context.peer.get_unique_id() != 1:
+		return _context_failure(
+			PartyResult.Outcome.INVALID,
+			&"private_promotion_not_owner",
+			"Only the current group owner may start the private match.",
+			context)
+	if _private_transition_busy(context):
+		return _context_failure(
+			PartyResult.Outcome.SUPERSEDED,
+			&"private_promotion_busy",
+			"The matchmaking group is still being updated.",
+			context)
+	var selected_keys: Array[Dictionary] = selected.get("keys", [])
+	var before := snapshot(context)
+	if not _private_owner_state_valid(context, before) \
+			or int(before.access_policy) != ACCESS_POLICY_PUBLIC \
+			or String(before.kind) != LOBBY_KIND_STAGING \
+			or not bool(before.membership_locked) \
+			or bool((before.private_control as Dictionary).get("valid", false)) \
+			or _private_control_identity_present(before.properties as Dictionary) \
+			or not _private_member_set_matches(before, selected_keys):
+		return _context_failure(
+			PartyResult.Outcome.INVALID,
+			&"private_promotion_unsealed",
+			"The full group was not sealed for the private match.",
+			context)
+	var control := encode_private_control(
+		normalized_session_id,
+		0,
+		ARRANGED_PHASE_STARTING,
+		1,
+		selected_keys)
+	if control.is_empty():
+		return _context_failure(
+			PartyResult.Outcome.INVALID,
+			&"private_promotion_invalid",
+			"The private match control is invalid.",
+			context)
+	var facts := _capture_private_context_facts(context, before)
+	var posted := await _post_context_update_checked(
+		context,
+		control,
+		{LOBBY_KIND_KEY: LOBBY_KIND_PRIVATE},
+		{},
+		deadline_msec,
+		0,
+		ACCESS_POLICY_PRIVATE)
+	if not posted.ok():
+		return _map_private_operation_result(
+			posted,
+			&"private_promotion_failed",
+			&"private_promotion_timeout",
+			&"private_promotion_changed",
+			"The private match could not be configured.",
+			"The private match update did not finish in time.",
+			"The matchmaking group changed during private preparation.")
+	var readback := snapshot(context)
+	var private_control: Dictionary = readback.private_control
+	if not _private_context_facts_match(context, facts, readback) \
+			or int(readback.access_policy) != ACCESS_POLICY_PRIVATE \
+			or String(readback.kind) != LOBBY_KIND_PRIVATE \
+			or not bool(readback.membership_locked) \
+			or not _private_member_set_matches(readback, selected_keys) \
+			or not _private_control_matches(
+				private_control,
+				normalized_session_id,
+				0,
+				ARRANGED_PHASE_STARTING,
+				1,
+				selected_keys) \
+			or String((readback.properties as Dictionary).get(
+				SEARCH_CONTROL_KEY, "")) != String(facts.search_control):
+		return _private_operation_failure(
+			PartyResult.Outcome.SUPERSEDED,
+			&"private_promotion_changed",
+			"The matchmaking group changed during private preparation.",
+			context,
+			posted)
+	context.kind = LOBBY_KIND_PRIVATE
+	context.play_origin = PLAY_ORIGIN_PRIVATE
+	context.private_session_id = normalized_session_id
+	context.selected_start_count = MatchmakingService.SESSION_CAPACITY
+	context.active_permit = 0
+	context.published_phase = ARRANGED_PHASE_STARTING
+	context.published_lobby_properties.merge(control, true)
+	context.published_search_properties[LOBBY_KIND_KEY] = LOBBY_KIND_PRIVATE
+	posted.play_origin = PLAY_ORIGIN_PRIVATE
+	posted.private_session_id = normalized_session_id
+	return posted
+
+
+func restore_private_to_gathering(
+	context: LobbyContext,
+	expected_session_id: String,
+	gathering_search_control: String,
+	deadline_msec: int = 0
+) -> PartyResult:
+	var normalized_session_id := expected_session_id.strip_edges()
+	var gathering := decode_search_control(gathering_search_control)
+	if not _valid_private_session_id(normalized_session_id) \
+			or not bool(gathering.get("valid", false)) \
+			or String(gathering.get("phase", "")) != "gathering":
+		return _context_failure(
+			PartyResult.Outcome.INVALID,
+			&"private_restore_unsafe",
+			"The matchmaking group could not be safely restored.",
+			context)
+	if not _context_is_current(context) or _private_transition_busy(context):
+		return _context_failure(
+			PartyResult.Outcome.SUPERSEDED,
+			&"private_restore_unsafe",
+			"The matchmaking group could not be safely restored.",
+			context)
+	var before := snapshot(context)
+	if not _private_owner_state_valid(context, before) \
+			or not _private_restore_state_is_proven(
+				before, normalized_session_id):
+		return _context_failure(
+			PartyResult.Outcome.SUPERSEDED,
+			&"private_restore_unsafe",
+			"The matchmaking group could not be safely restored.",
+			context)
+	var facts := _capture_private_context_facts(context, before)
+	var cleared_control := {
+		PLAY_ORIGIN_KEY: "",
+		PRIVATE_SESSION_ID_KEY: "",
+		ROUND_GENERATION_KEY: "",
+		SESSION_PHASE_KEY: "gathering",
+		START_GENERATION_KEY: "",
+		START_MEMBERS_KEY: "",
+		SEARCH_CONTROL_KEY: gathering_search_control,
+	}
+	var posted := await _post_context_update_checked(
+		context,
+		cleared_control,
+		{LOBBY_KIND_KEY: LOBBY_KIND_STAGING},
+		{},
+		deadline_msec,
+		0,
+		ACCESS_POLICY_PUBLIC)
+	if not posted.ok():
+		return _map_private_operation_result(
+			posted,
+			&"private_restore_failed",
+			&"private_restore_timeout",
+			&"private_restore_changed",
+			"The matchmaking group could not be restored.",
+			"The matchmaking group restoration did not finish in time.",
+			"The matchmaking group changed while it was being restored.")
+	var updated := snapshot(context)
+	if not _private_context_facts_match(context, facts, updated) \
+			or not _private_gathering_state_matches(
+				updated, gathering_search_control, true):
+		return _private_operation_failure(
+			PartyResult.Outcome.SUPERSEDED,
+			&"private_restore_changed",
+			"The matchmaking group changed while it was being restored.",
+			context,
+			posted)
+	var unlocked := await set_context_locked(context, false, deadline_msec)
+	if not unlocked.ok():
+		return _map_private_operation_result(
+			unlocked,
+			&"private_restore_failed",
+			&"private_restore_timeout",
+			&"private_restore_changed",
+			"The matchmaking group could not be reopened.",
+			"The matchmaking group did not reopen in time.",
+			"The matchmaking group changed while it was being reopened.")
+	var restored := snapshot(context)
+	if not _private_context_facts_match(context, facts, restored) \
+			or not _private_gathering_state_matches(
+				restored, gathering_search_control, false):
+		return _private_operation_failure(
+			PartyResult.Outcome.SUPERSEDED,
+			&"private_restore_changed",
+			"The matchmaking group changed while it was being reopened.",
+			context,
+			unlocked)
+	context.kind = LOBBY_KIND_STAGING
+	context.play_origin = &""
+	context.private_session_id = ""
+	context.selected_start_count = 0
+	context.active_permit = 0
+	context.published_phase = "gathering"
+	context.published_lobby_properties = cleared_control.duplicate(true)
+	context.published_search_properties[LOBBY_KIND_KEY] = LOBBY_KIND_STAGING
+	unlocked.play_origin = &""
+	unlocked.private_session_id = ""
+	return unlocked
+
+
+func set_private_round_control(
+	context: LobbyContext,
+	session_id: String,
+	round: int,
+	phase: String,
+	deadline_msec: int = 0
+) -> PartyResult:
+	var normalized_session_id := session_id.strip_edges()
+	var control := encode_private_control(
+		normalized_session_id, round, phase, 0, [])
+	if control.is_empty() or not _context_is_current(context):
+		return _context_failure(
+			PartyResult.Outcome.INVALID,
+			&"private_round_invalid",
+			"The private round update is invalid.",
+			context)
+	if not context.local_creator or not _context_local_is_owner(context):
+		return _context_failure(
+			PartyResult.Outcome.INVALID,
+			&"private_round_not_owner",
+			"Only the private match owner may update its round.",
+			context)
+	var before := snapshot(context)
+	if not _private_owner_state_valid(context, before) \
+			or int(before.access_policy) != ACCESS_POLICY_PRIVATE \
+			or String(before.kind) != LOBBY_KIND_PRIVATE \
+			or String(before.private_session_id) != normalized_session_id:
+		return _context_failure(
+			PartyResult.Outcome.SUPERSEDED,
+			&"private_round_changed",
+			"The private match changed before its round could be updated.",
+			context)
+	var facts := _capture_private_context_facts(context, before)
+	var posted := await _post_context_update_checked(
+		context, control, {}, {}, deadline_msec, 0)
+	if not posted.ok():
+		return _map_private_operation_result(
+			posted,
+			&"private_round_failed",
+			&"private_round_timeout",
+			&"private_round_changed",
+			"The private round could not be updated.",
+			"The private round update did not finish in time.",
+			"The private match changed while its round was being updated.")
+	var readback := snapshot(context)
+	if not _private_context_facts_match(context, facts, readback) \
+			or int(readback.access_policy) != ACCESS_POLICY_PRIVATE \
+			or String(readback.kind) != LOBBY_KIND_PRIVATE \
+			or not _private_control_matches(
+				readback.private_control as Dictionary,
+				normalized_session_id,
+				round,
+				phase,
+				0,
+				[]):
+		return _private_operation_failure(
+			PartyResult.Outcome.SUPERSEDED,
+			&"private_round_changed",
+			"The private match changed while its round was being updated.",
+			context,
+			posted)
+	context.play_origin = PLAY_ORIGIN_PRIVATE
+	context.private_session_id = normalized_session_id
+	context.selected_start_count = 0
+	context.published_phase = phase
+	context.published_lobby_properties.merge(control, true)
+	posted.play_origin = PLAY_ORIGIN_PRIVATE
+	posted.private_session_id = normalized_session_id
+	return posted
+
+
 func _post_context_update_checked(
 	context: LobbyContext,
 	lobby_properties: Dictionary,
 	search_properties: Dictionary,
 	member_properties: Dictionary,
 	deadline_msec: int,
-	required_permit: int
+	required_permit: int,
+	access_policy: int = -1
 ) -> PartyResult:
 	if not _context_is_current(context) or context.lobby == null:
 		return _context_failure(
@@ -2536,21 +3018,26 @@ func _post_context_update_checked(
 	if context.kind == LOBBY_KIND_ARRANGED \
 		and (lobby_properties.has(MATCH_ID_MEMBER_KEY)
 			or lobby_properties.has(ROUND_GENERATION_KEY)
-			or lobby_properties.has(SESSION_PHASE_KEY)) \
+			or lobby_properties.has(SESSION_PHASE_KEY)
+			or lobby_properties.has(START_GENERATION_KEY)
+			or lobby_properties.has(START_MEMBERS_KEY)) \
 		and not bool(decode_arranged_control(lobby_properties).get("valid", false)):
 		return _context_failure(
 			PartyResult.Outcome.INVALID,
 			&"arranged_control_invalid",
-			"Arranged state updates need a valid match id, round, and phase.",
+			"Arranged state updates need valid match, round, phase, generation, and selected-member control.",
 			context)
-	if (not lobby_properties.is_empty() or not search_properties.is_empty()) \
+	if (not lobby_properties.is_empty() or not search_properties.is_empty()
+			or access_policy >= 0) \
 		and not _context_local_is_owner(context):
 		return _context_failure(
 			PartyResult.Outcome.INVALID,
 			&"context_not_owner",
 			"Only the PlayFab lobby owner may update shared lobby state.",
 			context)
-	var requires_owner := not lobby_properties.is_empty() or not search_properties.is_empty()
+	var requires_owner := not lobby_properties.is_empty() \
+		or not search_properties.is_empty() \
+		or access_policy >= 0
 	var update_error := _context_operation_error(context, requires_owner)
 	if update_error != null:
 		return update_error
@@ -2568,6 +3055,7 @@ func _post_context_update_checked(
 		lobby_properties.duplicate(true),
 		search_properties.duplicate(true),
 		member_properties.duplicate(true),
+		access_policy,
 		operation)
 	return await _await_scoped_operation(
 		operation,
@@ -2811,12 +3299,31 @@ func snapshot(context: LobbyContext) -> Dictionary:
 	var owner_value: Variant = _object_value(lobby, &"owner_entity_key", {})
 	var owner_key := _copy_entity_key(owner_value as Dictionary) \
 		if typeof(owner_value) == TYPE_DICTIONARY else {}
+	var native_kind := String(search_properties.get(LOBBY_KIND_KEY, ""))
+	var arranged_control := decode_arranged_control(properties)
+	var private_control := decode_private_control(properties)
+	var play_origin: StringName = &""
+	var private_session_id := ""
+	if native_kind == LOBBY_KIND_ARRANGED:
+		play_origin = PLAY_ORIGIN_MATCHMADE
+	if native_kind == LOBBY_KIND_PRIVATE \
+			and bool(private_control.get("valid", false)):
+		play_origin = PLAY_ORIGIN_PRIVATE
+		private_session_id = String(private_control.get("session_id", ""))
+	var current_control: Dictionary = private_control \
+		if play_origin == PLAY_ORIGIN_PRIVATE else arranged_control
+	if bool(current_control.get("valid", false)):
+		context.selected_start_count = int(current_control.get(
+			"selected_count", 0))
 	return {
 		"context_id": context.context_id,
 		"role": String(context.role),
-		"kind": context.kind,
+		"kind": native_kind,
 		"recovery_epoch": context.recovery_epoch,
-		"expected_count": context.expected_count,
+		"capacity": context.capacity,
+		"selected_start_count": context.selected_start_count,
+		"play_origin": play_origin,
+		"private_session_id": private_session_id,
 		"lobby_id": String(_object_value(lobby, &"lobby_id", "")),
 		"local_key": context.local_key.duplicate(),
 		"owner_key": owner_key,
@@ -2834,7 +3341,8 @@ func snapshot(context: LobbyContext) -> Dictionary:
 		"properties": properties,
 		"phase": String(properties.get(SESSION_PHASE_KEY, "")),
 		"search_control": decode_search_control(String(properties.get(SEARCH_CONTROL_KEY, ""))),
-		"arranged_control": decode_arranged_control(properties),
+		"arranged_control": arranged_control,
+		"private_control": private_control,
 	}
 
 
@@ -2851,7 +3359,8 @@ func admission_proof(context: LobbyContext, peer_id: int) -> Dictionary:
 		"native_connected": false,
 		"member_properties": {},
 		"owner_key": {},
-		"expected_count": context.expected_count if context != null else 0,
+		"capacity": context.capacity if context != null else 0,
+		"selected_start_count": context.selected_start_count if context != null else 0,
 		"local_creator": context.local_creator if context != null else false,
 		"transport_attached": false,
 	}
@@ -2898,7 +3407,22 @@ func admission_proof(context: LobbyContext, peer_id: int) -> Dictionary:
 		proof["valid"] = true
 		proof["reason_code"] = ""
 		return proof
-	proof["pending"] = members.size() < context.expected_count
+	if String(state.kind) == LOBBY_KIND_PRIVATE:
+		var private_control: Dictionary = state.private_control
+		proof["pending"] = not bool(state.membership_locked) \
+			and bool(private_control.get("valid", false)) \
+			and String(private_control.get("phase", "")) == ARRANGED_PHASE_REMATCH
+	else:
+		var arranged_control: Dictionary = state.arranged_control
+		var arranged_phase := String(arranged_control.get("phase", ""))
+		proof["pending"] = not bool(state.membership_locked) \
+			and (
+				not bool(arranged_control.get("valid", false))
+				or arranged_phase in [
+					ARRANGED_PHASE_BOOTSTRAP,
+					ARRANGED_PHASE_REMATCH,
+				]
+			)
 	proof["reason_code"] = "native_member_pending" if bool(proof["pending"]) \
 		else "native_member_missing"
 	return proof
@@ -2924,9 +3448,14 @@ func joined_owner_proof(
 		"local_lobby_connected": false,
 		"protocol": "",
 		"kind": "",
+		"play_origin": "",
+		"private_session_id": "",
 		"match_id": "",
 		"round": 0,
 		"phase": "",
+		"start_generation": 0,
+		"selected_members": [],
+		"selected_count": 0,
 	}
 	var lobby: Variant = null
 	var peer: Variant = null
@@ -3035,11 +3564,14 @@ func joined_owner_proof(
 	proof["kind"] = kind
 	var protocol := ""
 	if kind == LOBBY_KIND_ARRANGED:
+		proof["play_origin"] = String(PLAY_ORIGIN_MATCHMADE)
 		var control := decode_arranged_control(lobby_properties)
 		if not bool(control.get("valid", false)):
 			var has_control := lobby_properties.has(MATCH_ID_MEMBER_KEY) \
 				or lobby_properties.has(ROUND_GENERATION_KEY) \
-				or lobby_properties.has(SESSION_PHASE_KEY)
+				or lobby_properties.has(SESSION_PHASE_KEY) \
+				or lobby_properties.has(START_GENERATION_KEY) \
+				or lobby_properties.has(START_MEMBERS_KEY)
 			proof["pending"] = not has_control
 			proof["reason_code"] = "arranged_control_pending" \
 				if bool(proof["pending"]) else "arranged_control_invalid"
@@ -3047,6 +3579,11 @@ func joined_owner_proof(
 		proof["match_id"] = String(control.get("match_id", ""))
 		proof["round"] = int(control.get("round", 0))
 		proof["phase"] = String(control.get("phase", ""))
+		proof["start_generation"] = int(control.get("start_generation", 0))
+		proof["selected_members"] = (
+			control.get("selected_members", []) as Array
+		).duplicate(true)
+		proof["selected_count"] = int(control.get("selected_count", 0))
 		var owner_properties: Dictionary = owner_member.get("properties", {})
 		protocol = String(owner_properties.get(
 			MatchmakingService.PROTOCOL_MEMBER_KEY, ""))
@@ -3058,6 +3595,29 @@ func joined_owner_proof(
 		if owner_match != String(proof["match_id"]):
 			proof["reason_code"] = "owner_match_mismatch"
 			return proof
+	elif kind == LOBBY_KIND_PRIVATE:
+		proof["play_origin"] = String(PLAY_ORIGIN_PRIVATE)
+		var private_control := decode_private_control(lobby_properties)
+		if not bool(private_control.get("valid", false)):
+			var has_private_control := lobby_properties.has(PLAY_ORIGIN_KEY) \
+				or lobby_properties.has(PRIVATE_SESSION_ID_KEY)
+			proof["pending"] = not has_private_control
+			proof["reason_code"] = "private_control_pending" \
+				if bool(proof["pending"]) else "private_control_invalid"
+			return proof
+		proof["private_session_id"] = String(private_control.get("session_id", ""))
+		proof["round"] = int(private_control.get("round", 0))
+		proof["phase"] = String(private_control.get("phase", ""))
+		proof["start_generation"] = int(private_control.get(
+			"start_generation", 0))
+		proof["selected_members"] = (
+			private_control.get("selected_members", []) as Array
+		).duplicate(true)
+		proof["selected_count"] = int(private_control.get("selected_count", 0))
+		var private_owner_properties: Dictionary = owner_member.get(
+			"properties", {})
+		protocol = String(private_owner_properties.get(
+			MatchmakingService.PROTOCOL_MEMBER_KEY, ""))
 	else:
 		protocol = String(search_properties.get(NRProtocol.LOBBY_KEY, ""))
 	proof["protocol"] = protocol
@@ -3226,20 +3786,111 @@ static func decode_search_control(text: String) -> Dictionary:
 	}
 
 
-static func encode_arranged_control(match_id: String, round: int, phase: String) -> Dictionary:
+static func encode_arranged_control(
+	match_id: String,
+	round: int,
+	phase: String,
+	start_generation: int = 0,
+	selected_members: Array[Dictionary] = []
+) -> Dictionary:
 	var normalized_match_id := match_id.strip_edges()
 	var normalized_phase := phase.strip_edges()
+	var selected := _canonical_entity_keys(selected_members)
 	if normalized_match_id.is_empty() or round < 0 \
-		or normalized_phase not in [
-			ARRANGED_PHASE_BOOTSTRAP,
-			ARRANGED_PHASE_GAMEPLAY,
-			ARRANGED_PHASE_REMATCH,
-		]:
+			or not bool(selected.get("valid", false)):
+		return {}
+	var keys: Array[Dictionary] = selected.get("keys", [])
+	if not _arranged_control_shape_valid(
+			round,
+			normalized_phase,
+			start_generation,
+			keys.size()):
 		return {}
 	return {
 		MATCH_ID_MEMBER_KEY: normalized_match_id,
 		ROUND_GENERATION_KEY: str(round),
 		SESSION_PHASE_KEY: normalized_phase,
+		START_GENERATION_KEY: str(start_generation),
+		START_MEMBERS_KEY: JSON.stringify(keys),
+	}
+
+
+static func encode_private_control(
+	session_id: String,
+	round: int,
+	phase: String,
+	start_generation: int = 0,
+	selected_members: Array[Dictionary] = []
+) -> Dictionary:
+	var normalized_session_id := session_id.strip_edges()
+	var normalized_phase := phase.strip_edges()
+	var selected := _canonical_entity_keys(selected_members)
+	if not _valid_private_session_id(normalized_session_id) \
+			or round < 0 \
+			or not bool(selected.get("valid", false)):
+		return {}
+	var keys: Array[Dictionary] = selected.get("keys", [])
+	if not _private_control_shape_valid(
+			round,
+			normalized_phase,
+			start_generation,
+			keys.size()):
+		return {}
+	return {
+		PLAY_ORIGIN_KEY: String(PLAY_ORIGIN_PRIVATE),
+		PRIVATE_SESSION_ID_KEY: normalized_session_id,
+		ROUND_GENERATION_KEY: str(round),
+		SESSION_PHASE_KEY: normalized_phase,
+		START_GENERATION_KEY: str(start_generation),
+		START_MEMBERS_KEY: JSON.stringify(keys),
+	}
+
+
+static func decode_private_control(properties: Dictionary) -> Dictionary:
+	var origin := String(properties.get(PLAY_ORIGIN_KEY, "")).strip_edges()
+	var session_id := String(properties.get(
+		PRIVATE_SESSION_ID_KEY, "")).strip_edges()
+	var round_text := String(properties.get(ROUND_GENERATION_KEY, "")).strip_edges()
+	var phase := String(properties.get(SESSION_PHASE_KEY, "")).strip_edges()
+	var start_text := String(properties.get(START_GENERATION_KEY, "")).strip_edges()
+	var selected_text := String(properties.get(START_MEMBERS_KEY, "")).strip_edges()
+	if origin != String(PLAY_ORIGIN_PRIVATE) \
+			or not _valid_private_session_id(session_id) \
+			or not round_text.is_valid_int() \
+			or not start_text.is_valid_int() \
+			or selected_text.is_empty():
+		return {"valid": false}
+	var round := int(round_text)
+	var start_generation := int(start_text)
+	if round < 0 or round_text != str(round) \
+			or start_generation < 0 or start_text != str(start_generation):
+		return {"valid": false}
+	var parser := JSON.new()
+	var parse_error: Error = parser.parse(selected_text)
+	if parse_error != OK:
+		return {"valid": false}
+	var parsed_selected: Variant = parser.data
+	if typeof(parsed_selected) != TYPE_ARRAY:
+		return {"valid": false}
+	var selected := _canonical_entity_keys(parsed_selected as Array)
+	if not bool(selected.get("valid", false)):
+		return {"valid": false}
+	var keys: Array[Dictionary] = selected.get("keys", [])
+	if not _private_control_shape_valid(
+			round,
+			phase,
+			start_generation,
+			keys.size()):
+		return {"valid": false}
+	return {
+		"valid": true,
+		"origin": PLAY_ORIGIN_PRIVATE,
+		"session_id": session_id,
+		"round": round,
+		"phase": phase,
+		"start_generation": start_generation,
+		"selected_members": keys,
+		"selected_count": keys.size(),
 	}
 
 
@@ -3247,22 +3898,108 @@ static func decode_arranged_control(properties: Dictionary) -> Dictionary:
 	var match_id := String(properties.get(MATCH_ID_MEMBER_KEY, "")).strip_edges()
 	var round_text := String(properties.get(ROUND_GENERATION_KEY, "")).strip_edges()
 	var phase := String(properties.get(SESSION_PHASE_KEY, "")).strip_edges()
+	var start_text := String(properties.get(START_GENERATION_KEY, "")).strip_edges()
+	var selected_text := String(properties.get(START_MEMBERS_KEY, "")).strip_edges()
 	if match_id.is_empty() or not round_text.is_valid_int() \
-		or phase not in [
-			ARRANGED_PHASE_BOOTSTRAP,
-			ARRANGED_PHASE_GAMEPLAY,
-			ARRANGED_PHASE_REMATCH,
-		]:
+			or not start_text.is_valid_int() or selected_text.is_empty():
 		return {"valid": false}
 	var round := int(round_text)
-	if round < 0 or round_text != str(round):
+	var start_generation := int(start_text)
+	if round < 0 or round_text != str(round) \
+			or start_generation < 0 or start_text != str(start_generation):
+		return {"valid": false}
+	var parser := JSON.new()
+	var parse_error: Error = parser.parse(selected_text)
+	if parse_error != OK:
+		return {"valid": false}
+	var parsed_selected: Variant = parser.data
+	if typeof(parsed_selected) != TYPE_ARRAY:
+		return {"valid": false}
+	var selected := _canonical_entity_keys(parsed_selected as Array)
+	if not bool(selected.get("valid", false)):
+		return {"valid": false}
+	var keys: Array[Dictionary] = selected.get("keys", [])
+	if not _arranged_control_shape_valid(
+			round,
+			phase,
+			start_generation,
+			keys.size()):
 		return {"valid": false}
 	return {
 		"valid": true,
 		"match_id": match_id,
 		"round": round,
 		"phase": phase,
+		"start_generation": start_generation,
+		"selected_members": keys,
+		"selected_count": keys.size(),
 	}
+
+
+static func _arranged_control_shape_valid(
+	round: int,
+	phase: String,
+	start_generation: int,
+	selected_count: int
+) -> bool:
+	if round == 0 and phase == ARRANGED_PHASE_BOOTSTRAP:
+		return start_generation == 0 and selected_count == 0
+	if round == 0 and phase == ARRANGED_PHASE_STARTING:
+		return start_generation > 0 \
+			and selected_count >= MatchmakingService.QUEUE_MIN_MATCH_SIZE \
+			and selected_count <= MatchmakingService.SESSION_CAPACITY
+	if round >= 1 and phase in [
+		ARRANGED_PHASE_REMATCH,
+		ARRANGED_PHASE_GAMEPLAY,
+	]:
+		return start_generation == 0 and selected_count == 0
+	return false
+
+
+static func _private_control_shape_valid(
+	round: int,
+	phase: String,
+	start_generation: int,
+	selected_count: int
+) -> bool:
+	if round == 0 and phase == ARRANGED_PHASE_STARTING:
+		return start_generation == 1 \
+			and selected_count == MatchmakingService.SESSION_CAPACITY
+	if round >= 1 and phase in [
+		ARRANGED_PHASE_REMATCH,
+		ARRANGED_PHASE_GAMEPLAY,
+	]:
+		return start_generation == 0 and selected_count == 0
+	return false
+
+
+static func _valid_private_session_id(session_id: String) -> bool:
+	if session_id.length() != 32:
+		return false
+	for index: int in session_id.length():
+		if "0123456789abcdef".find(session_id[index]) < 0:
+			return false
+	return true
+
+
+static func _canonical_entity_keys(values: Array) -> Dictionary:
+	var keys: Array[Dictionary] = []
+	var seen: Dictionary = {}
+	for value: Variant in values:
+		if typeof(value) != TYPE_DICTIONARY:
+			return {"valid": false, "keys": []}
+		var key := _copy_entity_key(value as Dictionary)
+		if key.is_empty():
+			return {"valid": false, "keys": []}
+		var fingerprint: String = "%s\u001f%s" % [key.id, key.type]
+		if seen.has(fingerprint):
+			return {"valid": false, "keys": []}
+		seen[fingerprint] = true
+		keys.append(key)
+	keys.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return ("%s\u001f%s" % [a.id, a.type]) \
+			< ("%s\u001f%s" % [b.id, b.type]))
+	return {"valid": true, "keys": keys}
 
 
 func _new_context(
@@ -3440,6 +4177,9 @@ func _scoped_operation_result(
 	result.descriptor = String(_object_value(context.network, &"descriptor", "")) \
 		if context != null and context.network != null else ""
 	result.publication_permit = operation.publication_permit
+	result.play_origin = context.play_origin if context != null else &""
+	result.private_session_id = context.private_session_id \
+		if context != null else ""
 	result.cleanup_pending = operation.cleanup_pending
 	result.operation = operation
 	return result
@@ -3613,8 +4353,8 @@ func _attach_context_lobby(context: LobbyContext, lobby: Variant) -> void:
 	context.lobby = lobby
 	context.left_lobby = false
 	context.loss_emitted = false
-	if context.expected_count <= 0:
-		context.expected_count = int(_object_value(lobby, &"max_member_count", 0))
+	if context.capacity <= 0:
+		context.capacity = int(_object_value(lobby, &"max_member_count", 0))
 	var callback := Callable(self, "_on_context_lobby_changed").bind(context)
 	context.lobby_callback = callback
 	if lobby.has_signal("state_changed") and not lobby.is_connected("state_changed", callback):
@@ -3622,6 +4362,7 @@ func _attach_context_lobby(context: LobbyContext, lobby: Variant) -> void:
 	var owner_value: Variant = _object_value(lobby, &"owner_entity_key", {})
 	context.owner_key = _copy_entity_key(owner_value as Dictionary) \
 		if typeof(owner_value) == TYPE_DICTIONARY else {}
+	_refresh_context_selected_start(context)
 
 
 func _disconnect_context_lobby(context: LobbyContext) -> void:
@@ -3631,6 +4372,20 @@ func _disconnect_context_lobby(context: LobbyContext) -> void:
 		and context.lobby.is_connected("state_changed", context.lobby_callback):
 		context.lobby.disconnect("state_changed", context.lobby_callback)
 	context.lobby_callback = Callable()
+
+
+func _refresh_context_selected_start(context: LobbyContext) -> void:
+	if context == null or context.lobby == null:
+		return
+	var properties_value: Variant = _object_value(
+		context.lobby, &"properties", {})
+	if typeof(properties_value) != TYPE_DICTIONARY:
+		return
+	var control := decode_arranged_control(properties_value as Dictionary)
+	if not bool(control.get("valid", false)):
+		control = decode_private_control(properties_value as Dictionary)
+	if bool(control.get("valid", false)):
+		context.selected_start_count = int(control.get("selected_count", 0))
 
 
 func _attach_context_transport(
@@ -3690,11 +4445,11 @@ func _on_context_lobby_changed(change: Variant, context: LobbyContext) -> void:
 		var owner_reason := ""
 		if current_owner.is_empty():
 			owner_reason = "The match host left or is no longer available, so the match was closed." \
-				if context.kind == LOBBY_KIND_ARRANGED \
+				if context.kind in [LOBBY_KIND_ARRANGED, LOBBY_KIND_PRIVATE] \
 				else "The group host left or is no longer available, so the group was closed."
 		else:
 			owner_reason = "The match host changed, so the match was closed." \
-				if context.kind == LOBBY_KIND_ARRANGED \
+				if context.kind in [LOBBY_KIND_ARRANGED, LOBBY_KIND_PRIVATE] \
 				else "The group host changed, so the group was closed."
 		_log_party_context_failure(
 			context,
@@ -3717,6 +4472,7 @@ func _on_context_lobby_changed(change: Variant, context: LobbyContext) -> void:
 			context,
 			"The matchmaking lobby connection was lost.")
 		return
+	_refresh_context_selected_start(context)
 	context_updated.emit(context)
 
 
@@ -3994,6 +4750,7 @@ func _run_context_update(
 	lobby_properties: Dictionary,
 	search_properties: Dictionary,
 	member_properties: Dictionary,
+	access_policy: int,
 	operation: ScopedOperation
 ) -> void:
 	while context.post_running and _scoped_operation_current(context, operation) \
@@ -4024,7 +4781,9 @@ func _run_context_update(
 			&"publication_revoked",
 			"Transport publication permission is no longer current.")
 		return
-	var requires_owner := not lobby_properties.is_empty() or not search_properties.is_empty()
+	var requires_owner := not lobby_properties.is_empty() \
+		or not search_properties.is_empty() \
+		or access_policy >= 0
 	var entry_error := _context_operation_error(context, requires_owner)
 	if entry_error != null:
 		_finish_scoped_operation(
@@ -4039,7 +4798,8 @@ func _run_context_update(
 	context.post_result = null
 	context.post_operation += 1
 	var post_operation := context.post_operation
-	if not lobby_properties.is_empty() or not search_properties.is_empty():
+	if not lobby_properties.is_empty() or not search_properties.is_empty() \
+			or access_policy >= 0:
 		var update: Variant = _new_lobby_update_config()
 		if update == null:
 			if post_operation == context.post_operation:
@@ -4055,6 +4815,8 @@ func _run_context_update(
 			update.lobby_properties = lobby_properties
 		if not search_properties.is_empty():
 			update.search_properties = search_properties
+		if access_policy >= 0:
+			update.access_policy = access_policy
 		var shared_result: Variant = await context.lobby.post_update_async(update)
 		if post_operation == context.post_operation \
 			and not _scoped_operation_current(context, operation):
@@ -4134,6 +4896,8 @@ func _run_context_update(
 		var control := decode_arranged_control(lobby_properties)
 		if bool(control.get("valid", false)):
 			context.published_phase = String(control.get("phase", ""))
+			context.selected_start_count = int(control.get(
+				"selected_count", 0))
 			context.published_lobby_properties.merge(lobby_properties, true)
 	context_updated.emit(context)
 	_finish_scoped_operation(operation, context, PartyResult.Outcome.OK)
@@ -4180,6 +4944,288 @@ func _context_operation_error(
 	return null
 
 
+func _private_transition_busy(context: LobbyContext) -> bool:
+	if context == null or context.pending_operations > 0 \
+			or context.cleanup_pending \
+			or context.lobby_leave_running \
+			or context.transport_leave_running \
+			or context.lobby_leave_cleanup_pending \
+			or context.transport_leave_cleanup_pending \
+			or context.lock_running \
+			or context.post_running:
+		return true
+	for operation_value: Variant in _scoped_operations.values():
+		var operation := operation_value as ScopedOperation
+		if operation != null and operation.context_id == context.context_id:
+			return true
+	return false
+
+
+func _private_owner_state_valid(
+	context: LobbyContext,
+	state: Dictionary
+) -> bool:
+	if not _context_is_current(context) or context.lobby == null \
+			or context.network == null or context.peer == null \
+			or bool(state.get("disconnected", true)) \
+			or context.capacity != MatchmakingService.SESSION_CAPACITY \
+			or int(state.get("max_members", 0)) \
+				!= MatchmakingService.SESSION_CAPACITY \
+			or int(state.get("owner_migration", -1)) != OWNER_MIGRATION_NONE \
+			or not context.local_creator \
+			or not bool(state.get("is_local_owner", false)) \
+			or not (context.peer is MultiplayerPeer) \
+			or context.peer.get_connection_status() \
+				!= MultiplayerPeer.CONNECTION_CONNECTED \
+			or context.peer.get_unique_id() != 1:
+		return false
+	var owner_value: Variant = state.get("owner_key", {})
+	var owner_key := _copy_entity_key(owner_value as Dictionary) \
+		if typeof(owner_value) == TYPE_DICTIONARY else {}
+	if owner_key.is_empty() \
+			or not _entity_keys_match(owner_key, context.local_key) \
+			or (
+				not context.owner_key.is_empty()
+				and not _entity_keys_match(owner_key, context.owner_key)
+			):
+		return false
+	return not String(_object_value(
+		context.network, &"descriptor", "")).is_empty()
+
+
+func _capture_private_context_facts(
+	context: LobbyContext,
+	state: Dictionary
+) -> Dictionary:
+	var properties_value: Variant = state.get("properties", {})
+	var properties: Dictionary = properties_value as Dictionary \
+		if typeof(properties_value) == TYPE_DICTIONARY else {}
+	return {
+		"context_id": context.context_id,
+		"operation_id": context.operation_id,
+		"recovery_epoch": context.recovery_epoch,
+		"lobby": context.lobby,
+		"network": context.network,
+		"peer": context.peer,
+		"owner_key": (state.get("owner_key", {}) as Dictionary).duplicate(),
+		"descriptor": String(_object_value(
+			context.network, &"descriptor", "")),
+		"search_control": String(properties.get(SEARCH_CONTROL_KEY, "")),
+	}
+
+
+func _private_context_facts_match(
+	context: LobbyContext,
+	facts: Dictionary,
+	state: Dictionary
+) -> bool:
+	if not _context_is_current(context) \
+			or context.context_id != int(facts.get("context_id", 0)) \
+			or context.operation_id != int(facts.get("operation_id", -1)) \
+			or context.recovery_epoch != int(facts.get("recovery_epoch", -1)) \
+			or context.lobby != facts.get("lobby") \
+			or context.network != facts.get("network") \
+			or context.peer != facts.get("peer") \
+			or bool(state.get("disconnected", true)) \
+			or context.capacity != MatchmakingService.SESSION_CAPACITY \
+			or int(state.get("max_members", 0)) \
+				!= MatchmakingService.SESSION_CAPACITY \
+			or int(state.get("owner_migration", -1)) != OWNER_MIGRATION_NONE \
+			or String(_object_value(context.network, &"descriptor", "")) \
+				!= String(facts.get("descriptor", "")):
+		return false
+	var owner_value: Variant = state.get("owner_key", {})
+	var owner_key := _copy_entity_key(owner_value as Dictionary) \
+		if typeof(owner_value) == TYPE_DICTIONARY else {}
+	var expected_owner_value: Variant = facts.get("owner_key", {})
+	var expected_owner := _copy_entity_key(expected_owner_value as Dictionary) \
+		if typeof(expected_owner_value) == TYPE_DICTIONARY else {}
+	return not owner_key.is_empty() \
+		and _entity_keys_match(owner_key, expected_owner) \
+		and _entity_keys_match(owner_key, context.local_key) \
+		and bool(state.get("is_local_owner", false))
+
+
+func _private_member_set_matches(
+	state: Dictionary,
+	expected: Array[Dictionary]
+) -> bool:
+	var members_value: Variant = state.get("members", [])
+	var members: Array = members_value as Array \
+		if typeof(members_value) == TYPE_ARRAY else []
+	if members.size() != expected.size():
+		return false
+	var native_keys: Array[Dictionary] = []
+	for member_value: Variant in members:
+		if typeof(member_value) != TYPE_DICTIONARY:
+			return false
+		var member := member_value as Dictionary
+		if not bool(member.get("connected", false)):
+			return false
+		var key_value: Variant = member.get("key", {})
+		if typeof(key_value) != TYPE_DICTIONARY:
+			return false
+		native_keys.append((key_value as Dictionary).duplicate())
+	var canonical := _canonical_entity_keys(native_keys)
+	if not bool(canonical.get("valid", false)):
+		return false
+	var canonical_keys: Array[Dictionary] = canonical.get("keys", [])
+	return _entity_key_arrays_match(canonical_keys, expected)
+
+
+func _private_control_identity_present(properties: Dictionary) -> bool:
+	return not String(properties.get(PLAY_ORIGIN_KEY, "")).is_empty() \
+		or not String(properties.get(PRIVATE_SESSION_ID_KEY, "")).is_empty()
+
+
+func _private_control_matches(
+	control: Dictionary,
+	session_id: String,
+	round: int,
+	phase: String,
+	start_generation: int,
+	selected_members: Array
+) -> bool:
+	if not bool(control.get("valid", false)) \
+			or String(control.get("origin", "")) \
+				!= String(PLAY_ORIGIN_PRIVATE) \
+			or String(control.get("session_id", "")) != session_id \
+			or int(control.get("round", -1)) != round \
+			or String(control.get("phase", "")) != phase \
+			or int(control.get("start_generation", -1)) != start_generation:
+		return false
+	var actual_value: Variant = control.get("selected_members", [])
+	var actual: Array[Dictionary] = []
+	if typeof(actual_value) != TYPE_ARRAY:
+		return false
+	actual.assign(actual_value as Array)
+	var expected: Array[Dictionary] = []
+	expected.assign(selected_members)
+	return _entity_key_arrays_match(actual, expected)
+
+
+func _private_restore_state_is_proven(
+	state: Dictionary,
+	expected_session_id: String
+) -> bool:
+	var properties_value: Variant = state.get("properties", {})
+	var properties: Dictionary = properties_value as Dictionary \
+		if typeof(properties_value) == TYPE_DICTIONARY else {}
+	var control_value: Variant = state.get("private_control", {})
+	var control: Dictionary = control_value as Dictionary \
+		if typeof(control_value) == TYPE_DICTIONARY else {}
+	if int(state.get("access_policy", -1)) == ACCESS_POLICY_PUBLIC \
+			and String(state.get("kind", "")) == LOBBY_KIND_STAGING \
+			and not bool(control.get("valid", false)) \
+			and not _private_control_identity_present(properties):
+		return true
+	return int(state.get("access_policy", -1)) == ACCESS_POLICY_PRIVATE \
+		and String(state.get("kind", "")) == LOBBY_KIND_PRIVATE \
+		and bool(state.get("membership_locked", false)) \
+		and bool(control.get("valid", false)) \
+		and String(control.get("session_id", "")) == expected_session_id \
+		and int(control.get("round", -1)) == 0 \
+		and String(control.get("phase", "")) == ARRANGED_PHASE_STARTING \
+		and int(control.get("start_generation", -1)) == 1 \
+		and int(control.get("selected_count", 0)) \
+			== MatchmakingService.SESSION_CAPACITY
+
+
+func _private_gathering_state_matches(
+	state: Dictionary,
+	gathering_search_control: String,
+	allow_locked: bool
+) -> bool:
+	var properties_value: Variant = state.get("properties", {})
+	var properties: Dictionary = properties_value as Dictionary \
+		if typeof(properties_value) == TYPE_DICTIONARY else {}
+	var private_value: Variant = state.get("private_control", {})
+	var private_control: Dictionary = private_value as Dictionary \
+		if typeof(private_value) == TYPE_DICTIONARY else {}
+	return int(state.get("access_policy", -1)) == ACCESS_POLICY_PUBLIC \
+		and String(state.get("kind", "")) == LOBBY_KIND_STAGING \
+		and (allow_locked or not bool(state.get("membership_locked", true))) \
+		and not bool(private_control.get("valid", false)) \
+		and not _private_control_identity_present(properties) \
+		and String(properties.get(SESSION_PHASE_KEY, "")) == "gathering" \
+		and String(properties.get(SEARCH_CONTROL_KEY, "")) \
+			== gathering_search_control
+
+
+func _entity_key_arrays_match(
+	a: Array[Dictionary],
+	b: Array[Dictionary]
+) -> bool:
+	if a.size() != b.size():
+		return false
+	for index: int in a.size():
+		if not _entity_keys_match(a[index], b[index]):
+			return false
+	return true
+
+
+func _map_private_operation_result(
+	source: PartyResult,
+	failed_code: StringName,
+	timeout_code: StringName,
+	changed_code: StringName,
+	failed_reason: String,
+	timeout_reason: String,
+	changed_reason: String
+) -> PartyResult:
+	if source == null:
+		return _private_operation_failure(
+			PartyResult.Outcome.SERVICE_ERROR,
+			failed_code,
+			failed_reason,
+			null,
+			null)
+	if source.outcome == PartyResult.Outcome.TIMEOUT:
+		return _private_operation_failure(
+			PartyResult.Outcome.TIMEOUT,
+			timeout_code,
+			timeout_reason,
+			source.context,
+			source)
+	if source.outcome == PartyResult.Outcome.SUPERSEDED \
+			or source.outcome == PartyResult.Outcome.CANCELLED:
+		return _private_operation_failure(
+			source.outcome,
+			changed_code,
+			changed_reason,
+			source.context,
+			source)
+	return _private_operation_failure(
+		source.outcome,
+		failed_code,
+		failed_reason,
+		source.context,
+		source)
+
+
+func _private_operation_failure(
+	outcome: int,
+	code: StringName,
+	message: String,
+	context: LobbyContext,
+	source: PartyResult
+) -> PartyResult:
+	var result := _context_failure(outcome, code, message, context)
+	if source == null:
+		return result
+	result.diagnostic = source.diagnostic
+	result.peer = source.peer
+	result.owner_key = source.owner_key.duplicate()
+	result.local_creator = source.local_creator
+	result.descriptor_ready = source.descriptor_ready
+	result.descriptor = source.descriptor
+	result.cleanup_pending = source.cleanup_pending
+	result.operation = source.operation
+	result.play_origin = source.play_origin
+	result.private_session_id = source.private_session_id
+	return result
+
+
 func _context_success(context: LobbyContext, permit: int = 0) -> PartyResult:
 	var result := PartyResult.new()
 	result.outcome = PartyResult.Outcome.OK
@@ -4192,6 +5238,9 @@ func _context_success(context: LobbyContext, permit: int = 0) -> PartyResult:
 	result.descriptor = String(_object_value(context.network, &"descriptor", "")) \
 		if context != null and context.network != null else ""
 	result.publication_permit = permit
+	result.play_origin = context.play_origin if context != null else &""
+	result.private_session_id = context.private_session_id \
+		if context != null else ""
 	result.cleanup_pending = context.cleanup_pending if context != null else false
 	return result
 
@@ -4476,7 +5525,10 @@ func _empty_context_snapshot() -> Dictionary:
 		"role": "",
 		"kind": "",
 		"recovery_epoch": -1,
-		"expected_count": 0,
+		"capacity": 0,
+		"selected_start_count": 0,
+		"play_origin": &"",
+		"private_session_id": "",
 		"lobby_id": "",
 		"local_key": {},
 		"owner_key": {},
@@ -4493,6 +5545,7 @@ func _empty_context_snapshot() -> Dictionary:
 		"phase": "",
 		"search_control": {"valid": false},
 		"arranged_control": {"valid": false},
+		"private_control": {"valid": false},
 	}
 
 

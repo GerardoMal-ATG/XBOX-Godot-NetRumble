@@ -2,6 +2,10 @@ extends RefCounted
 
 
 class Results extends RefCounted:
+	const E_FAIL := -2147467259
+	const E_ABORT := -2147467260
+	const E_INVALIDARG := -2147024809
+
 	static func make(
 		ok: bool,
 		data: Variant = null,
@@ -17,6 +21,70 @@ class Results extends RefCounted:
 			"hresult": (0 if ok else -2147467259) \
 				if hresult == 0x7FFFFFFFFFFFFFFF else hresult,
 		}
+
+	static func match_ticket_create_cancelled(
+		properties: Dictionary = {}
+	) -> Dictionary:
+		return make(
+			false,
+			properties.duplicate(true),
+			"match_ticket_create_cancelled",
+			"Injected ticket creation was cancelled.",
+			E_ABORT)
+
+	static func match_ticket_join_cancelled(ticket: Variant) -> Dictionary:
+		return make(
+			false,
+			ticket,
+			"match_ticket_join_cancelled",
+			"Injected ticket join was cancelled.",
+			E_ABORT)
+
+	static func match_ticket_completed_failed(
+		ticket: Variant,
+		hresult: int = E_FAIL
+	) -> Dictionary:
+		return make(
+			false,
+			ticket,
+			"match_ticket_completed_failed",
+			"Injected ticket terminal failure.",
+			hresult)
+
+	static func match_ticket_create_failed(
+		properties: Dictionary = {},
+		hresult: int = E_FAIL
+	) -> Dictionary:
+		return make(
+			false,
+			properties.duplicate(true),
+			"match_ticket_create_failed",
+			"Injected ticket creation failure.",
+			hresult)
+
+	static func match_ticket_cancel_lost_race(ticket: Variant) -> Dictionary:
+		return make(
+			false,
+			ticket,
+			"match_ticket_cancel_lost_race",
+			"Injected match completed before cancellation.",
+			E_ABORT)
+
+	static func invalid_match_ticket() -> Dictionary:
+		return make(
+			false,
+			null,
+			"invalid_match_ticket",
+			"Injected ticket is already terminal.",
+			E_INVALIDARG)
+
+	static func cancelled_by_shutdown() -> Dictionary:
+		return make(
+			false,
+			null,
+			"cancelled",
+			"Injected runtime invalidation.",
+			E_ABORT)
 
 
 class Clock extends OnlineFlowClock:
@@ -77,6 +145,37 @@ class Config extends RefCounted:
 	var direct_peer_connectivity := 0
 
 
+class LobbyUpdateConfig extends RefCounted:
+	var present: Dictionary = {}
+	var _access_policy := -1
+	var _lobby_properties: Dictionary = {}
+	var _search_properties: Dictionary = {}
+
+	var access_policy: int:
+		get:
+			return _access_policy
+		set(value):
+			_access_policy = value
+			present["access_policy"] = true
+
+	var lobby_properties: Dictionary:
+		get:
+			return _lobby_properties
+		set(value):
+			_lobby_properties = value.duplicate(true)
+			present["lobby_properties"] = true
+
+	var search_properties: Dictionary:
+		get:
+			return _search_properties
+		set(value):
+			_search_properties = value.duplicate(true)
+			present["search_properties"] = true
+
+	func has_field(field: String) -> bool:
+		return present.has(field)
+
+
 class MatchmakingMember extends RefCounted:
 	var user: Variant = null
 	var attributes: Dictionary = {}
@@ -107,80 +206,179 @@ class Ticket extends RefCounted:
 	var match_id := ""
 	var arranged_lobby_connection_string := ""
 	var properties: Dictionary = {}
+	var completion_received := false
+	var native_destroyed := false
+	var terminal_event_count := 0
+	var terminal_delivery_order: StringName = &"completion_first"
 	var cancel_calls := 0
-	var cancel_ok := true
-	var cancel_confirms_terminal := true
-	var block_cancel := false
-	var cancel_release_result: Variant = null
+	var cancel_fault_unanswered := false
+	var cancel_fault_result: Variant = null
+	var cancel_terminal_before_start_status := -1
 	var runtime_invalidated := false
 	var cancel_waiting := false
+	var _cancel_started := false
+	var _cancel_completed := false
+	var _cancel_result: Variant = null
+	var _cancel_result_ticket: WeakRef = null
+	var _cancel_waiter_count := 0
 
 	func is_complete() -> bool:
 		return status >= MatchmakingService.STATUS_MATCHED
 
 	func cancel_async() -> Dictionary:
-		cancel_calls += 1
-		if status >= MatchmakingService.STATUS_MATCHED:
-			return Results.make(
-				false,
-				self,
-				"ticket_already_terminal",
-				"Injected terminal ticket cannot be cancelled.")
-		if block_cancel:
-			cancel_waiting = true
-			await cancel_released
-			cancel_waiting = false
-		if runtime_invalidated:
-			return Results.make(
-				false,
-				self,
-				"cancelled",
-				"Injected runtime invalidation.",
-				-2147467260)
-		if cancel_release_result != null:
-			var released_result: Variant = cancel_release_result
-			cancel_release_result = null
-			return released_result
-		if status == MatchmakingService.STATUS_MATCHED:
-			cancel_waiting = true
-			while not runtime_invalidated and cancel_release_result == null:
-				await cancel_released
-			cancel_waiting = false
-			if runtime_invalidated:
-				return Results.make(
-					false,
-					self,
-					"cancelled",
-					"Injected runtime invalidation.",
-					-2147467260)
-			var matched_result: Variant = cancel_release_result
-			cancel_release_result = null
-			return matched_result
-		if cancel_ok and cancel_confirms_terminal:
-			status = MatchmakingService.STATUS_CANCELLED
-			state_changed.emit(Change.new())
-		return Results.make(
-			cancel_ok,
-			self,
-			"cancelled" if cancel_ok else "match_ticket_cancel_start_failed",
-			"Injected cancel result.",
-			0 if cancel_ok else -2147467259)
+		if runtime_invalidated or completion_received or native_destroyed:
+			return Results.invalid_match_ticket()
+		if not _cancel_started:
+			if cancel_terminal_before_start_status \
+					>= MatchmakingService.STATUS_MATCHED:
+				_apply_terminal_snapshot(cancel_terminal_before_start_status)
+				completion_received = true
+				native_destroyed = true
+				return Results.invalid_match_ticket()
+			_cancel_started = true
+			if not is_complete():
+				cancel_calls += 1
+		if _cancel_completed:
+			return _materialize_cancel_result()
+		_cancel_waiter_count += 1
+		cancel_waiting = true
+		await cancel_released
+		return _consume_cancel_result()
 
 	func emit_status(next_status: int, result: Variant = null) -> void:
+		if next_status >= MatchmakingService.STATUS_MATCHED:
+			publish_terminal(next_status, result)
+			return
+		publish_nonterminal(next_status)
+
+	func publish_nonterminal(next_status: int) -> void:
+		if runtime_invalidated or native_destroyed or completion_received:
+			return
 		status = next_status
+		var change := Change.new()
+		change.result = Results.make(true, self)
+		state_changed.emit(change)
+
+	func publish_terminal(
+		next_status: int,
+		terminal_result: Variant = null
+	) -> void:
+		if runtime_invalidated or native_destroyed or completion_received:
+			return
+		_apply_terminal_snapshot(next_status)
+		var result: Variant = terminal_result \
+			if terminal_result != null else _default_terminal_result()
+		completion_received = true
+		if terminal_delivery_order == &"event_first":
+			_emit_terminal(result)
+			_complete_cancel_for_terminal(result)
+		else:
+			_complete_cancel_for_terminal(result)
+			_emit_terminal(result)
+		native_destroyed = true
+
+	func prime_terminal_snapshot(
+		next_status: int,
+		_terminal_result: Variant = null
+	) -> void:
+		if runtime_invalidated or native_destroyed or completion_received:
+			return
+		_apply_terminal_snapshot(next_status)
+		completion_received = true
+		native_destroyed = true
+
+	func invalidate_runtime() -> void:
+		runtime_invalidated = true
+		native_destroyed = true
+		if _cancel_started and not _cancel_completed:
+			_complete_cancel(Results.cancelled_by_shutdown())
+
+	func release_cancel(result: Variant) -> void:
+		if _cancel_started and not _cancel_completed:
+			_complete_cancel(result)
+
+	func _apply_terminal_snapshot(next_status: int) -> void:
+		status = next_status
+
+	func _default_terminal_result() -> Dictionary:
+		match status:
+			MatchmakingService.STATUS_FAILED:
+				return Results.match_ticket_completed_failed(self)
+			_:
+				return Results.make(true, self)
+
+	func _emit_terminal(result: Variant) -> void:
+		terminal_event_count += 1
 		var change := Change.new()
 		change.result = result
 		state_changed.emit(change)
 
-	func invalidate_runtime() -> void:
-		runtime_invalidated = true
-		block_cancel = false
-		cancel_released.emit()
+	func _complete_cancel_for_terminal(terminal_result: Variant) -> void:
+		if not _cancel_started or _cancel_completed or cancel_fault_unanswered:
+			return
+		if cancel_fault_result != null:
+			var fault_result: Variant = cancel_fault_result
+			cancel_fault_result = null
+			_complete_cancel(fault_result)
+			return
+		match status:
+			MatchmakingService.STATUS_CANCELLED:
+				_complete_cancel(Results.make(true))
+			MatchmakingService.STATUS_MATCHED:
+				_complete_cancel(Results.match_ticket_cancel_lost_race(self))
+			MatchmakingService.STATUS_FAILED:
+				_complete_cancel(terminal_result)
 
-	func release_cancel(result: Variant) -> void:
-		cancel_release_result = result
-		block_cancel = false
+	func _complete_cancel(result: Variant) -> void:
+		_store_cancel_result(result)
+		_cancel_completed = true
 		cancel_released.emit()
+		if _cancel_waiter_count == 0:
+			_clear_cancel_result()
+
+	func _consume_cancel_result() -> Variant:
+		var result: Variant = _materialize_cancel_result()
+		var code := String((result as Dictionary).get("code", "")) \
+			if typeof(result) == TYPE_DICTIONARY else ""
+		_cancel_waiter_count = maxi(_cancel_waiter_count - 1, 0)
+		cancel_waiting = _cancel_waiter_count > 0
+		if _cancel_waiter_count == 0:
+			_clear_cancel_result()
+		if code == "match_ticket_cancel_start_failed" \
+				or (
+					not completion_received
+					and not runtime_invalidated
+					and not native_destroyed
+				):
+			_cancel_started = false
+			_cancel_completed = false
+		return result
+
+	func _store_cancel_result(result: Variant) -> void:
+		_cancel_result_ticket = null
+		if typeof(result) != TYPE_DICTIONARY:
+			_cancel_result = result
+			return
+		var stored := (result as Dictionary).duplicate(true)
+		if stored.get("data") == self:
+			_cancel_result_ticket = weakref(self)
+			stored["data"] = null
+		_cancel_result = stored
+
+	func _materialize_cancel_result() -> Variant:
+		if typeof(_cancel_result) != TYPE_DICTIONARY:
+			return _cancel_result
+		var result := (_cancel_result as Dictionary).duplicate(true)
+		if _cancel_result_ticket != null:
+			result["data"] = _cancel_result_ticket.get_ref()
+		return result
+
+	func _clear_cancel_result() -> void:
+		_cancel_result = null
+		_cancel_result_ticket = null
+
+	func has_retained_cancel_result() -> bool:
+		return _cancel_result != null or _cancel_result_ticket != null
 
 
 class TicketWithoutProperties extends RefCounted:
@@ -266,12 +464,18 @@ class MatchmakingSDK extends RefCounted:
 	func invalidate_runtime() -> void:
 		for ticket: Ticket in tracked_tickets:
 			ticket.invalidate_runtime()
-		tracked_tickets.clear()
 
 	func pending_cancel_waiters() -> int:
 		var count := 0
 		for ticket: Ticket in tracked_tickets:
 			if ticket.cancel_waiting:
+				count += 1
+		return count
+
+	func retained_cancel_results() -> int:
+		var count := 0
+		for ticket: Ticket in tracked_tickets:
+			if ticket.has_retained_cancel_result():
 				count += 1
 		return count
 
@@ -357,12 +561,15 @@ class Matchmaking extends MatchmakingService:
 			var alarms := service._clock.armed_alarm_count() \
 				if service._clock != null else 0
 			var waiters := service.sdk.pending_cancel_waiters()
-			if alarms > 0 or waiters > 0 or service.has_pending_cleanup():
+			var retained := service.sdk.retained_cancel_results()
+			if alarms > 0 or waiters > 0 or retained > 0 \
+					or service.has_pending_cleanup():
 				report.append(
-					"instance=%d alarms=%d waiters=%d cleanup=%s attempts=%d" % [
+					"instance=%d alarms=%d waiters=%d retained=%d cleanup=%s attempts=%d" % [
 						service.get_instance_id(),
 						alarms,
 						waiters,
+						retained,
 						service.has_pending_cleanup(),
 						service._attempts.size(),
 					])
@@ -689,7 +896,9 @@ class Lobby extends RefCounted:
 	var disconnected := false
 	var leaves := 0
 	var update_calls := 0
+	var update_records: Array[Dictionary] = []
 	var property_calls := 0
+	var member_calls := 0
 	var lock_calls := 0
 	var block_leave := false
 	var block_post := false
@@ -698,6 +907,7 @@ class Lobby extends RefCounted:
 	var block_properties := false
 	var next_leave_result: Variant = null
 	var next_post_result: Variant = null
+	var next_post_overrides: Dictionary = {}
 	var next_lock_result: Variant = null
 	var next_member_result: Variant = null
 
@@ -720,16 +930,54 @@ class Lobby extends RefCounted:
 
 	func post_update_async(update: Variant) -> Dictionary:
 		update_calls += 1
+		var access_present: bool = update != null \
+			and update.has_method("has_field") \
+			and bool(update.has_field("access_policy"))
+		var lobby_present: bool = update != null \
+			and update.has_method("has_field") \
+			and bool(update.has_field("lobby_properties"))
+		var search_present: bool = update != null \
+			and update.has_method("has_field") \
+			and bool(update.has_field("search_properties"))
+		update_records.append({
+			"present": update.present.duplicate()
+				if update != null and update.get("present") != null else {},
+			"access_policy": int(update.access_policy) if access_present else -1,
+			"lobby_properties": update.lobby_properties.duplicate(true)
+				if lobby_present else {},
+			"search_properties": update.search_properties.duplicate(true)
+				if search_present else {},
+		})
 		if block_post:
 			await post_released
 		if next_post_result != null:
 			var result: Variant = next_post_result
 			next_post_result = null
 			return result
-		if not update.lobby_properties.is_empty():
+		if access_present:
+			access_policy = int(update.access_policy)
+		if lobby_present:
 			properties.merge(update.lobby_properties, true)
-		if not update.search_properties.is_empty():
+		if search_present:
 			search_properties.merge(update.search_properties, true)
+		if not next_post_overrides.is_empty():
+			if next_post_overrides.has("access_policy"):
+				access_policy = int(next_post_overrides.access_policy)
+			if next_post_overrides.has("lobby_properties"):
+				properties.merge(
+					next_post_overrides.lobby_properties as Dictionary, true)
+			if next_post_overrides.has("search_properties"):
+				search_properties.merge(
+					next_post_overrides.search_properties as Dictionary, true)
+			if next_post_overrides.has("owner_entity_key"):
+				owner_entity_key = (
+					next_post_overrides.owner_entity_key as Dictionary
+				).duplicate()
+			if next_post_overrides.has("max_member_count"):
+				max_member_count = int(next_post_overrides.max_member_count)
+			if next_post_overrides.has("membership_lock"):
+				membership_lock = int(next_post_overrides.membership_lock)
+			next_post_overrides = {}
 		return Results.make(true)
 
 	func set_properties_async(values: Dictionary) -> Dictionary:
@@ -740,6 +988,7 @@ class Lobby extends RefCounted:
 		return Results.make(true)
 
 	func set_member_properties_async(values: Dictionary) -> Dictionary:
+		member_calls += 1
 		if block_member:
 			await member_released
 		if next_member_result != null:
@@ -809,7 +1058,7 @@ class PartySDK extends RefCounted:
 				network.local_peer = null
 		return Results.make(true)
 
-	func create_and_join_network_async(user: Variant, config: Variant) -> Dictionary:
+	func create_and_join_network_async(_user: Variant, config: Variant) -> Dictionary:
 		create_calls.append({
 			"max_players": int(config.max_players),
 			"invitation_id": String(config.invitation_id),
@@ -823,11 +1072,10 @@ class PartySDK extends RefCounted:
 		_apply_next_network_leave_result(network)
 		if block_create:
 			await create_released
-		network.local_peer.keys[1] = user.entity_key.duplicate()
 		networks.append(network)
 		return Results.make(true, network)
 
-	func join_network_async(user: Variant, descriptor: String, config: Variant) -> Dictionary:
+	func join_network_async(_user: Variant, descriptor: String, config: Variant) -> Dictionary:
 		join_calls.append({
 			"descriptor": descriptor,
 			"invitation_id": String(config.invitation_id),
@@ -842,7 +1090,6 @@ class PartySDK extends RefCounted:
 		if block_join:
 			await join_released
 		network.local_peer.unique_id = 7
-		network.local_peer.keys[7] = user.entity_key.duplicate()
 		networks.append(network)
 		return Results.make(true, network)
 
@@ -1063,7 +1310,7 @@ class Party extends PartyService:
 		return Config.new()
 
 	func _new_lobby_update_config() -> Variant:
-		return Config.new()
+		return LobbyUpdateConfig.new()
 
 	func _new_lobby_search_config() -> Variant:
 		return Config.new()

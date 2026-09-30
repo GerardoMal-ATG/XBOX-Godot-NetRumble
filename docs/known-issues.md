@@ -22,8 +22,9 @@ See also: [Troubleshooting](troubleshooting.md) · [Manual test plan](manual-tes
 | Shots sometimes bounce off another player's ship instead of counting as a hit. | PC | [#3][issue-3] |
 | Backing out of the lobby code screen with **B** can leave the menu unresponsive. Pressing **B** again gets you out and restores it. | Console | [#4][issue-4] |
 | The ready indicator on the lobby roster is slightly too big for the circle it sits in. | PC | [#1][issue-1] |
-| A full group of four that chooses **Matchmaking** cannot find a match: the queue refuses a ticket that already fills it, and everyone is returned to the same lobby with a reason and a note to use **Host Match**. | PC and console | [Below](#a-full-group-of-four-cannot-use-quick-match) |
-| If a match is found at the very moment a search is cancelled or runs out of time, the group closes, and Quick Match can take up to about 20 seconds to become available again while the game restarts its multiplayer services. | PC and console | [Below](#a-match-found-just-as-a-search-stops) |
+| A full group of four does not search for a match: the queue cannot take a ticket that is already at its maximum of four. When all four are ready, the group starts a private match automatically, in the same lobby. | PC and console | [Below](#a-full-group-of-four-starts-a-private-match) |
+| A matched game starts with the players who have arrived. A player who arrives after it has started cannot join that round and is returned to the menu to search again. | PC and console | [Below](#players-who-arrive-after-a-match-starts) |
+| If a match is found at the very moment a search is cancelled or runs out of time, the group closes instead of joining it, and a new group can be opened once the old group's usual cleanup has finished. | PC and console | [Below](#a-match-found-just-as-a-search-stops) |
 
 ## The chat cleanup hang
 
@@ -50,38 +51,48 @@ an exit as a workaround.
 The full technical detail, including what the coordinated run did and did not prove, is in the
 [manual test plan](manual-test-plan.md#known-cleanup-blocker).
 
-## A full group of four cannot use Quick Match
+## A full group of four starts a private match
 
-Quick Match fills four-player Deathmatch matches from the `godotnr_q` queue. A group of one to
-three players readies up together in its lobby, and the group's owner submits one matchmaking
-ticket for all of them, which PlayFab fills with other players. A full group of four takes exactly
-the same path, and PlayFab refuses it. The rule is documented in
+Quick Match fills Deathmatch matches of two to four players from the `godotnr_q` queue. A group of
+one to three players readies up together in its lobby, and the group's owner submits one
+matchmaking ticket for all of them, which PlayFab matches with other players.
+
+A full group of four does not search. A ticket that already carries four players meets this
+queue's four-player maximum, and the queue does not take it. The rule is documented in
 [Configuring matchmaking queues][mm-queues]:
 
 > If a ticket already meets the maximum requirement for a match, however, it is rejected.
 
-A ticket that already carries four players meets this queue's four-player maximum, so it can never
-match. The sample submits it anyway rather than refusing the group itself, so the queue's own
-configuration stays the one authority on what can match.
+Instead, when all four are ready, the group starts a private match automatically: the same lobby
+and the same players, with no search, no ticket and nothing extra to press. Any change to who is in
+the group sets everyone back to not ready, so readiness given by four players never starts a
+search for three. After each match the group stays together for further rounds of two to four
+players. See [Private Start](matchmaking.md#private-start).
 
-What the players see: the whole group is returned to the same lobby, every member is shown the same
-reason once, everyone is set back to not ready, the lobby is unlocked and reopened, and each
-member's XBOX activity is published again. Nothing has to be restarted.
+If the private match cannot be started, what happens depends on how far it got, and it never
+falls back to searching for a match:
 
-Which reason depends on what the addon reports. The version this sample is built with does not yet
-pass on the matchmaking service's own reason for a failed ticket, so the game cannot tell this
-refusal apart from any other failure it cannot see into. The group is shown a general failure --
-*"Could not create a matchmaking ticket."* or *"Matchmaking failed before a match was found."* --
-followed by *"A full group of four also cannot match in this four-player queue. Use Host Match to
-play together."* That second sentence is a fact about the queue, not a diagnosis of the failure, and
-a group of four is told it whenever the cause is not reported. When the service's reason does
-arrive, the group is shown *"A full group of four cannot match in this four-player queue."*
+- When the lobby is confirmed back as the group's own, the players still in the group are
+  returned to it, unready, with the reason, and can ready up again.
+- If, before the lobby was switched to the private match, the group's lobby cannot be reopened, it
+  stays closed until the owner tries again or leaves.
+- If the switch cannot be confirmed or undone, the group's owner leaves or is lost, or anything
+  fails once the private match has been committed, the group ends with the reason, and its lobby
+  and connection are cleaned up.
 
-What to do instead: a group of four that wants to play together can use **Host Match** and share
-the room code. That path does not go through the matchmaking queue at all.
+## Players who arrive after a match starts
 
-A follow-up called *Private Start* has been proposed, in which a full group would skip the queue
-and start its match directly. It is not part of this sample, and nothing falls back to it today.
+A match can start with the players who have arrived. Players who arrive after it starts cannot join
+that round and may need to search again.
+
+Once PlayFab has matched a group, the matched game starts as soon as two to four of its players
+are present and ready in the match's lobby. It does not wait for every player the service
+matched. A player who arrives after the start is not added to that round. They are shown *"This
+match is already starting or in progress. Return to Matchmaking to search again."* If the game
+cannot tell why the match could not be joined, they are shown *"This match could not be joined. It
+may already have started. Return to Matchmaking to search again."* Nothing else is affected: the
+players already in the match carry on, and the late player can search again from
+**Matchmaking**.
 
 ## A match found just as a search stops
 
@@ -90,19 +101,21 @@ moment. The cancel stays binding: the group does not join that match or reopen a
 happened, and every member is shown *"A match was found just as the search stopped, so the group
 was closed."* Everyone is returned to the menu, and a new group can be opened.
 
-The addon this sample is built with does not yet finish a cancellation that loses this race, so
-the game restarts its multiplayer services -- never your account or your saves -- before Quick
-Match can be used again. Until that finishes, which takes up to about 20 seconds, the Matchmaking
-row explains that the previous session is still finishing. Signing out, or the game being
-suspended, during that wait does not skip the restart: it still runs once, and the next player
-can use Quick Match without restarting the game. An invitation accepted during that wait is kept
-and joined once the restart has finished. If that restart of the multiplayer services itself
-fails, online play stays unavailable until the game is restarted: every online option says so
-instead of asking you to try again, an invitation is answered once with the same reason, and
-quitting still takes no longer than usual. Practice is refused only while the group that was
-searching still holds that cleanup. Once it has been let go -- after signing out or a suspend,
-for example -- a signed-in player can start Practice as usual, because Practice needs no online
-services. See the configuration guide for the addon revision this sample is built from.
+The cancellation still finishes: the service reports that the match won the race, and nothing is
+restarted. The group's usual cleanup of its lobby and connection then finishes, and Quick Match can
+be used again after that. Only if that answer never arrives does the
+game restart its multiplayer services -- never your account or your saves -- before Quick Match can
+be used again. Until that finishes, which takes up to about 20 seconds, the Matchmaking row
+explains that the previous session is still finishing. Signing out, or the game being suspended,
+during that wait does not skip the restart: it still runs once, and the next player can use Quick
+Match without restarting the game. An invitation accepted during that wait is kept and joined once
+the restart has finished. If that restart of the multiplayer services itself fails, online play
+stays unavailable until the game is restarted: every online option says so instead of asking you
+to try again, an invitation is answered once with the same reason, and quitting still takes no
+longer than usual. Practice is refused only while the group that was searching still holds that
+cleanup. Once it has been let go -- after signing out or a suspend, for example -- a signed-in
+player can start Practice as usual, because Practice needs no online services. See the
+configuration guide for the addon revision this sample is built from.
 
 ## What is not on this list
 

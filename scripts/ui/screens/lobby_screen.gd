@@ -168,7 +168,7 @@ func _ready() -> void:
 
 
 ## Whether this screen may reopen a closed session on arrival: always for a hosted match,
-## and for a matchmaking group only in its arranged rematch phase.
+## and for a matchmaking group only in its play session's rematch phase.
 func _reopen_allowed() -> bool:
 	if not NetManager.has_online_flow():
 		return true
@@ -430,21 +430,31 @@ func _refresh_rules() -> void:
 	]
 
 
-## A matchmaking group is not the match: it fills up to four here and the service finds
-## whoever else the four-player match needs, so the two numbers are shown apart. Once the
-## match exists the lobby is the match's own, and shows its players.
+## A matchmaking group is not the match: it fills up to four here, and the service matches it
+## into a game of two to four players, so the two are shown apart -- unless the group is full,
+## which plays a private match of its own instead of searching. Once the match exists the lobby
+## is the match's own and shows its players -- those who have arrived, out of the room's four --
+## and, once they are chosen, the players the first match starts with.
 func _players_line() -> String:
 	if not NetManager.has_online_flow():
 		return "Players: %d" % _roster_capacity()
 	var flow := NetManager.flow_snapshot()
 	var phase := int(flow.get("phase", -1))
-	if phase in [MatchmakingFlow.Phase.ADMITTING_COHORT, MatchmakingFlow.Phase.COMMITTING_START,
-			MatchmakingFlow.Phase.GAMEPLAY, MatchmakingFlow.Phase.REMATCH_GATHERING]:
-		return "Players %d/%d" % [NetManager.players.size(), int(flow.get("match_size", NetManager.session_capacity()))]
-	return "Group %d/%d  ·  Match %d" % [
-		NetManager.players.size(),
-		int(flow.get("capacity", NetManager.session_capacity())),
-		int(flow.get("match_size", NetManager.session_capacity())),
+	var capacity := int(flow.get("capacity", NetManager.session_capacity()))
+	if phase in [MatchmakingFlow.Phase.ADMITTING_COHORT, MatchmakingFlow.Phase.COMMITTING_START]:
+		var selected := int(flow.get("selected_count", 0))
+		if selected > 0:
+			return "Starting with %d players" % [selected]
+		return "Players %d/%d" % [NetManager.players.size(), capacity]
+	if phase in [MatchmakingFlow.Phase.GAMEPLAY, MatchmakingFlow.Phase.REMATCH_GATHERING]:
+		return "Players %d/%d" % [NetManager.players.size(), capacity]
+	var group := "Group %d/%d" % [NetManager.players.size(), capacity]
+	if phase == MatchmakingFlow.Phase.PRIVATE_PREPARING or NetManager.players.size() >= capacity:
+		return "%s  ·  Private match" % [group]
+	return "%s  ·  Match %d-%d" % [
+		group,
+		MatchmakingService.QUEUE_MIN_MATCH_SIZE,
+		MatchmakingService.QUEUE_MAX_MATCH_SIZE,
 	]
 
 
@@ -527,7 +537,7 @@ func _can_invite() -> bool:
 	if not NetManager.is_accepting_joins():
 		return false
 	# A matchmaking group's local gate can be open while it must not be advertised --
-	# admitting its own arranged cohort -- so the social veto decides, not the gate.
+	# admitting the arrivals of its arranged match -- so the social veto decides, not the gate.
 	if NetManager.has_online_flow() and not bool(NetManager.flow_social_snapshot().get("joinable", false)):
 		return false
 	return Services.xbox_user() != null
@@ -615,10 +625,10 @@ func _toggle_ready() -> void:
 ## STARTING first would leave the lobby advertised and its join code live for the whole
 ## match, which is how a latecomer reached a session that had already begun.
 func _try_auto_start() -> void:
-	# A matchmaking group takes the hosted start only in its arranged rematch round. A
-	# gathering group's owner flow starts a search -- not a match -- once the whole group is
-	# ready, and the matched game's start is the flow's strict commit, owned outside this
-	# screen so a rebuilt lobby can neither skip nor repeat it.
+	# A matchmaking group takes the hosted start only in its play session's rematch rounds,
+	# matchmade or private. A gathering group's owner flow starts a search -- or a full group's
+	# private match -- once the whole group is ready, and the first game's start is the flow's
+	# strict commit, owned outside this screen so a rebuilt lobby can neither skip nor repeat it.
 	if NetManager.has_online_flow() \
 			and int(NetManager.flow_snapshot().get("phase", -1)) != MatchmakingFlow.Phase.REMATCH_GATHERING:
 		return
@@ -861,13 +871,17 @@ func _flow_status_text() -> String:
 	if phase in [MatchmakingFlow.Phase.CREATING_TICKET, MatchmakingFlow.Phase.JOINING_TICKET]:
 		return "Starting the search\u2026"
 	if phase == MatchmakingFlow.Phase.SEARCHING:
-		return "Searching for a %d-player match\u2026" % int(flow.get("match_size", MatchmakingFlow.CAPACITY))
+		return "Searching for a match of %d to %d players\u2026" % [
+			MatchmakingService.QUEUE_MIN_MATCH_SIZE, MatchmakingService.QUEUE_MAX_MATCH_SIZE]
 	if phase == MatchmakingFlow.Phase.CANCELLING:
 		if bool(flow.get("cancel_unresolved", false)):
 			return "Still cancelling the search\u2026 You can leave; it will finish in the background."
 		return "Cancelling the search\u2026"
 	if phase == MatchmakingFlow.Phase.RESTORING_STAGING:
 		return "Returning to the group\u2026"
+	if phase == MatchmakingFlow.Phase.PRIVATE_PREPARING \
+			or (phase == MatchmakingFlow.Phase.COMMITTING_START and bool(flow.get("private", false))):
+		return "Starting a private match\u2026"
 	if phase in [MatchmakingFlow.Phase.MATCHED, MatchmakingFlow.Phase.JOINING_ARRANGED,
 			MatchmakingFlow.Phase.ARMING_HANDOFF, MatchmakingFlow.Phase.SWITCHING_TRANSPORT,
 			MatchmakingFlow.Phase.ADMITTING_COHORT, MatchmakingFlow.Phase.COMMITTING_START]:
@@ -883,9 +897,17 @@ func _flow_status_text() -> String:
 			return "Joining the group\u2026"
 		var local := NetManager.local_player()
 		if local != null and not local.is_ready:
-			# The full reason -- which can carry a note about the queue's four-player limit --
-			# is shown once in its own dialog; this single line only says a search ended.
-			return ("The last search ended. " if not reason.is_empty() else "") + "Press Ready to search for a match"
+			# A full group does not search: once everyone is ready it plays a private match of
+			# its own. A smaller group searches for a match of two to four.
+			if NetManager.players.size() >= int(flow.get("capacity", MatchmakingFlow.CAPACITY)):
+				return "Your group is full. When everyone is ready, a private match starts without searching."
+			# The full reason is shown once in its own dialog; this single line only says an
+			# attempt ended.
+			if reason.is_empty():
+				return "Press Ready to search for a match"
+			if bool(flow.get("private_outcome", false)):
+				return "The private match did not start. Press Ready to search for a match"
+			return "The last search ended. Press Ready to search for a match"
 		return "Waiting for the group to ready up\u2026"
 	if phase in [MatchmakingFlow.Phase.GAMEPLAY, MatchmakingFlow.Phase.REMATCH_GATHERING] \
 			and not bool(flow.get("host_returned", true)):
@@ -907,7 +929,8 @@ func _present_flow_outcome() -> void:
 	if int(flow.get("phase", -1)) != MatchmakingFlow.Phase.GATHERING:
 		return
 	NetManager.mark_flow_outcome_presented(outcome_epoch)
-	await ScreenManager.show_dialog("Search Ended", reason, "warning", false)
+	var title: String = "Private Match Not Started" if bool(flow.get("private_outcome", false)) else "Search Ended"
+	await ScreenManager.show_dialog(title, reason, "warning", false)
 	if _account_current() and is_active:
 		_restore_lobby_focus()
 
@@ -1005,11 +1028,16 @@ func on_back_pressed() -> void:
 	if _transitioning:
 		return
 	# The owner's Back during a search is Cancel Search: the group stays together and is
-	# restored once the service confirms. Everyone else's Back leaves -- a guest's leave
-	# withdraws its consent and stops the owner's search too.
+	# restored once the service confirms. The owner's Back while a private match is being
+	# started, before its lobby switch was asked for, cancels it the same way. Everyone else's
+	# Back leaves -- a guest's leave withdraws its consent and stops the owner's search too.
 	var flow := NetManager.flow_snapshot()
 	if bool(flow.get("cancellable", false)):
-		var cancel: bool = await ScreenManager.show_dialog("Cancel Search", "Stop searching for a match?", "warning", true)
+		var starting_private: bool = int(flow.get("phase", -1)) == MatchmakingFlow.Phase.PRIVATE_PREPARING
+		var cancel: bool = await ScreenManager.show_dialog(
+			"Cancel Private Match" if starting_private else "Cancel Search",
+			"Stop starting the private match?" if starting_private else "Stop searching for a match?",
+			"warning", true)
 		if cancel and _account_current():
 			NetManager.cancel_matchmaking_search()
 		return

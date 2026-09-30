@@ -4,16 +4,22 @@ extends MultiplayerPeerExtension
 ##
 ## It reports a chosen unique id and a connected status, announces whichever remote peers a
 ## test names -- so SceneMultiplayer's own peer bookkeeping and NetManager's peer signals run
-## for real -- and records every packet NetManager sends. Nothing is ever delivered: an RPC
-## body a test exercises is still NetManager's own, invoked by the test, and none of this
-## is evidence about native Party routing or timing.
+## for real -- and records every packet NetManager sends, with the peer it was addressed to
+## (0 for everyone), and every peer the host drops from its own peers. Nothing is ever
+## delivered: an RPC body a test exercises is still NetManager's own, invoked by the test, and
+## none of this is evidence about native Party routing or timing.
 
 var unique_id := 1
 var status: MultiplayerPeer.ConnectionStatus = MultiplayerPeer.CONNECTION_CONNECTED
 var sent: Array[PackedByteArray] = []
+## The target of each packet in `sent`, index for index.
+var targets: Array[int] = []
+## Peers the host dropped from its own peers, in order.
+var disconnected: Array[int] = []
 var _channel := 0
 var _mode: MultiplayerPeer.TransferMode = MultiplayerPeer.TRANSFER_MODE_RELIABLE
 var _refusing := false
+var _target := 0
 
 
 func _init(id: int = 1) -> void:
@@ -36,6 +42,7 @@ func _get_packet_script() -> PackedByteArray:
 
 func _put_packet_script(p_buffer: PackedByteArray) -> Error:
 	sent.append(p_buffer)
+	targets.append(_target)
 	return OK
 
 
@@ -71,8 +78,8 @@ func _get_transfer_mode() -> MultiplayerPeer.TransferMode:
 	return _mode
 
 
-func _set_target_peer(_p_peer: int) -> void:
-	pass
+func _set_target_peer(p_peer: int) -> void:
+	_target = p_peer
 
 
 func _get_packet_peer() -> int:
@@ -92,6 +99,7 @@ func _close() -> void:
 
 
 func _disconnect_peer(p_peer: int, _p_force: bool) -> void:
+	disconnected.append(p_peer)
 	peer_disconnected.emit(p_peer)
 
 

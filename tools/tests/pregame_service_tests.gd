@@ -104,8 +104,8 @@ const SOURCE_OPTIONAL_SURFACES := [
 	"PlayFabLobbySearchResult.lobbies",
 	"PlayFabMultiplayer.find_lobbies_async",
 ]
-# Pinned Sample b1b4e0b, PlayFab Multiplayer implementation lines 624-652,
-# 1926-1928, 1990-2001, 2772-2939, 3434-3437 and 3470-3507.
+# Pinned Sample 442d790, PlayFab Multiplayer implementation lines 636-700,
+# 2042-2091, 3062-3096 and 3751-3846.
 const SOURCE_MATCHMAKING_NATIVE_CODES := [
 	"shutting_down",
 	"not_initialized",
@@ -114,21 +114,22 @@ const SOURCE_MATCHMAKING_NATIVE_CODES := [
 	"invalid_match_ticket_member",
 	"match_ticket_create_start_failed",
 	"match_ticket_create_failed",
+	"match_ticket_create_cancelled",
 	"invalid_join_match_ticket",
 	"match_ticket_join_start_failed",
 	"match_ticket_join_failed",
 	"match_ticket_join_cancelled",
 	"invalid_match_ticket",
 	"match_ticket_cancel_start_failed",
-	"match_ticket_failed",
 	"match_ticket_completed_failed",
+	"match_ticket_cancel_lost_race",
 	"lobby_state_finish_failed",
 	"matchmaking_state_finish_failed",
 	"cancelled",
 ]
-# Pinned Sample b1b4e0b, PlayFab Multiplayer implementation lines 2056-2091,
-# 2238-2769 and 3077-3437; PlayFab Party implementation lines 25-41,
-# 2149-2202, 2685-2707, 2872-3128, 3230-3660 and 4620-4758.
+# Pinned Sample 442d790, PlayFab Multiplayer implementation lines 2056-2091,
+# 2238-2769 and 3370-3720; PlayFab Party implementation lines 25-43,
+# 2149-2202, 2685-2755, 2872-3180, 3230-3785 and 4620-4758.
 const SOURCE_PARTY_NATIVE_CODES := [
 	"shutting_down",
 	"not_initialized",
@@ -170,6 +171,8 @@ const SOURCE_PARTY_NATIVE_CODES := [
 	"party_descriptor_invalid",
 	"party_transport_create_failed",
 	"party_peer_not_connected",
+	"party_handshake_endpoint_entity_unavailable",
+	"party_handshake_entity_mismatch",
 	"party_chat_control_create_failed",
 	"party_resource_not_ready",
 	"party_state_start_failed",
@@ -193,6 +196,7 @@ func run(test: Node) -> void:
 	await _s1_default_ticket_clock(test)
 	await _s2_group_ticket_shape(test)
 	await _s3_level_triggered_ticket_lifecycle(test)
+	await _a_mig_early_terminal_results(test)
 	await _s3_guest_join_and_late_retirement(test)
 	await _s4_failure_cancel_and_timeout(test)
 	await _s4_native_cleanup_ownership(test)
@@ -200,6 +204,7 @@ func run(test: Node) -> void:
 	await _s4_failure_cause_availability(test)
 	await _s4_safe_structured_failure_logging(test)
 	await _s4_source_derived_native_code_paths(test)
+	await _a_mig_party_handshake_rejections(test)
 	await _s4_observe_terminal_before_cancel(test)
 	await _s5_scoped_lobby_ownership(test)
 	await _s5_hosted_production_paths(test)
@@ -218,6 +223,9 @@ func run(test: Node) -> void:
 	await _s6_scoped_deadline_ownership(test)
 	await _s6_context_loss_and_admission(test)
 	await _s7_arranged_control_and_publication(test)
+	await _c_private_promotion_and_readback(test)
+	await _c_private_hold_restore_and_round(test)
+	await _c_private_invitation(test)
 	await _s8_joined_owner_authority_without_flow(test)
 	await _s8_legacy_guest_authority_changes(test)
 	await _s8_invite_destinations(test)
@@ -285,7 +293,7 @@ func _s1_capability_and_profile_gates(test: Node) -> void:
 		test._check(not bool(profile.get("ok", false))
 			and String(profile.get("reason_code", "")) == "profile_count_mismatch"
 			and service.availability_reason()
-				== "Quick Match needs the four-player Deathmatch settings.",
+				== "Quick Match needs the capacity-four Deathmatch settings.",
 			"configured %d-player Deathmatch is unavailable through the shared profile gate" % count)
 	service.fake_mode_config = null
 	var missing := service.runtime_profile(NRTypes.GameModeType.DEATHMATCH)
@@ -293,12 +301,17 @@ func _s1_capability_and_profile_gates(test: Node) -> void:
 		and String(missing.get("reason_code", "")) == "profile_missing"
 		and not service.is_available()
 		and service.availability_reason()
-			== "Quick Match needs the four-player Deathmatch settings.",
+			== "Quick Match needs the capacity-four Deathmatch settings.",
 		"missing Deathmatch reason=%s" % service.availability_reason())
 	service.fake_mode_config = _mode_config(4)
+	var supported_profile := service.runtime_profile(
+		NRTypes.GameModeType.DEATHMATCH)
 	test._check(service.is_available() and service.availability_reason().is_empty()
-		and bool(service.runtime_profile(NRTypes.GameModeType.DEATHMATCH).get("ok", false)),
-		"configured four-player Deathmatch passes the runtime profile gate")
+		and bool(supported_profile.get("ok", false))
+		and int(supported_profile.get("capacity", 0)) == 4
+		and int(supported_profile.get("queue_min_match_size", 0)) == 2
+		and int(supported_profile.get("queue_max_match_size", 0)) == 4,
+		"configured Deathmatch exposes queue 2-4 and capacity four")
 	var unsupported := service.runtime_profile(99)
 	test._check(not bool(unsupported.get("ok", false))
 		and String(unsupported.get("reason_code", "")) == "profile_unsupported_mode",
@@ -312,7 +325,7 @@ func _s1_capability_and_profile_gates(test: Node) -> void:
 		"invalid direct entry never reaches the SDK")
 
 	var mismatched := _spec(user, [user.entity_key], 2)
-	mismatched.expected_match_count = 8
+	mismatched.capacity = 8
 	var mismatch_attempt := service.begin_create(mismatched)
 	test._check(mismatch_attempt.outcome == MatchmakingService.Outcome.FAILED,
 		"non-four-player profile fails before native create")
@@ -321,11 +334,11 @@ func _s1_capability_and_profile_gates(test: Node) -> void:
 
 	service.fake_mode_config = _mode_config(3)
 	var mismatched_create := _spec(user, [user.entity_key], 3)
-	mismatched_create.expected_match_count = 4
+	mismatched_create.capacity = 4
 	var mismatched_create_attempt := service.begin_create(mismatched_create)
 	var mismatched_join := _join_spec(
 		user, [user.entity_key], 4, "mismatched-ticket")
-	mismatched_join.expected_match_count = 4
+	mismatched_join.capacity = 4
 	var mismatched_join_attempt := service.begin_join(mismatched_join)
 	test._check(mismatched_create_attempt.outcome == MatchmakingService.Outcome.FAILED
 		and mismatched_join_attempt.outcome == MatchmakingService.Outcome.FAILED
@@ -425,7 +438,7 @@ func _s1_optional_capability_degradation(test: Node) -> void:
 
 
 func _s1_arranged_capacity_contract(test: Node) -> void:
-	print("CASE: Phase 1 arranged capacity is caller-validated, native, and captured")
+	print("CASE: B-ORDER capacity-four arranged bootstrap is independent of selected size")
 	var service := Doubles.Party.new(ChatService.new())
 	service.configure_clock(service.fake_clock)
 	var user := Doubles.User.new("arranged-capacity")
@@ -453,10 +466,16 @@ func _s1_arranged_capacity_contract(test: Node) -> void:
 		and not bool(arranged_call.restrict_invites_to_lobby_owner),
 		"arranged native config is private/four/automatic/unrestricted: %s" % \
 			arranged_call)
-	test._check(int(accepted_snapshot.expected_count) == 4
-		and int(accepted_snapshot.max_members) == 4,
-		"arranged snapshot preserves expected=%s native=%s" % [
-			accepted_snapshot.expected_count, accepted_snapshot.max_members])
+	test._check(int(accepted_snapshot.capacity) == 4
+		and int(accepted_snapshot.selected_start_count) == 0
+		and int(accepted_snapshot.max_members) == 4
+		and (accepted_snapshot.members as Array).size() == 1
+		and not bool(accepted_snapshot.membership_locked),
+		"arranged snapshot keeps capacity=%s selected=%s native=%s" % [
+			accepted_snapshot.capacity,
+			accepted_snapshot.selected_start_count,
+			accepted_snapshot.max_members,
+		])
 	var prepared: PartyService.PartyResult = await service.prepare_transport(
 		accepted.context, user, service.fake_clock.now_msec() + 1000)
 	test._check(prepared.ok(),
@@ -466,13 +485,16 @@ func _s1_arranged_capacity_contract(test: Node) -> void:
 	test._check(int(create_call.max_players) == 4,
 		"arranged transport receives captured capacity max_players=%s" % \
 			create_call.get("max_players"))
+	test._check(service.snapshot(accepted.context).members.size() == 1
+		and not bool(service.snapshot(accepted.context).membership_locked),
+		"B-ORDER owner prepares a capacity-four network while bootstrap has one unlocked member")
 	await service.leave_transport(accepted.context)
 	await service.leave_lobby(accepted.context)
 
 	var tampered: PartyService.PartyResult = await service.join_arranged(
 		user, "capacity-tampered", {}, 4, 1, 12, 1000)
 	var creates_before := service.pf.party.create_calls.size()
-	tampered.context.expected_count = 3
+	tampered.context.capacity = 3
 	var tampered_prepare: PartyService.PartyResult = await service.prepare_transport(
 		tampered.context, user, service.fake_clock.now_msec() + 1000)
 	test._check(not tampered_prepare.ok(),
@@ -532,12 +554,17 @@ func _s1_default_ticket_clock(test: Node) -> void:
 		and production_clock.armed_alarm_count() == 1,
 		"standalone attempt arms one deadline alarm count=%d" % \
 			production_clock.armed_alarm_count())
+	var standalone_ticket := standalone_attempt.ticket as Doubles.Ticket
 	standalone.retire(standalone_attempt)
 	test._check(standalone_attempt.deadline_alarm == null,
 		"standalone retirement clears its alarm handle")
 	test._check(production_clock.armed_alarm_count() == 0,
 		"standalone retirement disarms the production clock count=%d" % \
 			production_clock.armed_alarm_count())
+	test._check(standalone.has_pending_cleanup()
+		and standalone.sdk.pending_cancel_waiters() == 1,
+		"standalone retirement owns its pending native cancel")
+	standalone_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
 	await _frames(test, 2)
 	test._check(not standalone.has_pending_cleanup(),
 		"standalone retirement reaches ticket quiescence")
@@ -555,10 +582,15 @@ func _s1_default_ticket_clock(test: Node) -> void:
 	test._check(fake_clock.armed_alarm_count() == 1,
 		"configured fake owns one deadline alarm count=%d" % \
 			fake_clock.armed_alarm_count())
+	var configured_ticket := configured_attempt.ticket as Doubles.Ticket
 	configured.retire(configured_attempt)
 	test._check(fake_clock.armed_alarm_count() == 0,
 		"configured retirement disarms its fake clock count=%d" % \
 			fake_clock.armed_alarm_count())
+	test._check(configured.has_pending_cleanup()
+		and configured.sdk.pending_cancel_waiters() == 1,
+		"configured retirement owns its pending native cancel")
+	configured_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
 	await _frames(test, 2)
 	test._check(not configured.has_pending_cleanup(),
 		"configured attempt returns cleanup ownership to zero")
@@ -599,10 +631,12 @@ func _s2_group_ticket_shape(test: Node) -> void:
 		if group_size == 4:
 			test._check(attempt.outcome == MatchmakingService.Outcome.PENDING,
 				"full group is submitted rather than rejected locally")
+		var ticket := attempt.ticket as Doubles.Ticket
 		service.retire(attempt)
 		test._check(clock.armed_alarm_count() == 0,
 			"group %d retire cancels its deadline alarm count=%d" % [
 				group_size, clock.armed_alarm_count()])
+		ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
 		await _frames(test, 1)
 		await _drain_clock(test, clock, "S2 group %d" % group_size)
 
@@ -623,9 +657,9 @@ func _s3_level_triggered_ticket_lifecycle(test: Node) -> void:
 	var service := Doubles.Matchmaking.new()
 	var user := Doubles.User.new("s3-local")
 	var matched := Doubles.Ticket.new()
-	matched.status = MatchmakingService.STATUS_MATCHED
 	matched.match_id = "match-s3"
 	matched.arranged_lobby_connection_string = "arrangement-s3"
+	matched.prime_terminal_snapshot(MatchmakingService.STATUS_MATCHED)
 	service.sdk.queued_create_results.append(Doubles.Results.make(true, matched))
 	var attempt := service.begin_create(_spec(user, [user.entity_key], 30))
 	await _frames(test, 2)
@@ -634,9 +668,11 @@ func _s3_level_triggered_ticket_lifecycle(test: Node) -> void:
 	test._check(attempt.match_id == "match-s3"
 		and attempt.arrangement == "arrangement-s3",
 		"matched snapshot copies handoff data")
-	matched.emit_status(MatchmakingService.STATUS_MATCHED)
+	matched.publish_terminal(MatchmakingService.STATUS_MATCHED)
 	test._check(attempt.outcome == MatchmakingService.Outcome.MATCHED,
-		"duplicate terminal events cannot settle twice")
+		"post-destruction terminal publication emits nothing and cannot settle twice")
+	test._check(matched.terminal_event_count == 0 and matched.native_destroyed,
+		"primed terminal snapshot has no historical or post-destruction event")
 	service.retire(attempt)
 
 	var duplicate_service := Doubles.Matchmaking.new()
@@ -674,10 +710,16 @@ func _s3_guest_join_and_late_retirement(test: Node) -> void:
 		and (service.sdk.join_calls[0].local_members as Array).size() == 1
 		and joined.status == MatchmakingService.STATUS_WAITING_FOR_MATCH,
 		"guest passes id, queue and one local member, then reconciles the accepted snapshot")
-	accepted.emit_status(MatchmakingService.STATUS_FAILED)
-	accepted.emit_status(MatchmakingService.STATUS_FAILED)
+	accepted.publish_terminal(
+		MatchmakingService.STATUS_FAILED,
+		Doubles.Results.match_ticket_completed_failed(
+			accepted,
+			-2147467259))
+	accepted.publish_terminal(MatchmakingService.STATUS_FAILED)
 	test._check(joined.outcome == MatchmakingService.Outcome.FAILED,
-		"duplicate guest terminal events settle once")
+		"one guest terminal publication settles the attempt once")
+	test._check(accepted.terminal_event_count == 1 and accepted.native_destroyed,
+		"one guest terminal publication retains its cached snapshot")
 
 	var immediate := Doubles.Matchmaking.new()
 	immediate.sdk.queued_join_results.append(Doubles.Results.make(
@@ -699,12 +741,97 @@ func _s3_guest_join_and_late_retirement(test: Node) -> void:
 	var current := late.begin_create(_spec(user, [user.entity_key], 35))
 	late.sdk.block_join = false
 	late.sdk.join_released.emit()
-	await _frames(test, 3)
+	await _frames(test, 2)
+	late_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
+	await _frames(test, 2)
 	test._check(retired.outcome == MatchmakingService.Outcome.SUPERSEDED
 		and late_ticket.cancel_calls == 1 and current.is_pending()
 		and not late.has_pending_cleanup(),
 		"a retired blocked join cleans only its late ticket and cannot mutate the current attempt")
+	var current_ticket := current.ticket as Doubles.Ticket
 	late.retire(current)
+	current_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
+
+
+func _a_mig_early_terminal_results(test: Node) -> void:
+	print("CASE: A-MIG-01/02 single terminal snapshots and early cancellation shapes")
+	var user := Doubles.User.new("a-mig-early")
+
+	var create_cancelled := Doubles.Matchmaking.new()
+	create_cancelled.sdk.queued_create_results.append(
+		Doubles.Results.match_ticket_create_cancelled({
+			"source": "create-cancelled",
+		}))
+	var create_attempt := create_cancelled.begin_create(
+		_spec(user, [user.entity_key], 36))
+	await _frames(test, 2)
+	test._check(create_attempt.outcome == MatchmakingService.Outcome.CANCELLED
+		and create_attempt.status == MatchmakingService.STATUS_CANCELLED
+		and create_attempt.native_terminal
+		and not create_attempt.cleanup_pending,
+		"A-MIG-02 create cancelled before id settles CANCELLED from its result shape")
+
+	var join_cancelled := Doubles.Matchmaking.new()
+	var cancelled_ticket := Doubles.Ticket.new()
+	cancelled_ticket.ticket_id = "cancelled-join"
+	cancelled_ticket.prime_terminal_snapshot(
+		MatchmakingService.STATUS_CANCELLED)
+	join_cancelled.sdk.queued_join_results.append(
+		Doubles.Results.match_ticket_join_cancelled(cancelled_ticket))
+	var join_attempt := join_cancelled.begin_join(_join_spec(
+		user,
+		[user.entity_key],
+		37,
+		"cancelled-join"))
+	await _frames(test, 2)
+	test._check(join_attempt.outcome == MatchmakingService.Outcome.CANCELLED
+		and join_attempt.status == MatchmakingService.STATUS_CANCELLED
+		and join_attempt.ticket_id == "cancelled-join"
+		and join_attempt.native_terminal,
+		"A-MIG-02 terminal guest join reconciles the cached cancelled ticket")
+
+	var cancelled_precedence := Doubles.Matchmaking.new()
+	var precedence_ticket := Doubles.Ticket.new()
+	cancelled_precedence.sdk.queued_create_results.append(
+		Doubles.Results.make(true, precedence_ticket))
+	var precedence_attempt := cancelled_precedence.begin_create(
+		_spec(user, [user.entity_key], 371))
+	await _frames(test, 2)
+	precedence_ticket.publish_terminal(
+		MatchmakingService.STATUS_CANCELLED,
+		Doubles.Results.make(
+			false,
+			precedence_ticket,
+			"match_ticket_completed_failed",
+			"Injected SDK cancellation HRESULT.",
+			-1994169596))
+	test._check(precedence_attempt.outcome == MatchmakingService.Outcome.CANCELLED
+		and precedence_attempt.status == MatchmakingService.STATUS_CANCELLED
+		and precedence_attempt.reason_code == &""
+		and cancelled_precedence.fake_warnings.is_empty(),
+		"A-MIG-03 Cancelled status wins over a non-OK completion HRESULT")
+
+	var failed_join := Doubles.Matchmaking.new()
+	var failed_ticket := Doubles.Ticket.new()
+	failed_ticket.ticket_id = "failed-join"
+	failed_ticket.prime_terminal_snapshot(MatchmakingService.STATUS_FAILED)
+	failed_join.sdk.queued_join_results.append(
+		Doubles.Results.make(
+			false,
+			failed_ticket,
+			"match_ticket_join_failed",
+			"Injected forwarded join failure.",
+			-1994172846))
+	var failed_attempt := failed_join.begin_join(_join_spec(
+		user,
+		[user.entity_key],
+		38,
+		"failed-join"))
+	await _frames(test, 2)
+	test._check(failed_attempt.outcome == MatchmakingService.Outcome.FAILED
+		and failed_attempt.reason_code == &"ticket_group_too_large"
+		and failed_attempt.status == MatchmakingService.STATUS_FAILED,
+		"A-MIG-06 terminal join forwards the signed native HRESULT into classification")
 
 
 func _s4_failure_cancel_and_timeout(test: Node) -> void:
@@ -739,11 +866,8 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 		await _frames(test, 2)
 		failed_ticket.emit_status(
 			MatchmakingService.STATUS_FAILED,
-			Doubles.Results.make(
-				false,
-				null,
-				"match_ticket_failed",
-				"Injected credential SECRET_TERMINAL.",
+			Doubles.Results.match_ticket_completed_failed(
+				failed_ticket,
 				hresult))
 		_full_party_failure(test, terminal_attempt,
 			"terminal signed/unsigned size HRESULT has the specific durable outcome")
@@ -762,7 +886,7 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 		test,
 		lossy_create_attempt,
 		&"ticket_create_failed",
-		"lossy no-id create stays generic with separate policy guidance")
+		"lossy no-id create stays generic with private-route guidance")
 
 	var lossy_terminal := Doubles.Matchmaking.new()
 	var lossy_ticket := Doubles.Ticket.new()
@@ -773,21 +897,24 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 	await _frames(test, 2)
 	lossy_ticket.emit_status(
 		MatchmakingService.STATUS_FAILED,
-		Doubles.Results.make(
-			false,
-			null,
-			"match_ticket_failed",
-			"Injected lossy terminal detail.",
+		Doubles.Results.match_ticket_completed_failed(
+			lossy_ticket,
 			-2147467259))
 	_generic_full_party_failure(
 		test,
 		lossy_terminal_attempt,
 		&"matchmaking_failed",
-		"lossy terminal failure stays generic with separate policy guidance")
+		"lossy terminal failure stays generic with private-route guidance")
 	test._check(MatchmakingService.reason_for_code(
 		String(MatchmakingService.FULL_PARTY_REASON_CODE))
 			== MatchmakingService.FULL_PARTY_REASON,
 		"confirmed full-party reason lookup remains unchanged")
+	test._check(MatchmakingService.FULL_PARTY_REASON
+			== "Matchmaking rejected this full four-player ticket."
+		and MatchmakingService.FULL_PARTY_GUIDANCE
+			== "Return to the group and ready up to start a private match without searching."
+		and not MatchmakingService.FULL_PARTY_GUIDANCE.contains("Host Match"),
+		"full-party constants describe the current private route")
 	test._check(MatchmakingService.reason_for_code("matchmaking_failed").is_empty(),
 		"generic reason codes are carried with explicit text, not inferred")
 	var guided_control_text := PartyService.encode_search_control({
@@ -815,7 +942,7 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 		test,
 		absent_attempt,
 		&"matchmaking_failed",
-		"terminal failure without native detail stays generic with separate guidance")
+		"terminal failure without native detail stays generic with private-route guidance")
 
 	for explicit_failure: Dictionary in [
 		{"code": "not_initialized", "hresult": -1994183168},
@@ -856,7 +983,7 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 	test._check(diagnostic_attempt.outcome == MatchmakingService.Outcome.FAILED
 		and diagnostic_attempt.diagnostic.contains("service_failure")
 		and diagnostic_attempt.diagnostic.contains("No match text"),
-		"terminal event result is preserved and arbitrary no-match wording remains FAILED")
+		"injected malformed terminal result is preserved and arbitrary no-match wording remains FAILED")
 
 	var cancelling := Doubles.Matchmaking.new()
 	var cancel_ticket := Doubles.Ticket.new()
@@ -864,6 +991,7 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 	var cancel_attempt := cancelling.begin_create(_spec(user, [user.entity_key], 47))
 	await _frames(test, 2)
 	cancelling.request_cancel(cancel_attempt)
+	cancel_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
 	await _frames(test, 2)
 	test._check(cancel_attempt.outcome == MatchmakingService.Outcome.CANCELLED,
 		"cancellation settles only after the ticket reaches terminal cancelled")
@@ -889,7 +1017,10 @@ func _s4_failure_cancel_and_timeout(test: Node) -> void:
 		"local 600-second expiry remains distinct from service no-match")
 	test._check(clock.armed_alarm_count() == 0,
 		"ticket timeout retires its alarm, count=%d" % clock.armed_alarm_count())
-	await _drain_clock(test, clock, "S4 timeout")
+	timeout_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
+	await _frames(test, 2)
+	await _assert_matchmaking_case_clean(
+		test, timing, clock, "S4 standalone timeout")
 	for terminal_case: Dictionary in [
 		{"status": MatchmakingService.STATUS_CANCELLED, "label": "cancelled"},
 		{"status": MatchmakingService.STATUS_FAILED, "label": "failed"},
@@ -912,9 +1043,6 @@ func _cancel_in_flight_timeout_race(
 	var clock := Doubles.Clock.new()
 	service.configure_clock(clock)
 	var ticket := Doubles.Ticket.new()
-	ticket.block_cancel = true
-	if terminal_status != MatchmakingService.STATUS_CANCELLED:
-		ticket.cancel_ok = false
 	service.sdk.queued_create_results.append(Doubles.Results.make(true, ticket))
 	var spec := _spec(user, [user.entity_key], 60 + terminal_status)
 	spec.deadline_msec = 100
@@ -943,38 +1071,22 @@ func _cancel_in_flight_timeout_race(
 	if terminal_status == MatchmakingService.STATUS_MATCHED:
 		ticket.match_id = "cancel-race-match"
 		ticket.arranged_lobby_connection_string = "cancel-race-arrangement"
-		ticket.emit_status(MatchmakingService.STATUS_MATCHED)
+		ticket.publish_terminal(MatchmakingService.STATUS_MATCHED)
 	elif terminal_status == MatchmakingService.STATUS_FAILED:
-		var failed_completion := Doubles.Results.make(
-			false,
-			ticket,
-			"match_ticket_failed",
-			"Injected current-package terminal failure.",
-			-2147467259)
-		ticket.emit_status(terminal_status, failed_completion)
+		ticket.publish_terminal(
+			terminal_status,
+			Doubles.Results.match_ticket_completed_failed(ticket))
 	else:
-		ticket.emit_status(terminal_status)
+		ticket.publish_terminal(terminal_status)
 	test._check(attempt.outcome == MatchmakingService.Outcome.TIMEOUT,
 		"[%s] terminal evidence cannot rewrite TIMEOUT" % label)
 	if terminal_status == MatchmakingService.STATUS_MATCHED:
 		test._check(attempt.match_id == "cancel-race-match"
 			and attempt.arrangement == "cancel-race-arrangement",
 			"[matched] terminal cleanup still captures handoff diagnostics")
-	test._check(service.has_pending_cleanup(),
-		"[%s] cancel await remains owned until its native return" % label)
-	if terminal_status == MatchmakingService.STATUS_MATCHED:
-		ticket.invalidate_runtime()
-	elif terminal_status == MatchmakingService.STATUS_FAILED:
-		ticket.release_cancel(Doubles.Results.make(
-			false,
-			ticket,
-			"match_ticket_failed",
-			"Injected current-package terminal failure.",
-			-2147467259))
-	else:
-		ticket.block_cancel = false
-		ticket.cancel_released.emit()
-	await _frames(test, 3)
+	test._check(not service.has_pending_cleanup(),
+		"[%s] terminal publication resolves the native cancel in the same call" % label)
+	await _frames(test, 2)
 	test._check(ticket.cancel_calls == 1,
 		"[%s] native cancel total=%d" % [label, ticket.cancel_calls])
 	test._check(attempt.outcome == MatchmakingService.Outcome.TIMEOUT,
@@ -999,11 +1111,16 @@ func _s4_native_cleanup_ownership(test: Node) -> void:
 
 	var failed_service := Doubles.Matchmaking.new()
 	var failed_ticket := Doubles.Ticket.new()
-	failed_ticket.cancel_ok = false
 	failed_service.sdk.queued_create_results.append(Doubles.Results.make(true, failed_ticket))
 	var failed := failed_service.begin_create(_spec(user, [user.entity_key], 45))
 	await _frames(test, 2)
 	failed_service.request_cancel(failed)
+	failed_ticket.release_cancel(Doubles.Results.make(
+		false,
+		failed_ticket,
+		"match_ticket_cancel_start_failed",
+		"Injected cancel observer failure.",
+		-2147467259))
 	await _frames(test, 2)
 	test._check(failed.outcome == MatchmakingService.Outcome.FAILED
 		and failed.reason_code == &"cancel_unconfirmed"
@@ -1013,35 +1130,40 @@ func _s4_native_cleanup_ownership(test: Node) -> void:
 	failed_service.retire(failed)
 	await _frames(test, 2)
 	test._check(failed.outcome == MatchmakingService.Outcome.FAILED
-		and failed.cleanup_pending and failed_ticket.cancel_calls == 2,
+		and failed.cleanup_pending
+		and failed_ticket.cancel_calls == 2
+		and failed_ticket.cancel_waiting,
 		"retiring a failed cancel keeps its outcome and performs one service-owned retry")
-	failed_ticket.emit_status(MatchmakingService.STATUS_CANCELLED)
+	failed_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
 	test._check(failed.outcome == MatchmakingService.Outcome.FAILED
 		and not failed.cleanup_pending and not failed_service.has_pending_cleanup(),
 		"later terminal evidence clears cleanup without rewriting the caller outcome")
 
 	var unconfirmed_service := Doubles.Matchmaking.new()
 	var unconfirmed_ticket := Doubles.Ticket.new()
-	unconfirmed_ticket.cancel_confirms_terminal = false
 	unconfirmed_service.sdk.queued_create_results.append(
 		Doubles.Results.make(true, unconfirmed_ticket))
 	var unconfirmed := unconfirmed_service.begin_create(
 		_spec(user, [user.entity_key], 46))
 	await _frames(test, 2)
 	unconfirmed_service.request_cancel(unconfirmed)
+	unconfirmed_ticket.release_cancel(Doubles.Results.make(
+		true,
+		unconfirmed_ticket))
 	await _frames(test, 2)
 	test._check(unconfirmed.outcome == MatchmakingService.Outcome.FAILED
 		and unconfirmed.cleanup_pending,
 		"success-shaped cancel without terminal status remains unconfirmed and owned")
-	unconfirmed_ticket.emit_status(MatchmakingService.STATUS_CANCELLED)
+	unconfirmed_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
 	test._check(not unconfirmed.cleanup_pending,
 		"unconfirmed cancel ownership clears when terminal status eventually arrives")
+	test._check(not unconfirmed_ticket.has_retained_cancel_result(),
+		"unconfirmed cancel releases its stored result after the waiter consumes it")
 
 	var race_service := Doubles.Matchmaking.new()
 	var race_clock := Doubles.Clock.new()
 	race_service.configure_clock(race_clock)
 	var race_ticket := Doubles.Ticket.new()
-	race_ticket.block_cancel = true
 	race_service.sdk.queued_create_results.append(Doubles.Results.make(true, race_ticket))
 	var race_spec := _spec(user, [user.entity_key], 47)
 	race_spec.deadline_msec = 100
@@ -1054,8 +1176,7 @@ func _s4_native_cleanup_ownership(test: Node) -> void:
 		"timeout settles once while its native cancel remains in flight")
 	race_ticket.match_id = "late-match"
 	race_ticket.arranged_lobby_connection_string = "late-arrangement"
-	race_ticket.emit_status(MatchmakingService.STATUS_MATCHED)
-	race_ticket.invalidate_runtime()
+	race_ticket.publish_terminal(MatchmakingService.STATUS_MATCHED)
 	await _frames(test, 2)
 	test._check(race.outcome == MatchmakingService.Outcome.TIMEOUT
 		and race.match_id == "late-match" and not race.cleanup_pending
@@ -1065,25 +1186,23 @@ func _s4_native_cleanup_ownership(test: Node) -> void:
 
 	var retired_service := Doubles.Matchmaking.new()
 	var retired_ticket := Doubles.Ticket.new()
-	retired_ticket.block_cancel = true
 	retired_service.sdk.queued_create_results.append(Doubles.Results.make(true, retired_ticket))
 	var retired := retired_service.begin_create(_spec(user, [user.entity_key], 48))
 	await _frames(test, 2)
 	retired_service.retire(retired)
 	test._check(retired.outcome == MatchmakingService.Outcome.SUPERSEDED
 		and retired.cleanup_pending and retired_ticket.cancel_calls == 1,
-		"retire is synchronous and leaves blocked native cleanup owned")
-	retired_ticket.block_cancel = false
-	retired_ticket.cancel_released.emit()
+		"retire is synchronous and leaves pending native cleanup owned")
+	retired_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
 	await _frames(test, 2)
 	test._check(not retired.cleanup_pending and not retired_service.has_pending_cleanup(),
 		"retired cleanup clears only after native terminal completion")
 
 	var matched_service := Doubles.Matchmaking.new()
 	var matched_ticket := Doubles.Ticket.new()
-	matched_ticket.status = MatchmakingService.STATUS_MATCHED
 	matched_ticket.match_id = "matched"
 	matched_ticket.arranged_lobby_connection_string = "arranged"
+	matched_ticket.prime_terminal_snapshot(MatchmakingService.STATUS_MATCHED)
 	matched_service.sdk.queued_create_results.append(Doubles.Results.make(true, matched_ticket))
 	var matched := matched_service.begin_create(_spec(user, [user.entity_key], 49))
 	await _frames(test, 2)
@@ -1094,90 +1213,65 @@ func _s4_native_cleanup_ownership(test: Node) -> void:
 
 
 func _s4_matched_cancel_contracts(test: Node) -> void:
-	print("CASE: Matched truth preserves cancel ownership and neutral observer attribution")
+	print("CASE: A-MIG-04/05/07 fixed-contract cancel races and injected fallback")
 	var user := Doubles.User.new("matched-cancel-contract")
 
-	var legacy := Doubles.Matchmaking.new()
-	var legacy_clock := Doubles.Clock.new()
-	legacy.configure_clock(legacy_clock)
-	var legacy_cleanup_events: Array[int] = []
-	legacy.cleanup_state_changed.connect(func() -> void:
-		legacy_cleanup_events.append(1))
-	var legacy_ticket := Doubles.Ticket.new()
-	legacy_ticket.block_cancel = true
-	legacy.sdk.queued_create_results.append(Doubles.Results.make(true, legacy_ticket))
-	var legacy_attempt := legacy.begin_create(
+	var fault := Doubles.Matchmaking.new()
+	var fault_clock := Doubles.Clock.new()
+	fault.configure_clock(fault_clock)
+	var fault_cleanup_events: Array[int] = []
+	fault.cleanup_state_changed.connect(func() -> void:
+		fault_cleanup_events.append(1))
+	var fault_ticket := Doubles.Ticket.new()
+	fault_ticket.cancel_fault_unanswered = true
+	fault.sdk.queued_create_results.append(Doubles.Results.make(true, fault_ticket))
+	var fault_attempt := fault.begin_create(
 		_spec(user, [user.entity_key], 80))
-	var legacy_terminal: Array = []
-	legacy_attempt.native_terminal_changed.connect(
-		func(_attempt: Variant) -> void: legacy_terminal.append(true))
+	var fault_terminal: Array = []
+	fault_attempt.native_terminal_changed.connect(
+		func(_attempt: Variant) -> void: fault_terminal.append(true))
 	await _frames(test, 2)
-	legacy.request_cancel(legacy_attempt)
+	fault.request_cancel(fault_attempt)
 	await _frames(test, 1)
-	legacy.retire(legacy_attempt)
-	test._check(legacy_attempt.retired
-		and legacy_attempt.outcome == MatchmakingService.Outcome.SUPERSEDED,
-		"legacy abandoned attempt settles locally before native Matched")
-	legacy_ticket.match_id = "legacy-match"
-	legacy_ticket.arranged_lobby_connection_string = "legacy-arrangement"
-	var terminal_events_before := legacy_cleanup_events.size()
-	legacy_ticket.emit_status(MatchmakingService.STATUS_MATCHED)
-	test._check(legacy_cleanup_events.size() > terminal_events_before,
-		"native terminal cleanup notification is emitted synchronously")
+	fault.retire(fault_attempt)
+	fault_ticket.match_id = "fault-match"
+	fault_ticket.arranged_lobby_connection_string = "fault-arrangement"
+	var terminal_events_before := fault_cleanup_events.size()
+	fault_ticket.publish_terminal(MatchmakingService.STATUS_MATCHED)
+	test._check(fault_cleanup_events.size() > terminal_events_before,
+		"injected unanswered terminal observation publishes cleanup state")
 	await _frames(test, 2)
-	test._check(legacy_attempt.outcome == MatchmakingService.Outcome.SUPERSEDED,
-		"legacy native Matched cannot rewrite retired caller outcome=%d" % \
-			legacy_attempt.outcome)
-	test._check(legacy_terminal.size() == 1,
-		"legacy native terminal notifications=%d" % legacy_terminal.size())
-	test._check(legacy_attempt.match_id == "legacy-match"
-		and legacy_attempt.arrangement == "legacy-arrangement",
-		"legacy retired attempt still exposes native Matched data")
-	test._check(legacy_attempt.cancel_in_flight
-		and legacy_attempt.cleanup_pending
-		and legacy.has_pending_cleanup(),
-		"legacy Matched keeps the unresolved native cancel owned")
-	test._check(legacy.has_orphaned_matched_cancel(),
-		"legacy Matched exposes process-lifetime orphaned cancel state")
-	test._check(legacy.has_pending_cleanup(),
-		"an orphaned Matched cancel always keeps the process cleanup fence raised")
-	test._check(not legacy_cleanup_events.is_empty(),
-		"legacy orphan state emits service-level cleanup notification")
-	legacy.fake_account_current = false
-	test._check(legacy.has_orphaned_matched_cancel(),
-		"account staleness does not erase process-lifetime cancel ownership")
-	test._check(legacy_ticket.cancel_calls == 1,
-		"legacy Matched issues no second cancel calls=%d" % \
-			legacy_ticket.cancel_calls)
-	test._check(legacy.sdk.pending_cancel_waiters() == 1,
-		"legacy pinned contract retains one native cancel waiter")
-	var invalidation_events_before := legacy_cleanup_events.size()
-	legacy.multiplayer_invalidated(1)
-	test._check(legacy_cleanup_events.size() > invalidation_events_before,
+	test._check(fault_attempt.outcome == MatchmakingService.Outcome.SUPERSEDED
+		and fault_attempt.cancel_in_flight
+		and fault_attempt.cleanup_pending
+		and fault.has_orphaned_matched_cancel()
+		and fault_terminal.is_empty(),
+		"A-MIG-07 injected unanswered observer alone retains orphan cleanup")
+	fault.fake_account_current = false
+	test._check(fault.has_orphaned_matched_cancel(),
+		"injected orphan ownership survives account staleness")
+	var invalidation_events_before := fault_cleanup_events.size()
+	fault.multiplayer_invalidated(1)
+	test._check(fault_cleanup_events.size() > invalidation_events_before,
 		"Multiplayer invalidation emits cleanup state synchronously")
 	await _frames(test, 3)
-	test._check(not legacy_attempt.cancel_in_flight
-		and not legacy_attempt.cleanup_pending
-		and not legacy.has_pending_cleanup(),
-		"confirmed runtime invalidation discharges the legacy cancel waiter")
-	test._check(not legacy.has_orphaned_matched_cancel(),
-		"confirmed invalidation clears orphaned cancel state")
-	test._check(legacy_terminal.size() == 1,
-		"legacy invalidation emits no duplicate terminal notification")
-	test._check(legacy.sdk.pending_cancel_waiters() == 0,
-		"runtime invalidation releases every legacy cancel waiter")
-	test._check(legacy.fake_warnings.size() == 1
-		and legacy.fake_warnings[0].contains(
+	test._check(not fault_attempt.cancel_in_flight
+		and not fault_attempt.cleanup_pending
+		and not fault.has_pending_cleanup()
+		and not fault.has_orphaned_matched_cancel()
+		and fault.sdk.pending_cancel_waiters() == 0,
+		"confirmed reset discharges only the injected unanswered observer")
+	test._check(fault.fake_warnings.size() == 1
+		and fault.fake_warnings[0].contains(
 			"reason=cancel_released_by_reset")
-		and legacy.fake_warnings[0].contains("native_code=cancelled")
-		and legacy.fake_warnings[0].contains("hresult=0x80004004"),
-		"legacy reset release has distinct provenance=%s" % \
-			[legacy.fake_warnings])
-	await _drain_clock(test, legacy_clock, "S4 legacy matched cancel")
+		and fault.fake_warnings[0].contains("native_code=cancelled")
+		and fault.fake_warnings[0].contains("hresult=0x80004004"),
+		"injected reset release has distinct provenance=%s" % \
+			[fault.fake_warnings])
+	await _drain_clock(test, fault_clock, "S4 injected unanswered cancel")
 
 	var failed := Doubles.Matchmaking.new()
 	var failed_ticket := Doubles.Ticket.new()
-	failed_ticket.block_cancel = true
 	failed.sdk.queued_create_results.append(Doubles.Results.make(
 		true, failed_ticket))
 	var failed_attempt := failed.begin_create(
@@ -1185,16 +1279,11 @@ func _s4_matched_cancel_contracts(test: Node) -> void:
 	await _frames(test, 2)
 	failed.request_cancel(failed_attempt)
 	await _frames(test, 1)
-	var failed_completion := Doubles.Results.make(
-		false,
-		failed_ticket,
-		"match_ticket_completed_failed",
-		"Injected current-package failed completion.",
-		-2147467259)
-	failed_ticket.emit_status(
+	var failed_completion := Doubles.Results.match_ticket_completed_failed(
+		failed_ticket)
+	failed_ticket.publish_terminal(
 		MatchmakingService.STATUS_FAILED,
 		failed_completion)
-	failed_ticket.release_cancel(failed_completion)
 	await _frames(test, 3)
 	test._check(failed_attempt.outcome == MatchmakingService.Outcome.FAILED
 		and not failed_attempt.cancel_in_flight
@@ -1206,61 +1295,134 @@ func _s4_matched_cancel_contracts(test: Node) -> void:
 	test._check(not failed_lost_race,
 		"a FAILED completion is never labelled as a lost cancel race")
 
-	for ordering: String in ["event_first", "completion_first"]:
-		var observer := Doubles.Matchmaking.new()
-		var observer_clock := Doubles.Clock.new()
-		observer.configure_clock(observer_clock)
-		var observer_ticket := Doubles.Ticket.new()
-		observer_ticket.block_cancel = true
-		observer.sdk.queued_create_results.append(Doubles.Results.make(
-			true, observer_ticket))
-		var observer_attempt := observer.begin_create(
-			_spec(user, [user.entity_key], 81))
-		var observer_terminal: Array = []
-		observer_attempt.native_terminal_changed.connect(
-			func(_attempt: Variant) -> void: observer_terminal.append(true))
-		await _frames(test, 2)
-		observer.request_cancel(observer_attempt)
-		await _frames(test, 1)
-		observer_ticket.match_id = "observer-" + ordering
-		observer_ticket.arranged_lobby_connection_string = \
-			"observer-arrangement-" + ordering
-		if ordering == "event_first":
-			observer_ticket.emit_status(MatchmakingService.STATUS_MATCHED)
-		else:
-			observer_ticket.status = MatchmakingService.STATUS_MATCHED
-		observer_ticket.release_cancel(Doubles.Results.make(
-			false,
-			observer_ticket,
-			"observer_completion_failed",
-			"Injected observer completion.",
-			-2147024809))
-		await _frames(test, 3)
-		test._check(observer_attempt.outcome == MatchmakingService.Outcome.MATCHED,
-			"[%s] observer completion preserves Matched outcome=%d" % [
-				ordering, observer_attempt.outcome])
-		test._check(observer_terminal.size() == 1,
-			"[%s] Matched terminal notifications=%d" % [
-				ordering, observer_terminal.size()])
-		test._check(observer_attempt.match_id == "observer-" + ordering
-			and observer_attempt.arrangement == "observer-arrangement-" + ordering,
-			"[%s] Matched observation preserves terminal data" % ordering)
-		test._check(observer_ticket.cancel_calls == 1,
-			"[%s] native cancel observer calls=%d" % [
-				ordering, observer_ticket.cancel_calls])
-		test._check(not observer_attempt.cancel_in_flight
-			and not observer_attempt.cleanup_pending
-			and not observer.has_pending_cleanup(),
-			"[%s] explicit observer completion reaches quiescence" % ordering)
-		test._check(observer.fake_warnings.size() == 1
-			and observer.fake_warnings[0].contains(
-				"reason=cancel_observer_aborted")
-			and observer.fake_warnings[0].contains(
-				"native_code=unavailable"),
-			"[%s] unrecognized observer completion stays neutral=%s" % [
-				ordering, observer.fake_warnings])
-		await _drain_clock(
-			test, observer_clock, "S4 Matched observer " + ordering)
+	for ordering: String in ["completion_first", "event_first"]:
+		for retired_before_match: bool in [false, true]:
+			var race := Doubles.Matchmaking.new()
+			var race_clock := Doubles.Clock.new()
+			race.configure_clock(race_clock)
+			var race_ticket := Doubles.Ticket.new()
+			race_ticket.terminal_delivery_order = StringName(ordering)
+			race.sdk.queued_create_results.append(Doubles.Results.make(
+				true, race_ticket))
+			var race_attempt := race.begin_create(
+				_spec(user, [user.entity_key], 82))
+			var terminal_cancel_states: Array[bool] = []
+			var finished_cancel_states: Array[bool] = []
+			race_attempt.native_terminal_changed.connect(
+				func(observed: Variant) -> void:
+					terminal_cancel_states.append(bool(observed.cancel_in_flight)))
+			race_attempt.finished.connect(
+				func(observed: Variant) -> void:
+					finished_cancel_states.append(bool(observed.cancel_in_flight)))
+			await _frames(test, 2)
+			race.request_cancel(race_attempt)
+			if retired_before_match:
+				race.retire(race_attempt)
+			race_ticket.match_id = "race-" + ordering
+			race_ticket.arranged_lobby_connection_string = \
+				"race-arrangement-" + ordering
+			race_ticket.publish_terminal(MatchmakingService.STATUS_MATCHED)
+			await _frames(test, 2)
+			var expected_outcome := MatchmakingService.Outcome.SUPERSEDED \
+				if retired_before_match else MatchmakingService.Outcome.MATCHED
+			test._check(race_attempt.outcome == expected_outcome
+				and race_attempt.match_id == "race-" + ordering
+				and race_attempt.arrangement == "race-arrangement-" + ordering
+				and race_attempt.native_terminal
+				and not race_attempt.cancel_in_flight
+				and not race_attempt.cleanup_pending
+				and not race.has_pending_cleanup()
+				and not race.has_orphaned_matched_cancel(),
+				"A-MIG-04 [%s/retired=%s] normal lost race settles once without recovery" % [
+					ordering, retired_before_match])
+			test._check(terminal_cancel_states == [false]
+				and (
+					finished_cancel_states == [false]
+					or (retired_before_match and finished_cancel_states == [true])
+				),
+				"A-MIG-04 [%s/retired=%s] terminal observers see reconciled cancel state" % [
+					ordering, retired_before_match])
+			test._check(race.fake_warnings.size() == 1
+				and race.fake_warnings[0].contains("reason=cancel_lost_race")
+				and race.fake_warnings[0].contains(
+					"native_code=match_ticket_cancel_lost_race"),
+				"A-MIG-04 [%s] contractual lost race is logged once=%s" % [
+					ordering, race.fake_warnings])
+			test._check(race_ticket.cancel_calls == 1
+				and race_ticket.terminal_event_count == 1
+				and race_ticket.native_destroyed,
+				"A-MIG-01/05 [%s] one cancel start and one terminal publication" % \
+					ordering)
+			await _drain_clock(test, race_clock, "S4 normal lost race " + ordering)
+
+	var aborted := Doubles.Matchmaking.new()
+	var aborted_ticket := Doubles.Ticket.new()
+	aborted_ticket.cancel_fault_result = Doubles.Results.make(
+		false,
+		aborted_ticket,
+		"observer_completion_failed",
+		"Injected observer completion.",
+		-2147024809)
+	aborted.sdk.queued_create_results.append(Doubles.Results.make(
+		true, aborted_ticket))
+	var aborted_attempt := aborted.begin_create(
+		_spec(user, [user.entity_key], 83))
+	await _frames(test, 2)
+	aborted.request_cancel(aborted_attempt)
+	aborted_ticket.match_id = "aborted-match"
+	aborted_ticket.arranged_lobby_connection_string = "aborted-arrangement"
+	aborted_ticket.publish_terminal(MatchmakingService.STATUS_MATCHED)
+	await _frames(test, 2)
+	test._check(aborted_attempt.outcome == MatchmakingService.Outcome.MATCHED
+		and not aborted_attempt.cleanup_pending
+		and aborted.fake_warnings.size() == 1
+		and aborted.fake_warnings[0].contains(
+			"reason=cancel_observer_aborted"),
+		"other injected non-OK observers stay neutral and preserve Matched")
+
+	var direct_ticket := Doubles.Ticket.new()
+	var concurrent_results: Array = []
+	_capture_ticket_cancel(direct_ticket, concurrent_results)
+	_capture_ticket_cancel(direct_ticket, concurrent_results)
+	await _frames(test, 1)
+	test._check(direct_ticket.cancel_calls == 1
+		and direct_ticket.cancel_waiting
+		and concurrent_results.is_empty(),
+		"A-MIG-05 Ticket double coalesces concurrent observers onto one native request")
+	direct_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
+	await _frames(test, 2)
+	test._check(concurrent_results.size() == 2
+		and bool((concurrent_results[0] as Dictionary).get("ok", false))
+		and bool((concurrent_results[1] as Dictionary).get("ok", false)),
+		"A-MIG-05 Ticket double gives both observers the same cancelled completion")
+	var invalid_after_terminal: Dictionary = await direct_ticket.cancel_async()
+	test._check(not bool(invalid_after_terminal.get("ok", false))
+		and String(invalid_after_terminal.get("code", "")) == "invalid_match_ticket"
+		and (int(invalid_after_terminal.get("hresult", 0)) & 0xFFFFFFFF)
+			== (Doubles.Results.E_INVALIDARG & 0xFFFFFFFF),
+		"A-MIG-05 Ticket double returns invalid_match_ticket/E_INVALIDARG after terminal")
+
+	var invalid_race := Doubles.Matchmaking.new()
+	var invalid_race_ticket := Doubles.Ticket.new()
+	invalid_race_ticket.match_id = "invalid-race-match"
+	invalid_race_ticket.arranged_lobby_connection_string = \
+		"invalid-race-arrangement"
+	invalid_race_ticket.cancel_terminal_before_start_status = \
+		MatchmakingService.STATUS_MATCHED
+	invalid_race.sdk.queued_create_results.append(
+		Doubles.Results.make(true, invalid_race_ticket))
+	var invalid_race_attempt := invalid_race.begin_create(
+		_spec(user, [user.entity_key], 84))
+	await _frames(test, 2)
+	invalid_race.request_cancel(invalid_race_attempt)
+	await _frames(test, 2)
+	test._check(invalid_race_attempt.outcome == MatchmakingService.Outcome.MATCHED
+		and invalid_race_attempt.match_id == "invalid-race-match"
+		and invalid_race_attempt.arrangement == "invalid-race-arrangement"
+		and invalid_race_ticket.cancel_calls == 0
+		and not invalid_race_attempt.cleanup_pending
+		and invalid_race.fake_warnings.is_empty(),
+		"A-MIG-05 invalid-after-terminal reconciles the cached snapshot, not a cancel failure")
 
 
 func _s4_failure_cause_availability(test: Node) -> void:
@@ -1281,8 +1443,9 @@ func _s4_failure_cause_availability(test: Node) -> void:
 		},
 		{
 			"label": "generic terminal wrapper",
-			"result": Doubles.Results.make(
-				false, null, "match_ticket_failed", "", -2147467259),
+			"result": Doubles.Results.match_ticket_completed_failed(
+				null,
+				-2147467259),
 			"stage": &"terminal",
 			"available": false,
 		},
@@ -1391,19 +1554,27 @@ func _s4_safe_structured_failure_logging(test: Node) -> void:
 	terminal_ticket.properties = {"credential": secret}
 	terminal.sdk.queued_create_results.append(
 		Doubles.Results.make(true, terminal_ticket))
-	terminal.begin_create(_spec(user, [user.entity_key], 92))
+	var terminal_attempt := terminal.begin_create(
+		_spec(user, [user.entity_key], 92))
 	await _frames(test, 2)
+	var terminal_result := Doubles.Results.make(
+		false,
+		terminal_ticket,
+		"match_ticket_completed_failed",
+		secret,
+		-2147467259)
 	terminal_ticket.emit_status(
 		MatchmakingService.STATUS_FAILED,
-		Doubles.Results.make(
-			false, null, "match_ticket_failed", secret, -2147467259))
-	terminal_ticket.emit_status(
-		MatchmakingService.STATUS_FAILED,
-		Doubles.Results.make(
-			false, null, "match_ticket_failed", secret, -2147467259))
+		terminal_result)
+	terminal._log_ticket_failure(
+		terminal_attempt,
+		&"terminal",
+		&"matchmaking_failed",
+		terminal_result,
+		MatchmakingService.STATUS_FAILED)
 	_check_safe_warning(test, terminal.fake_warnings, [
 		"stage=terminal",
-		"native_code=match_ticket_failed",
+		"native_code=match_ticket_completed_failed",
 		"hresult=0x80004005",
 		"status=6",
 		"detail=unavailable",
@@ -1427,17 +1598,25 @@ func _s4_safe_structured_failure_logging(test: Node) -> void:
 		"hresult=0x00000000",
 		"detail=unavailable",
 	], secret, "timeout")
-	await _drain_clock(test, timing_clock, "S4 logging timeout")
+	timing_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
+	await _frames(test, 2)
+	await _assert_matchmaking_case_clean(
+		test, timing, timing_clock, "S4 logging timeout")
 
 	var cancel := Doubles.Matchmaking.new()
 	var cancel_ticket := Doubles.Ticket.new()
-	cancel_ticket.cancel_ok = false
 	cancel.sdk.queued_create_results.append(Doubles.Results.make(
 		true, cancel_ticket))
 	var cancel_attempt := cancel.begin_create(
 		_spec(user, [user.entity_key], 94))
 	await _frames(test, 2)
 	cancel.request_cancel(cancel_attempt)
+	cancel_ticket.release_cancel(Doubles.Results.make(
+		false,
+		cancel_ticket,
+		"match_ticket_cancel_start_failed",
+		secret,
+		-2147467259))
 	await _frames(test, 2)
 	_check_safe_warning(test, cancel.fake_warnings, [
 		"stage=cancel",
@@ -1647,6 +1826,88 @@ func _s4_source_derived_native_code_paths(test: Node) -> void:
 		], secret, "Party-network-" + party_code)
 
 
+func _a_mig_party_handshake_rejections(test: Node) -> void:
+	print("CASE: A-MIG-08 Party handshake rejections are logged once and nonterminal")
+	for native_code: String in [
+		"party_handshake_entity_mismatch",
+		"party_handshake_endpoint_entity_unavailable",
+	]:
+		var secret := "SECRET_HANDSHAKE_" + native_code
+		var hosted := Doubles.Party.new(ChatService.new())
+		hosted.configure_clock(hosted.fake_clock)
+		var hosted_result: Dictionary = await hosted.host(
+			Doubles.User.new("handshake-host-" + native_code),
+			4,
+			"deathmatch")
+		var hosted_failures: Array[bool] = []
+		hosted.party_failed.connect(
+			func(_reason: String, _context: Variant) -> void:
+				hosted_failures.append(true))
+		var hosted_change := Doubles.Change.new()
+		hosted_change.kind = PartyService.NETWORK_CHANGE_ERROR
+		hosted_change.peer_id = 0
+		hosted_change.network = hosted._network
+		hosted_change.result = Doubles.Results.make(
+			false,
+			null,
+			native_code,
+			secret,
+			-2147467259)
+		hosted._network.state_changed.emit(hosted_change)
+		test._check(bool(hosted_result.get("ok", false))
+			and hosted.has_network()
+			and hosted_failures == [true],
+			"[%s/hosted] rejection reports a recoverable failure without ending the session" % \
+				native_code)
+		_check_safe_warning(test, hosted.fake_warnings, [
+			"stage=legacy_network_state",
+			"native_code=" + native_code,
+		], secret, "handshake-hosted-" + native_code)
+		await hosted.leave()
+
+		var scoped := Doubles.Party.new(ChatService.new())
+		scoped.configure_clock(scoped.fake_clock)
+		var scoped_result: PartyService.PartyResult = await scoped.create_staging(
+			Doubles.User.new("handshake-group-" + native_code),
+			4,
+			"deathmatch",
+			1,
+			98,
+			scoped.fake_clock.now_msec() + 1000)
+		var scoped_failures: Array[int] = []
+		var scoped_losses: Array[bool] = []
+		scoped.party_failed.connect(
+			func(_reason: String, context: Variant) -> void:
+				scoped_failures.append(
+					int(context.context_id) if context != null else 0))
+		scoped.context_lost.connect(
+			func(_reason: String, _context: Variant) -> void:
+				scoped_losses.append(true))
+		var scoped_change := Doubles.Change.new()
+		scoped_change.kind = PartyService.NETWORK_CHANGE_ERROR
+		scoped_change.peer_id = 0
+		scoped_change.network = scoped_result.context.network
+		scoped_change.result = Doubles.Results.make(
+			false,
+			null,
+			native_code,
+			secret,
+			-2147467259)
+		(scoped_result.context.network as Doubles.Network).state_changed.emit(
+			scoped_change)
+		test._check(scoped_result.ok()
+			and scoped.has_network()
+			and scoped_failures == [scoped_result.context.context_id]
+			and scoped_losses.is_empty(),
+			"[%s/scoped] rejection leaves the matchmaking group and context live" % \
+				native_code)
+		_check_safe_warning(test, scoped.fake_warnings, [
+			"stage=scoped_network_state",
+			"native_code=" + native_code,
+		], secret, "handshake-scoped-" + native_code)
+		await scoped.leave()
+
+
 func _check_safe_warning(
 	test: Node,
 	warnings: Array[String],
@@ -1672,9 +1933,9 @@ func _s4_observe_terminal_before_cancel(test: Node) -> void:
 	var owner_service := Doubles.Matchmaking.new()
 	owner_service.sdk.block_create = true
 	var owner_ticket := Doubles.Ticket.new()
-	owner_ticket.status = MatchmakingService.STATUS_MATCHED
 	owner_ticket.match_id = "owner-match"
 	owner_ticket.arranged_lobby_connection_string = "owner-arrangement"
+	owner_ticket.prime_terminal_snapshot(MatchmakingService.STATUS_MATCHED)
 	owner_service.sdk.queued_create_results.append(Doubles.Results.make(true, owner_ticket))
 	var owner_attempt := owner_service.begin_create(_spec(user, [user.entity_key], 50))
 	await _frames(test, 1)
@@ -1693,9 +1954,9 @@ func _s4_observe_terminal_before_cancel(test: Node) -> void:
 	guest_service.sdk.block_join = true
 	var guest_ticket := Doubles.Ticket.new()
 	guest_ticket.ticket_id = "guest-terminal"
-	guest_ticket.status = MatchmakingService.STATUS_MATCHED
 	guest_ticket.match_id = "guest-match"
 	guest_ticket.arranged_lobby_connection_string = "guest-arrangement"
+	guest_ticket.prime_terminal_snapshot(MatchmakingService.STATUS_MATCHED)
 	guest_service.sdk.queued_join_results.append(Doubles.Results.make(true, guest_ticket))
 	var guest_attempt := guest_service.begin_join(_join_spec(
 		user,
@@ -1720,7 +1981,7 @@ func _s4_observe_terminal_before_cancel(test: Node) -> void:
 		var terminal_service := Doubles.Matchmaking.new()
 		terminal_service.sdk.block_create = true
 		var terminal_ticket := Doubles.Ticket.new()
-		terminal_ticket.status = terminal_status
+		terminal_ticket.prime_terminal_snapshot(terminal_status)
 		terminal_service.sdk.queued_create_results.append(
 			Doubles.Results.make(true, terminal_ticket))
 		var terminal_attempt := terminal_service.begin_create(
@@ -1741,9 +2002,9 @@ func _s4_observe_terminal_before_cancel(test: Node) -> void:
 	var stale_service := Doubles.Matchmaking.new()
 	stale_service.sdk.block_create = true
 	var stale_ticket := Doubles.Ticket.new()
-	stale_ticket.status = MatchmakingService.STATUS_MATCHED
 	stale_ticket.match_id = "stale-match"
 	stale_ticket.arranged_lobby_connection_string = "stale-arrangement"
+	stale_ticket.prime_terminal_snapshot(MatchmakingService.STATUS_MATCHED)
 	stale_service.sdk.queued_create_results.append(Doubles.Results.make(true, stale_ticket))
 	var stale_attempt := stale_service.begin_create(_spec(user, [user.entity_key], 60))
 	await _frames(test, 1)
@@ -3136,7 +3397,7 @@ func _s6_scoped_deadline_ownership(test: Node) -> void:
 
 
 func _s6_context_loss_and_admission(test: Node) -> void:
-	print("CASE: Phase 1 scoped lobby loss and synchronous admission proof")
+	print("CASE: B-HOST-IDENTITY/B-PRESENT/B-LATE admission uses current member facts")
 	var service := Doubles.Party.new(ChatService.new())
 	service.configure_clock(service.fake_clock)
 	var user := Doubles.User.new("proof-local")
@@ -3146,6 +3407,12 @@ func _s6_context_loss_and_admission(test: Node) -> void:
 	if not staging.ok():
 		return
 	var context: PartyService.LobbyContext = staging.context
+	var creator_proof := service.admission_proof(context, 1)
+	test._check(not bool(creator_proof.valid)
+		and not bool(creator_proof.pending)
+		and String(creator_proof.reason_code) == "party_identity_missing",
+		"B-HOST-IDENTITY creator admission lookup is empty until the case supplies it")
+	(context.peer as Doubles.Peer).keys[1] = user.entity_key.duplicate()
 	var local_proof := service.admission_proof(context, 1)
 	test._check(bool(local_proof.valid)
 		and bool(local_proof.native_present)
@@ -3167,11 +3434,15 @@ func _s6_context_loss_and_admission(test: Node) -> void:
 	})
 	remote_member.connection_status = 0
 	(context.lobby as Doubles.Lobby).members.append(remote_member)
+	var disconnected_snapshot := service.snapshot(context)
 	var disconnected_proof := service.admission_proof(context, 2)
 	test._check(not bool(disconnected_proof.valid)
 		and not bool(disconnected_proof.pending)
 		and String(disconnected_proof.reason_code) == "native_member_disconnected",
 		"a disconnected native member is refused, not treated as pending")
+	test._check((disconnected_snapshot.members as Array).size() == 2
+		and not bool((disconnected_snapshot.members as Array)[1].connected),
+		"B-PRESENT snapshot retains disconnected present members")
 	remote_member.connection_status = 1
 	var remote_proof := service.admission_proof(context, 2)
 	test._check(bool(remote_proof.valid)
@@ -3192,8 +3463,15 @@ func _s6_context_loss_and_admission(test: Node) -> void:
 	}))
 	var outsider_proof := service.admission_proof(context, 9)
 	test._check(not bool(outsider_proof.valid)
-		and not bool(outsider_proof.pending)
-		and String(outsider_proof.reason_code) == "native_member_missing",
+		and bool(outsider_proof.pending)
+		and String(outsider_proof.reason_code) == "native_member_pending",
+		"B-PRESENT unlocked bootstrap keeps unreplicated native membership pending")
+	(context.lobby as Doubles.Lobby).membership_lock = \
+		PartyService.MEMBERSHIP_LOCK_LOCKED
+	var locked_outsider := service.admission_proof(context, 9)
+	test._check(not bool(locked_outsider.valid)
+		and not bool(locked_outsider.pending)
+		and String(locked_outsider.reason_code) == "native_member_missing",
 		"a wrong authenticated key is invalid once the native cohort is complete")
 
 	var losses: Array = []
@@ -3367,30 +3645,169 @@ func _s6_context_loss_and_admission(test: Node) -> void:
 
 
 func _s7_arranged_control_and_publication(test: Node) -> void:
-	print("CASE: Phase 1 arranged control is atomic and descriptor refresh preserves it")
+	print("CASE: B-START/B-START-MALFORMED/B-REMATCH-PENDING arranged control boundaries")
 	var valid_control := PartyService.encode_arranged_control(
 		"control-match", 0, PartyService.ARRANGED_PHASE_BOOTSTRAP)
 	var decoded := PartyService.decode_arranged_control(valid_control)
 	test._check(bool(decoded.valid)
 		and String(decoded.match_id) == "control-match"
 		and int(decoded.round) == 0
-		and String(decoded.phase) == PartyService.ARRANGED_PHASE_BOOTSTRAP,
+		and String(decoded.phase) == PartyService.ARRANGED_PHASE_BOOTSTRAP
+		and int(decoded.start_generation) == 0
+		and int(decoded.selected_count) == 0,
 		"arranged control round zero round-trips=%s" % decoded)
+	var selected_fixture: Array[Dictionary] = [
+		{"id": "selected-c", "type": "title_player_account"},
+		{"id": "selected-a", "type": "title_player_account"},
+		{"id": "selected-b", "type": "title_player_account"},
+		{"id": "selected-d", "type": "title_player_account"},
+		{"id": "selected-e", "type": "title_player_account"},
+	]
+	for selected_count: int in [2, 3, 4]:
+		var selected: Array[Dictionary] = []
+		selected.assign(selected_fixture.slice(0, selected_count))
+		var encoded := PartyService.encode_arranged_control(
+			"control-match",
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			1,
+			selected)
+		var reversed: Array[Dictionary] = selected.duplicate(true)
+		reversed.reverse()
+		var equivalent := PartyService.encode_arranged_control(
+			"control-match",
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			1,
+			reversed)
+		var selected_control := PartyService.decode_arranged_control(encoded)
+		test._check(bool(selected_control.valid)
+			and int(selected_control.start_generation) == 1
+			and int(selected_control.selected_count) == selected_count
+			and encoded == equivalent,
+			"selected set %d canonical control=%s" % [
+				selected_count, selected_control])
 	for malformed: Dictionary in [
 		{},
 		{
 			PartyService.MATCH_ID_MEMBER_KEY: "control-match",
 			PartyService.ROUND_GENERATION_KEY: "01",
 			PartyService.SESSION_PHASE_KEY: PartyService.ARRANGED_PHASE_BOOTSTRAP,
+			PartyService.START_GENERATION_KEY: "0",
+			PartyService.START_MEMBERS_KEY: "[]",
 		},
 		{
 			PartyService.MATCH_ID_MEMBER_KEY: "control-match",
 			PartyService.ROUND_GENERATION_KEY: "0",
 			PartyService.SESSION_PHASE_KEY: "unknown",
+			PartyService.START_GENERATION_KEY: "0",
+			PartyService.START_MEMBERS_KEY: "[]",
+		},
+		PartyService.encode_arranged_control(
+			"control-match",
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			0,
+			selected_fixture.slice(0, 2)),
+		PartyService.encode_arranged_control(
+			"control-match",
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			1,
+			[selected_fixture[0]]),
+		PartyService.encode_arranged_control(
+			"control-match",
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			1,
+			[selected_fixture[0], selected_fixture[0]]),
+		PartyService.encode_arranged_control(
+			"control-match",
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			1,
+			selected_fixture),
+		PartyService.encode_arranged_control(
+			"control-match",
+			0,
+			PartyService.ARRANGED_PHASE_GAMEPLAY,
+			0,
+			[]),
+		PartyService.encode_arranged_control(
+			"control-match",
+			1,
+			PartyService.ARRANGED_PHASE_REMATCH,
+			1,
+			[]),
+		{
+			PartyService.MATCH_ID_MEMBER_KEY: "control-match",
+			PartyService.ROUND_GENERATION_KEY: "0",
+			PartyService.SESSION_PHASE_KEY: PartyService.ARRANGED_PHASE_STARTING,
+			PartyService.START_GENERATION_KEY: "01",
+			PartyService.START_MEMBERS_KEY: JSON.stringify(
+				selected_fixture.slice(0, 2)),
 		},
 	]:
-		test._check(not bool(PartyService.decode_arranged_control(malformed).valid),
+		test._check(malformed.is_empty()
+			or not bool(PartyService.decode_arranged_control(malformed).valid),
 			"malformed arranged control is rejected=%s" % malformed)
+	var raw_start_control := {
+		PartyService.MATCH_ID_MEMBER_KEY: "control-match",
+		PartyService.ROUND_GENERATION_KEY: "0",
+		PartyService.SESSION_PHASE_KEY: PartyService.ARRANGED_PHASE_STARTING,
+		PartyService.START_GENERATION_KEY: "1",
+		PartyService.START_MEMBERS_KEY: "[]",
+	}
+	var malformed_selected_members: Array[Dictionary] = [
+		{
+			"id": "duplicate",
+			"value": JSON.stringify([selected_fixture[0], selected_fixture[0]]),
+		},
+		{
+			"id": "one-key",
+			"value": JSON.stringify(selected_fixture.slice(0, 1)),
+		},
+		{
+			"id": "five-keys",
+			"value": JSON.stringify(selected_fixture),
+		},
+		{
+			"id": "invalid-key",
+			"value": JSON.stringify([
+				selected_fixture[0],
+				{"id": "missing-type"},
+			]),
+		},
+		{
+			"id": "non-array",
+			"value": JSON.stringify({"member": selected_fixture[0]}),
+		},
+		{
+			"id": "non-json",
+			"value": "not-json",
+		},
+	]
+	for malformed_case: Dictionary in malformed_selected_members:
+		var raw_malformed: Dictionary = raw_start_control.duplicate(true)
+		raw_malformed[PartyService.START_MEMBERS_KEY] = \
+			String(malformed_case.value)
+		var malformed_decoded := PartyService.decode_arranged_control(
+			raw_malformed)
+		test._check(not bool(malformed_decoded.valid),
+			"B-START-MALFORMED raw %s selected set is rejected=%s" % [
+				malformed_case.id,
+				malformed_decoded,
+			])
+	for hosted_phase: String in [
+		PartyService.ARRANGED_PHASE_REMATCH,
+		PartyService.ARRANGED_PHASE_GAMEPLAY,
+	]:
+		var hosted_control := PartyService.encode_arranged_control(
+			"control-match", 1, hosted_phase, 0, [])
+		test._check(bool(PartyService.decode_arranged_control(
+			hosted_control).valid),
+			"hosted round accepts generation-zero empty control phase=%s" % \
+				hosted_phase)
 
 	var service := Doubles.Party.new(ChatService.new())
 	service.configure_clock(service.fake_clock)
@@ -3440,16 +3857,38 @@ func _s7_arranged_control_and_publication(test: Node) -> void:
 		and lobby.update_calls == 1,
 		"phase/control mismatch is refused before a native update")
 
-	var rematch_control := PartyService.encode_arranged_control(
-		"control-match", 1, PartyService.ARRANGED_PHASE_REMATCH)
-	var advanced: PartyService.PartyResult = await service.post_context_update(
+	var selected_start := PartyService.encode_arranged_control(
+		"control-match",
+		0,
+		PartyService.ARRANGED_PHASE_STARTING,
+		1,
+		[
+			user.entity_key,
+			{"id": "selected-guest", "type": "title_player_account"},
+		])
+	var selected_post: PartyService.PartyResult = await service.post_context_update(
 		arranged.context,
-		rematch_control,
+		selected_start,
 		{},
 		{},
 		service.fake_clock.now_msec() + 1000)
-	test._check(advanced.ok() and lobby.update_calls == 2,
-		"later arranged round control updates through the serialized owner path")
+	var selected_snapshot := service.snapshot(arranged.context)
+	(arranged.context.peer as Doubles.Peer).keys[1] = user.entity_key.duplicate()
+	var selected_proof := service.joined_owner_proof(arranged.context, 1)
+	test._check(selected_post.ok() and lobby.update_calls == 2
+		and int(selected_snapshot.selected_start_count) == 2
+		and int((selected_snapshot.arranged_control as Dictionary).selected_count) == 2
+		and int(selected_proof.selected_count) == 2,
+		"Starting read-back exposes selected count through snapshot and owner proof")
+	(arranged.context.peer as Doubles.Peer).keys[9] = {
+		"id": "late-selected-peer",
+		"type": "title_player_account",
+	}
+	var late_proof := service.admission_proof(arranged.context, 9)
+	test._check(not bool(late_proof.valid)
+		and not bool(late_proof.pending)
+		and String(late_proof.reason_code) == "native_member_missing",
+		"B-LATE Starting control makes absent late membership definitive")
 	var network: Doubles.Network = arranged.context.network
 	network.descriptor = "descriptor-refreshed"
 	var descriptor_change := Doubles.Change.new()
@@ -3459,12 +3898,48 @@ func _s7_arranged_control_and_publication(test: Node) -> void:
 	test._check(lobby.update_calls == 3
 		and String(lobby.properties.get(PartyService.DESCRIPTOR_KEY, ""))
 			== "descriptor-refreshed"
-		and String(lobby.properties.get(PartyService.MATCH_ID_MEMBER_KEY, ""))
-			== "control-match"
-		and String(lobby.properties.get(PartyService.ROUND_GENERATION_KEY, "")) == "1"
 		and String(lobby.properties.get(PartyService.SESSION_PHASE_KEY, ""))
-			== PartyService.ARRANGED_PHASE_REMATCH,
-		"descriptor refresh preserves the latest valid match, round, and phase metadata")
+			== PartyService.ARRANGED_PHASE_STARTING
+		and String(lobby.properties.get(PartyService.START_GENERATION_KEY, "")) == "1"
+		and String(lobby.properties.get(PartyService.START_MEMBERS_KEY, ""))
+			== String(selected_start.get(PartyService.START_MEMBERS_KEY, "")),
+		"descriptor refresh preserves exact selected Starting control")
+	var rematch_control := PartyService.encode_arranged_control(
+		"control-match", 1, PartyService.ARRANGED_PHASE_REMATCH)
+	var advanced: PartyService.PartyResult = await service.post_context_update(
+		arranged.context,
+		rematch_control,
+		{},
+		{},
+		service.fake_clock.now_msec() + 1000)
+	test._check(advanced.ok() and lobby.update_calls == 4
+		and arranged.context.selected_start_count == 0,
+		"hosted rematch clears the initial selected count")
+	var rematch_pending := service.admission_proof(arranged.context, 9)
+	test._check(not bool(rematch_pending.valid)
+		and bool(rematch_pending.pending)
+		and String(rematch_pending.reason_code) == "native_member_pending",
+		"B-REMATCH-PENDING unlocked gathering waits for Party-before-Lobby replication")
+	lobby.membership_lock = PartyService.MEMBERSHIP_LOCK_LOCKED
+	var rematch_locked := service.admission_proof(arranged.context, 9)
+	test._check(not bool(rematch_locked.valid)
+		and not bool(rematch_locked.pending)
+		and String(rematch_locked.reason_code) == "native_member_missing",
+		"B-REMATCH-PENDING locked gathering makes missing membership definitive")
+	lobby.membership_lock = PartyService.MEMBERSHIP_LOCK_UNLOCKED
+	var closed: PartyService.PartyResult = await service.post_context_update(
+		arranged.context,
+		PartyService.encode_arranged_control(
+			"control-match", 1, PartyService.ARRANGED_PHASE_GAMEPLAY),
+		{},
+		{},
+		service.fake_clock.now_msec() + 1000)
+	var rematch_closed := service.admission_proof(arranged.context, 9)
+	test._check(closed.ok()
+		and not bool(rematch_closed.valid)
+		and not bool(rematch_closed.pending)
+		and String(rematch_closed.reason_code) == "native_member_missing",
+		"B-REMATCH-PENDING Gameplay closes a pending replacement definitively")
 	await service.leave()
 	await _drain_clock(test, service.fake_clock, "S7 arranged publication")
 
@@ -3543,6 +4018,796 @@ func _s7_arranged_control_and_publication(test: Node) -> void:
 		"unusable returned peer is refused and its network is left exactly once")
 	await unusable.leave()
 	await _drain_clock(test, unusable.fake_clock, "S7 unusable peer")
+
+
+func _c_private_promotion_and_readback(test: Node) -> void:
+	print("CASE: C-PRIVATE-PROMOTE/PRESENCE/READBACK keeps one checked private session")
+	var session_id := "0123456789abcdef0123456789abcdef"
+	var owner := Doubles.User.new("private-promote-owner")
+	var selected: Array[Dictionary] = [
+		owner.entity_key.duplicate(),
+		{"id": "private-promote-b", "type": "title_player_account"},
+		{"id": "private-promote-c", "type": "title_player_account"},
+		{"id": "private-promote-d", "type": "title_player_account"},
+	]
+	var reversed: Array[Dictionary] = selected.duplicate(true)
+	reversed.reverse()
+	var encoded := PartyService.encode_private_control(
+		session_id,
+		0,
+		PartyService.ARRANGED_PHASE_STARTING,
+		1,
+		selected)
+	var equivalent := PartyService.encode_private_control(
+		session_id,
+		0,
+		PartyService.ARRANGED_PHASE_STARTING,
+		1,
+		reversed)
+	var decoded := PartyService.decode_private_control(encoded)
+	test._check(bool(decoded.valid)
+		and String(decoded.origin) == String(PartyService.PLAY_ORIGIN_PRIVATE)
+		and String(decoded.session_id) == session_id
+		and int(decoded.round) == 0
+		and int(decoded.start_generation) == 1
+		and int(decoded.selected_count) == 4
+		and encoded == equivalent,
+		"C-PRIVATE-PROMOTE private control is canonical=%s" % decoded)
+	for invalid_control: Dictionary in [
+		PartyService.encode_private_control(
+			"ABCDEF0123456789ABCDEF0123456789",
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			1,
+			selected),
+		PartyService.encode_private_control(
+			session_id,
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			0,
+			selected),
+		PartyService.encode_private_control(
+			session_id,
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			1,
+			selected.slice(0, 3)),
+		PartyService.encode_private_control(
+			session_id,
+			0,
+			PartyService.ARRANGED_PHASE_STARTING,
+			1,
+			[selected[0], selected[1], selected[2], selected[2]]),
+		PartyService.encode_private_control(
+			session_id,
+			1,
+			PartyService.ARRANGED_PHASE_REMATCH,
+			1,
+			[]),
+	]:
+		test._check(invalid_control.is_empty(),
+			"C-PRIVATE-PROMOTE invalid private control is not encoded")
+
+	var service := Doubles.Party.new(ChatService.new())
+	service.configure_clock(service.fake_clock)
+	var fixture := await _private_staging_fixture(
+		service, owner, "private-promote", selected)
+	test._check(not fixture.is_empty(),
+		"C-PRIVATE-PROMOTE sealed full group fixture opens")
+	if fixture.is_empty():
+		return
+	var context: PartyService.LobbyContext = fixture.context
+	var lobby: Doubles.Lobby = fixture.lobby
+	var network: Doubles.Network = fixture.network
+	var peer: Doubles.Peer = fixture.peer
+	var descriptor := String(network.descriptor)
+	var context_id := context.context_id
+	var search_control := String(lobby.properties.get(
+		PartyService.SEARCH_CONTROL_KEY, ""))
+	var update_calls := lobby.update_calls
+	var party_create_calls := service.pf.party.create_calls.size()
+	var lobby_count := service.pf.multiplayer.lobbies.size()
+	var promoted: PartyService.PartyResult = await service.promote_staging_to_private(
+		context,
+		session_id,
+		selected,
+		service.fake_clock.now_msec() + 1000)
+	var promoted_snapshot := service.snapshot(context)
+	test._check(promoted.ok()
+		and promoted.context == context
+		and promoted.peer == peer
+		and promoted.private_session_id == session_id
+		and promoted.play_origin == PartyService.PLAY_ORIGIN_PRIVATE,
+		"C-PRIVATE-PROMOTE returns the same promoted context")
+	test._check(context.context_id == context_id
+		and context.lobby == lobby
+		and context.network == network
+		and context.peer == peer
+		and String(network.descriptor) == descriptor
+		and lobby.leaves == 0
+		and network.leaves == 0,
+		"C-PRIVATE-PROMOTE preserves every session resource")
+	test._check(service.pf.party.create_calls.size() == party_create_calls
+		and service.pf.multiplayer.lobbies.size() == lobby_count
+		and service.pf.multiplayer.arranged_calls.is_empty(),
+		"C-PRIVATE-PROMOTE creates no replacement lobby, network, or arrangement")
+	test._check(lobby.update_calls == update_calls + 1
+		and int(promoted_snapshot.access_policy)
+			== PartyService.ACCESS_POLICY_PRIVATE
+		and String(promoted_snapshot.kind) == PartyService.LOBBY_KIND_PRIVATE
+		and promoted_snapshot.play_origin == PartyService.PLAY_ORIGIN_PRIVATE
+		and String(promoted_snapshot.private_session_id) == session_id
+		and bool((promoted_snapshot.private_control as Dictionary).valid),
+		"C-PRIVATE-READBACK derives the committed private session from the lobby")
+	test._check(String((promoted_snapshot.properties as Dictionary).get(
+		PartyService.SEARCH_CONTROL_KEY, "")) == search_control,
+		"C-PRIVATE-PRESENCE leaves the gathering envelope untouched")
+	var update_record: Dictionary = lobby.update_records.back()
+	var present: Dictionary = update_record.present
+	test._check(present.size() == 3
+		and present.has("access_policy")
+		and present.has("lobby_properties")
+		and present.has("search_properties")
+		and int(update_record.access_policy)
+			== PartyService.ACCESS_POLICY_PRIVATE,
+		"C-PRIVATE-PRESENCE sends only access, kind, and private control")
+	var recorded_lobby: Dictionary = update_record.lobby_properties
+	var recorded_search: Dictionary = update_record.search_properties
+	test._check(recorded_lobby.size() == 6
+		and recorded_lobby.has(PartyService.PLAY_ORIGIN_KEY)
+		and recorded_lobby.has(PartyService.PRIVATE_SESSION_ID_KEY)
+		and recorded_lobby.has(PartyService.ROUND_GENERATION_KEY)
+		and recorded_lobby.has(PartyService.SESSION_PHASE_KEY)
+		and recorded_lobby.has(PartyService.START_GENERATION_KEY)
+		and recorded_lobby.has(PartyService.START_MEMBERS_KEY)
+		and recorded_search == {
+			PartyService.LOBBY_KIND_KEY: PartyService.LOBBY_KIND_PRIVATE,
+		},
+		"C-PRIVATE-PRESENCE omits capacity and authority configuration")
+	await service.leave()
+	await _drain_clock(test, service.fake_clock, "C-PRIVATE promotion")
+
+	var readback_cases: Array[Dictionary] = [
+		{
+			"label": "access",
+			"overrides": {"access_policy": PartyService.ACCESS_POLICY_PUBLIC},
+		},
+		{
+			"label": "kind",
+			"overrides": {"search_properties": {
+				PartyService.LOBBY_KIND_KEY: PartyService.LOBBY_KIND_STAGING,
+			}},
+		},
+		{
+			"label": "session",
+			"overrides": {"lobby_properties": {
+				PartyService.PRIVATE_SESSION_ID_KEY:
+					"fedcba9876543210fedcba9876543210",
+			}},
+		},
+		{
+			"label": "round",
+			"overrides": {"lobby_properties": {
+				PartyService.ROUND_GENERATION_KEY: "1",
+			}},
+		},
+		{
+			"label": "selected set",
+			"overrides": {"lobby_properties": {
+				PartyService.START_MEMBERS_KEY:
+					JSON.stringify(selected.slice(0, 3)),
+			}},
+		},
+		{
+			"label": "owner",
+			"overrides": {"owner_entity_key": {
+				"id": "private-promote-other-owner",
+				"type": "title_player_account",
+			}},
+		},
+		{
+			"label": "lock",
+			"overrides": {
+				"membership_lock": PartyService.MEMBERSHIP_LOCK_UNLOCKED,
+			},
+		},
+		{
+			"label": "capacity",
+			"overrides": {"max_member_count": 3},
+		},
+	]
+	for readback_case: Dictionary in readback_cases:
+		var changed_service := Doubles.Party.new(ChatService.new())
+		changed_service.configure_clock(changed_service.fake_clock)
+		var changed_owner := Doubles.User.new(
+			"private-readback-" + String(readback_case.label))
+		var changed_selected := _private_selected_group(
+			changed_owner, "private-readback-" + String(readback_case.label))
+		var changed_fixture := await _private_staging_fixture(
+			changed_service,
+			changed_owner,
+			"private-readback-" + String(readback_case.label),
+			changed_selected)
+		var changed_context: PartyService.LobbyContext = changed_fixture.context
+		var changed_lobby: Doubles.Lobby = changed_fixture.lobby
+		changed_lobby.next_post_overrides = (
+			readback_case.overrides as Dictionary
+		).duplicate(true)
+		var changed_result: PartyService.PartyResult = \
+			await changed_service.promote_staging_to_private(
+				changed_context,
+				session_id,
+				changed_selected,
+				changed_service.fake_clock.now_msec() + 1000)
+		test._check(not changed_result.ok()
+			and changed_result.reason_code == &"private_promotion_changed"
+			and changed_context.kind == PartyService.LOBBY_KIND_STAGING
+			and changed_context.play_origin == &""
+			and changed_context.private_session_id.is_empty(),
+			"C-PRIVATE-READBACK %s mismatch does not commit local state" % \
+				readback_case.label)
+		await changed_service.leave()
+		await _drain_clock(
+			test,
+			changed_service.fake_clock,
+			"C-PRIVATE readback " + String(readback_case.label))
+
+	var guest_service := Doubles.Party.new(ChatService.new())
+	guest_service.configure_clock(guest_service.fake_clock)
+	var guest_owner := Doubles.User.new("private-proof-owner")
+	var guest_user := Doubles.User.new("private-proof-guest")
+	var guest_selected := _private_selected_group(
+		guest_owner, "private-proof")
+	guest_selected[1] = guest_user.entity_key.duplicate()
+	var guest_lobby := _private_lobby_fixture(
+		guest_owner.entity_key,
+		guest_user.entity_key,
+		"private-proof",
+		session_id,
+		0,
+		PartyService.ARRANGED_PHASE_STARTING,
+		guest_selected,
+		true)
+	var guest_context := guest_service._new_context(
+		&"staging",
+		PartyService.LOBBY_KIND_STAGING,
+		guest_user,
+		1,
+		901)
+	guest_context.capacity = MatchmakingService.SESSION_CAPACITY
+	guest_service._attach_context_lobby(guest_context, guest_lobby)
+	var guest_network := Doubles.Network.new()
+	guest_network.local_peer.unique_id = 7
+	guest_network.local_peer.keys[1] = guest_owner.entity_key.duplicate()
+	test._check(guest_service._attach_context_transport(
+		guest_context, guest_network, false),
+		"C-PRIVATE-READBACK guest fixture attaches its retained transport")
+	var guest_snapshot := guest_service.snapshot(guest_context)
+	var guest_proof := guest_service.joined_owner_proof(guest_context, 1)
+	test._check(String(guest_snapshot.kind) == PartyService.LOBBY_KIND_PRIVATE
+		and guest_snapshot.play_origin == PartyService.PLAY_ORIGIN_PRIVATE
+		and String(guest_snapshot.private_session_id) == session_id
+		and bool(guest_proof.valid)
+		and String(guest_proof.play_origin)
+			== String(PartyService.PLAY_ORIGIN_PRIVATE)
+		and String(guest_proof.private_session_id) == session_id
+		and int(guest_proof.selected_count) == 4,
+		"C-PRIVATE-READBACK guest facts follow the committed lobby state")
+	await guest_service.leave()
+	await _drain_clock(test, guest_service.fake_clock, "C-PRIVATE guest readback")
+
+
+func _c_private_hold_restore_and_round(test: Node) -> void:
+	print("CASE: C-PRIVATE-HOLD/RESTORE/ROUND owns completion and retained rounds")
+	var session_id := "1023456789abcdef1023456789abcdef"
+	var hold_service := Doubles.Party.new(ChatService.new())
+	hold_service.configure_clock(hold_service.fake_clock)
+	var hold_owner := Doubles.User.new("private-hold-owner")
+	var hold_selected := _private_selected_group(
+		hold_owner, "private-hold")
+	var hold_fixture := await _private_staging_fixture(
+		hold_service, hold_owner, "private-hold", hold_selected)
+	var hold_context: PartyService.LobbyContext = hold_fixture.context
+	var hold_lobby: Doubles.Lobby = hold_fixture.lobby
+	hold_lobby.block_post = true
+	var hold_results: Array = []
+	_capture_private_promotion(
+		hold_service,
+		hold_context,
+		session_id,
+		hold_selected,
+		hold_service.fake_clock.now_msec() + 100,
+		hold_results)
+	await _frames(test, 1)
+	test._check(hold_results.is_empty()
+		and hold_lobby.update_calls == 1
+		and hold_context.pending_operations == 1,
+		"C-PRIVATE-HOLD held promotion remains owned")
+	hold_service.fake_clock.advance(0.1)
+	await _frames(test, 2)
+	var hold_timeout: PartyService.PartyResult = hold_results[0] \
+		if hold_results.size() == 1 else null
+	test._check(hold_timeout != null
+		and hold_timeout.reason_code == &"private_promotion_timeout"
+		and hold_timeout.cleanup_pending
+		and hold_timeout.operation != null
+		and hold_timeout.operation.cleanup_pending,
+		"C-PRIVATE-HOLD timeout exposes its owed completion")
+	var gathering_control := PartyService.encode_search_control({
+		"epoch": 902,
+		"phase": "gathering",
+		"group": hold_selected,
+	})
+	var hold_updates := hold_lobby.update_calls
+	var unsafe_while_owed: PartyService.PartyResult = \
+		await hold_service.restore_private_to_gathering(
+			hold_context,
+			session_id,
+			gathering_control,
+			hold_service.fake_clock.now_msec() + 1000)
+	test._check(unsafe_while_owed.reason_code == &"private_restore_unsafe"
+		and hold_lobby.update_calls == hold_updates,
+		"C-PRIVATE-RESTORE owed completion causes no restoration call")
+	hold_lobby.block_post = false
+	hold_lobby.post_released.emit()
+	await _frames(test, 3)
+	test._check(not hold_timeout.operation.cleanup_pending
+		and hold_context.pending_operations == 0
+		and hold_context.kind == PartyService.LOBBY_KIND_STAGING
+		and String(hold_lobby.search_properties.get(
+			PartyService.LOBBY_KIND_KEY, "")) == PartyService.LOBBY_KIND_PRIVATE,
+		"C-PRIVATE-HOLD late native completion stays owned without local commit")
+	await hold_service.leave()
+	await _drain_clock(test, hold_service.fake_clock, "C-PRIVATE hold")
+
+	var restore_service := Doubles.Party.new(ChatService.new())
+	restore_service.configure_clock(restore_service.fake_clock)
+	var restore_owner := Doubles.User.new("private-restore-owner")
+	var restore_selected := _private_selected_group(
+		restore_owner, "private-restore")
+	var restore_fixture := await _private_staging_fixture(
+		restore_service,
+		restore_owner,
+		"private-restore",
+		restore_selected)
+	var restore_context: PartyService.LobbyContext = restore_fixture.context
+	var restore_lobby: Doubles.Lobby = restore_fixture.lobby
+	var restore_network: Doubles.Network = restore_fixture.network
+	var promoted: PartyService.PartyResult = \
+		await restore_service.promote_staging_to_private(
+			restore_context,
+			session_id,
+			restore_selected,
+			restore_service.fake_clock.now_msec() + 1000)
+	var restore_updates := restore_lobby.update_calls
+	var restore_locks := restore_lobby.lock_calls
+	var restored: PartyService.PartyResult = \
+		await restore_service.restore_private_to_gathering(
+			restore_context,
+			session_id,
+			gathering_control,
+			restore_service.fake_clock.now_msec() + 1000)
+	var restored_snapshot := restore_service.snapshot(restore_context)
+	test._check(promoted.ok() and restored.ok()
+		and restore_context.lobby == restore_lobby
+		and restore_context.network == restore_network
+		and restore_context.kind == PartyService.LOBBY_KIND_STAGING
+		and restore_context.play_origin == &""
+		and restore_context.private_session_id.is_empty(),
+		"C-PRIVATE-RESTORE returns the same context to Gathering")
+	test._check(restore_lobby.update_calls == restore_updates + 1
+		and restore_lobby.lock_calls == restore_locks + 1
+		and int(restored_snapshot.access_policy)
+			== PartyService.ACCESS_POLICY_PUBLIC
+		and String(restored_snapshot.kind) == PartyService.LOBBY_KIND_STAGING
+		and not bool(restored_snapshot.membership_locked)
+		and not bool((restored_snapshot.private_control as Dictionary).valid)
+		and String((restored_snapshot.properties as Dictionary).get(
+			PartyService.SEARCH_CONTROL_KEY, "")) == gathering_control,
+		"C-PRIVATE-RESTORE checks public Gathering and unlock read-back")
+	var restore_record: Dictionary = restore_lobby.update_records.back()
+	test._check((restore_record.present as Dictionary).size() == 3
+		and int(restore_record.access_policy)
+			== PartyService.ACCESS_POLICY_PUBLIC
+		and String((restore_record.search_properties as Dictionary).get(
+			PartyService.LOBBY_KIND_KEY, ""))
+			== PartyService.LOBBY_KIND_STAGING
+		and String((restore_record.lobby_properties as Dictionary).get(
+			PartyService.PLAY_ORIGIN_KEY, "missing")).is_empty()
+		and String((restore_record.lobby_properties as Dictionary).get(
+			PartyService.PRIVATE_SESSION_ID_KEY, "missing")).is_empty(),
+		"C-PRIVATE-RESTORE explicitly clears private control in one update")
+	await restore_service.leave()
+	await _drain_clock(test, restore_service.fake_clock, "C-PRIVATE restore")
+
+	var failed_service := Doubles.Party.new(ChatService.new())
+	failed_service.configure_clock(failed_service.fake_clock)
+	var failed_owner := Doubles.User.new("private-failed-owner")
+	var failed_selected := _private_selected_group(
+		failed_owner, "private-failed")
+	var failed_fixture := await _private_staging_fixture(
+		failed_service,
+		failed_owner,
+		"private-failed",
+		failed_selected)
+	var failed_context: PartyService.LobbyContext = failed_fixture.context
+	var failed_lobby: Doubles.Lobby = failed_fixture.lobby
+	failed_lobby.next_post_result = Doubles.Results.make(
+		false, null, "lobby_update_failed", "Private update failed.")
+	var failed_promotion: PartyService.PartyResult = \
+		await failed_service.promote_staging_to_private(
+			failed_context,
+			session_id,
+			failed_selected,
+			failed_service.fake_clock.now_msec() + 1000)
+	var failed_restore: PartyService.PartyResult = \
+		await failed_service.restore_private_to_gathering(
+			failed_context,
+			session_id,
+			gathering_control,
+			failed_service.fake_clock.now_msec() + 1000)
+	test._check(failed_promotion.reason_code == &"private_promotion_failed"
+		and failed_restore.ok()
+		and failed_context.kind == PartyService.LOBBY_KIND_STAGING
+		and failed_lobby.update_calls == 2
+		and failed_lobby.lock_calls == 1,
+		"C-PRIVATE-RESTORE confirmed failed promotion restores and unlocks")
+	await failed_service.leave()
+	await _drain_clock(test, failed_service.fake_clock, "C-PRIVATE failed promotion")
+
+	var unsafe_service := Doubles.Party.new(ChatService.new())
+	unsafe_service.configure_clock(unsafe_service.fake_clock)
+	var unsafe_owner := Doubles.User.new("private-unsafe-owner")
+	var unsafe_selected := _private_selected_group(
+		unsafe_owner, "private-unsafe")
+	var unsafe_fixture := await _private_staging_fixture(
+		unsafe_service,
+		unsafe_owner,
+		"private-unsafe",
+		unsafe_selected)
+	var unsafe_context: PartyService.LobbyContext = unsafe_fixture.context
+	var unsafe_lobby: Doubles.Lobby = unsafe_fixture.lobby
+	var unsafe_promoted: PartyService.PartyResult = \
+		await unsafe_service.promote_staging_to_private(
+			unsafe_context,
+			session_id,
+			unsafe_selected,
+			unsafe_service.fake_clock.now_msec() + 1000)
+	unsafe_lobby.properties[PartyService.PRIVATE_SESSION_ID_KEY] = \
+		"2023456789abcdef2023456789abcdef"
+	var unsafe_calls := unsafe_lobby.update_calls
+	var unsafe_restore: PartyService.PartyResult = \
+		await unsafe_service.restore_private_to_gathering(
+			unsafe_context,
+			session_id,
+			gathering_control,
+			unsafe_service.fake_clock.now_msec() + 1000)
+	test._check(unsafe_promoted.ok()
+		and unsafe_restore.reason_code == &"private_restore_unsafe"
+		and unsafe_lobby.update_calls == unsafe_calls
+		and unsafe_context.kind == PartyService.LOBBY_KIND_PRIVATE,
+		"C-PRIVATE-RESTORE ambiguous private state has no side effects")
+	await unsafe_service.leave()
+	await _drain_clock(test, unsafe_service.fake_clock, "C-PRIVATE unsafe restore")
+
+	var restore_fail_service := Doubles.Party.new(ChatService.new())
+	restore_fail_service.configure_clock(restore_fail_service.fake_clock)
+	var restore_fail_owner := Doubles.User.new("private-restore-fail-owner")
+	var restore_fail_selected := _private_selected_group(
+		restore_fail_owner, "private-restore-fail")
+	var restore_fail_fixture := await _private_staging_fixture(
+		restore_fail_service,
+		restore_fail_owner,
+		"private-restore-fail",
+		restore_fail_selected)
+	var restore_fail_context: PartyService.LobbyContext = \
+		restore_fail_fixture.context
+	var restore_fail_lobby: Doubles.Lobby = restore_fail_fixture.lobby
+	await restore_fail_service.promote_staging_to_private(
+		restore_fail_context,
+		session_id,
+		restore_fail_selected,
+		restore_fail_service.fake_clock.now_msec() + 1000)
+	restore_fail_lobby.next_post_result = Doubles.Results.make(
+		false, null, "lobby_update_failed", "Restore failed.")
+	var restore_failed: PartyService.PartyResult = \
+		await restore_fail_service.restore_private_to_gathering(
+			restore_fail_context,
+			session_id,
+			gathering_control,
+			restore_fail_service.fake_clock.now_msec() + 1000)
+	test._check(restore_failed.reason_code == &"private_restore_failed"
+		and restore_fail_lobby.lock_calls == 0
+		and restore_fail_context.kind == PartyService.LOBBY_KIND_PRIVATE,
+		"C-PRIVATE-RESTORE failed update never unlocks optimistically")
+	await restore_fail_service.leave()
+	await _drain_clock(
+		test, restore_fail_service.fake_clock, "C-PRIVATE failed restore")
+
+	var round_service := Doubles.Party.new(ChatService.new())
+	round_service.configure_clock(round_service.fake_clock)
+	var round_owner := Doubles.User.new("private-round-owner")
+	var round_selected := _private_selected_group(
+		round_owner, "private-round")
+	var round_fixture := await _private_staging_fixture(
+		round_service, round_owner, "private-round", round_selected)
+	var round_context: PartyService.LobbyContext = round_fixture.context
+	var round_lobby: Doubles.Lobby = round_fixture.lobby
+	var round_network: Doubles.Network = round_fixture.network
+	await round_service.promote_staging_to_private(
+		round_context,
+		session_id,
+		round_selected,
+		round_service.fake_clock.now_msec() + 1000)
+	var round_create_calls := round_service.pf.party.create_calls.size()
+	var round_lobby_count := round_service.pf.multiplayer.lobbies.size()
+	var rematch: PartyService.PartyResult = \
+		await round_service.set_private_round_control(
+			round_context,
+			session_id,
+			1,
+			PartyService.ARRANGED_PHASE_REMATCH,
+			round_service.fake_clock.now_msec() + 1000)
+	var rematch_snapshot := round_service.snapshot(round_context)
+	test._check(rematch.ok()
+		and round_context.network == round_network
+		and int((rematch_snapshot.private_control as Dictionary).round) == 1
+		and String((rematch_snapshot.private_control as Dictionary).phase)
+			== PartyService.ARRANGED_PHASE_REMATCH
+		and int((rematch_snapshot.private_control as Dictionary).selected_count) == 0
+		and round_context.selected_start_count == 0,
+		"C-PRIVATE-ROUND publishes generation-zero empty retained control")
+	test._check(round_service.pf.party.create_calls.size() == round_create_calls
+		and round_service.pf.multiplayer.lobbies.size() == round_lobby_count
+		and round_service.pf.multiplayer.arranged_calls.is_empty(),
+		"C-PRIVATE-ROUND rebuilds no lobby, network, or arrangement")
+	round_lobby.membership_lock = PartyService.MEMBERSHIP_LOCK_UNLOCKED
+	(round_context.peer as Doubles.Peer).keys[9] = {
+		"id": "private-round-candidate",
+		"type": "title_player_account",
+	}
+	var private_pending := round_service.admission_proof(round_context, 9)
+	test._check(not bool(private_pending.valid)
+		and bool(private_pending.pending)
+		and String(private_pending.reason_code) == "native_member_pending",
+		"C-PRIVATE-ROUND unlocked rematch waits for current membership")
+	round_lobby.membership_lock = PartyService.MEMBERSHIP_LOCK_LOCKED
+	var private_locked := round_service.admission_proof(round_context, 9)
+	test._check(not bool(private_locked.valid)
+		and not bool(private_locked.pending)
+		and String(private_locked.reason_code) == "native_member_missing",
+		"C-PRIVATE-ROUND lock makes missing membership definitive")
+	round_lobby.membership_lock = PartyService.MEMBERSHIP_LOCK_UNLOCKED
+	var gameplay: PartyService.PartyResult = \
+		await round_service.set_private_round_control(
+			round_context,
+			session_id,
+			1,
+			PartyService.ARRANGED_PHASE_GAMEPLAY,
+			round_service.fake_clock.now_msec() + 1000)
+	var private_closed := round_service.admission_proof(round_context, 9)
+	test._check(gameplay.ok()
+		and not bool(private_closed.valid)
+		and not bool(private_closed.pending)
+		and String(private_closed.reason_code) == "native_member_missing",
+		"C-PRIVATE-ROUND Gameplay closes a pending replacement")
+	var round_updates := round_lobby.update_calls
+	var invalid_round: PartyService.PartyResult = \
+		await round_service.set_private_round_control(
+			round_context,
+			session_id,
+			0,
+			PartyService.ARRANGED_PHASE_REMATCH,
+			round_service.fake_clock.now_msec() + 1000)
+	test._check(invalid_round.reason_code == &"private_round_invalid"
+		and round_lobby.update_calls == round_updates,
+		"C-PRIVATE-ROUND invalid retained control makes no native call")
+	await round_service.leave()
+	await _drain_clock(test, round_service.fake_clock, "C-PRIVATE round")
+
+
+func _c_private_invitation(test: Node) -> void:
+	print("CASE: C-PRIVATE-INVITE accepts only an open retained private round")
+	var previous_matchmaking: MatchmakingService = Services._matchmaking
+	Services._matchmaking = Doubles.Matchmaking.new()
+	var session_id := "3023456789abcdef3023456789abcdef"
+	var owner := Doubles.User.new("private-invite-owner")
+	var guest := Doubles.User.new("private-invite-guest")
+	var exact_connection := "private+opaque%2fvalue|slash/:=lower"
+	var lobby := _private_lobby_fixture(
+		owner.entity_key,
+		guest.entity_key,
+		"private-invite",
+		session_id,
+		2,
+		PartyService.ARRANGED_PHASE_REMATCH,
+		[],
+		false)
+	lobby.connection_string = exact_connection
+	var network := Doubles.Network.new()
+	network.local_peer.keys[1] = owner.entity_key.duplicate()
+	var service := Doubles.Party.new(ChatService.new())
+	service.configure_clock(service.fake_clock)
+	service.pf.multiplayer.lobby_by_connection[exact_connection] = lobby
+	service.pf.party.queued_networks.append(network)
+	var joined: Dictionary = await service.join_by_connection_string(
+		guest,
+		exact_connection,
+		service.fake_clock.now_msec() + 45000)
+	test._check(bool(joined.get("ok", false))
+		and String(joined.get("destination", "")) == "private_rematch"
+		and String(joined.get("kind", "")) == PartyService.LOBBY_KIND_PRIVATE
+		and String(joined.get("play_origin", ""))
+			== String(PartyService.PLAY_ORIGIN_PRIVATE)
+		and String(joined.get("private_session_id", "")) == session_id
+		and int(joined.get("round", -1)) == 2
+		and int(joined.get("capacity", 0)) == 4
+		and int(joined.get("selected_start_count", -1)) == 0
+		and (joined.get("owner_key", {}) as Dictionary) == owner.entity_key,
+		"C-PRIVATE-INVITE returns the private-rematch result shape=%s" % joined)
+	test._check(service.pf.multiplayer.join_calls == [exact_connection]
+		and service.pf.multiplayer.find_calls.is_empty(),
+		"C-PRIVATE-INVITE preserves the exact connection string")
+	test._check(service.pf.party.join_calls.size() == 1
+		and String(service.pf.party.join_calls[0].invitation_id)
+			== PartyService.MATCHMAKING_INVITATION_ID
+		and service.pf.multiplayer.arranged_calls.is_empty(),
+		"C-PRIVATE-INVITE uses the retained Party network without an arrangement")
+	test._check(lobby.member_calls == 1
+		and lobby.update_calls == 0
+		and String(lobby.members[1].properties.get(
+			MatchmakingService.PROTOCOL_MEMBER_KEY, ""))
+			== NRProtocol.version_string()
+		and String(lobby.members[1].properties.get(
+			PartyService.PRIVATE_SESSION_ID_KEY, "")) == session_id
+		and not lobby.members[1].properties.has(
+			PartyService.MATCH_ID_MEMBER_KEY)
+		and not lobby.members[1].properties.has(
+			PartyService.MATCH_ORIGIN_MEMBER_KEY),
+		"C-PRIVATE-INVITE writes only protocol and private session metadata")
+	var joined_context: PartyService.LobbyContext = joined.context
+	var joined_snapshot := service.snapshot(joined_context)
+	var joined_proof := service.joined_owner_proof(joined_context, 1)
+	test._check(joined_snapshot.play_origin == PartyService.PLAY_ORIGIN_PRIVATE
+		and String(joined_snapshot.private_session_id) == session_id
+		and bool(joined_proof.valid)
+		and String(joined_proof.play_origin)
+			== String(PartyService.PLAY_ORIGIN_PRIVATE)
+		and String(joined_proof.private_session_id) == session_id
+		and int(joined_proof.round) == 2,
+		"C-PRIVATE-INVITE guest snapshot and owner proof retain private identity")
+	await service.leave()
+	await _drain_clock(test, service.fake_clock, "C-PRIVATE invite")
+
+	var ordered_lobby := _private_lobby_fixture(
+		owner.entity_key,
+		guest.entity_key,
+		"private-invite-order",
+		session_id,
+		3,
+		PartyService.ARRANGED_PHASE_REMATCH,
+		[],
+		false)
+	ordered_lobby.block_member = true
+	var ordered_network := Doubles.Network.new()
+	ordered_network.local_peer.keys[1] = owner.entity_key.duplicate()
+	var ordered_service := Doubles.Party.new(ChatService.new())
+	ordered_service.configure_clock(ordered_service.fake_clock)
+	ordered_service.pf.multiplayer.lobby_by_connection[
+		ordered_lobby.connection_string] = ordered_lobby
+	ordered_service.pf.party.queued_networks.append(ordered_network)
+	var ordered_results: Array = []
+	_capture_connection_join(
+		ordered_service,
+		guest,
+		ordered_lobby.connection_string,
+		ordered_service.fake_clock.now_msec() + 45000,
+		ordered_results)
+	await _frames(test, 1)
+	test._check(ordered_results.is_empty()
+		and ordered_lobby.member_calls == 1
+		and ordered_service.pf.party.join_calls.is_empty(),
+		"C-PRIVATE-INVITE member metadata completes before Party entry")
+	ordered_lobby.block_member = false
+	ordered_lobby.member_released.emit()
+	await _frames(test, 3)
+	test._check(ordered_results.size() == 1
+		and bool((ordered_results[0] as Dictionary).get("ok", false))
+		and ordered_lobby.member_calls == 1
+		and ordered_lobby.update_calls == 0
+		and ordered_service.pf.party.join_calls.size() == 1,
+		"C-PRIVATE-INVITE successful Party return performs no later lobby write")
+	await ordered_service.leave()
+	await _drain_clock(
+		test, ordered_service.fake_clock, "C-PRIVATE invite ordering")
+
+	for refusal_label: String in [
+		"locked",
+		"starting",
+		"gameplay",
+		"public",
+		"migration",
+		"protocol",
+		"owner disconnected",
+		"malformed",
+		"stale session",
+	]:
+		var refusal_service := Doubles.Party.new(ChatService.new())
+		refusal_service.configure_clock(refusal_service.fake_clock)
+		var refusal_lobby := _private_lobby_fixture(
+			owner.entity_key,
+			guest.entity_key,
+			"private-refusal-" + refusal_label.replace(" ", "-"),
+			session_id,
+			2,
+			PartyService.ARRANGED_PHASE_REMATCH,
+			[],
+			false)
+		match refusal_label:
+			"locked":
+				refusal_lobby.membership_lock = \
+					PartyService.MEMBERSHIP_LOCK_LOCKED
+			"starting":
+				var starting_selected := _private_selected_group(
+					owner, "private-refusal-starting")
+				starting_selected[1] = guest.entity_key.duplicate()
+				refusal_lobby.properties.merge(
+					PartyService.encode_private_control(
+						session_id,
+						0,
+						PartyService.ARRANGED_PHASE_STARTING,
+						1,
+						starting_selected),
+					true)
+			"gameplay":
+				refusal_lobby.properties.merge(
+					PartyService.encode_private_control(
+						session_id,
+						2,
+						PartyService.ARRANGED_PHASE_GAMEPLAY),
+					true)
+			"public":
+				refusal_lobby.access_policy = \
+					PartyService.ACCESS_POLICY_PUBLIC
+			"migration":
+				refusal_lobby.owner_migration_policy = \
+					PartyService.OWNER_MIGRATION_AUTOMATIC
+			"protocol":
+				refusal_lobby.members[0].properties[
+					MatchmakingService.PROTOCOL_MEMBER_KEY] = "0.0"
+			"owner disconnected":
+				refusal_lobby.members[0].connection_status = 0
+			"malformed":
+				refusal_lobby.properties[
+					PartyService.PRIVATE_SESSION_ID_KEY] = "invalid"
+			"stale session":
+				refusal_lobby.members[1].properties = {
+					MatchmakingService.PROTOCOL_MEMBER_KEY:
+						NRProtocol.version_string(),
+					PartyService.PRIVATE_SESSION_ID_KEY:
+						"4023456789abcdef4023456789abcdef",
+				}
+		refusal_service.pf.multiplayer.lobby_by_connection[
+			refusal_lobby.connection_string] = refusal_lobby
+		var refused: Dictionary = \
+			await refusal_service.join_by_connection_string(
+				guest,
+				refusal_lobby.connection_string,
+				refusal_service.fake_clock.now_msec() + 45000)
+		test._check(not bool(refused.get("ok", false))
+			and String(refused.get("kind", ""))
+				== PartyService.LOBBY_KIND_PRIVATE
+			and refusal_service.pf.party.join_calls.is_empty()
+			and refusal_service.pf.multiplayer.arranged_calls.is_empty()
+			and refusal_lobby.leaves == 1,
+			"C-PRIVATE-INVITE %s is refused before Party entry" % \
+				refusal_label)
+		await _drain_clock(
+			test,
+			refusal_service.fake_clock,
+			"C-PRIVATE refusal " + refusal_label)
+
+	Services._matchmaking = previous_matchmaking
 
 
 func _s8_joined_owner_authority_without_flow(test: Node) -> void:
@@ -3636,6 +4901,8 @@ func _s8_joined_owner_authority_without_flow(test: Node) -> void:
 		1,
 		702,
 		staging_service.fake_clock.now_msec() + 1000)
+	(staging.context.peer as Doubles.Peer).keys[1] = \
+		staging_user.entity_key.duplicate()
 	var staging_proof := staging_service.joined_owner_proof(staging.context, 1)
 	test._check(bool(staging_proof.valid)
 		and bool(staging_proof.local_lobby_connected)
@@ -3646,8 +4913,12 @@ func _s8_joined_owner_authority_without_flow(test: Node) -> void:
 
 	var hosted_service := Doubles.Party.new(ChatService.new())
 	hosted_service.configure_clock(hosted_service.fake_clock)
+	var hosted_user := Doubles.User.new("owner-proof-hosted")
 	var hosted: Dictionary = await hosted_service.host(
-		Doubles.User.new("owner-proof-hosted"), 4, "deathmatch")
+		hosted_user, 4, "deathmatch")
+	var hosted_network: Doubles.Network = hosted_service.pf.party.networks[0]
+	(hosted_network.local_peer as Doubles.Peer).keys[1] = \
+		hosted_user.entity_key.duplicate()
 	var hosted_proof := hosted_service.joined_owner_proof(null, 1)
 	test._check(bool(hosted.get("ok", false)) and bool(hosted_proof.valid)
 		and bool(hosted_proof.local_lobby_connected)
@@ -3796,7 +5067,7 @@ func _legacy_guest_session_fixture(
 
 
 func _s8_invite_destinations(test: Node) -> void:
-	print("CASE: Phase 1 invite destinations preserve opaque strings and fence Party entry")
+	print("CASE: B-LATE arranged destinations distinguish rematch, cutoff, and unknown failure")
 	var previous_matchmaking: MatchmakingService = Services._matchmaking
 	Services._matchmaking = Doubles.Matchmaking.new()
 
@@ -3826,7 +5097,8 @@ func _s8_invite_destinations(test: Node) -> void:
 		and String(rematch.get("kind", "")) == PartyService.LOBBY_KIND_ARRANGED
 		and String(rematch.get("match_id", "")) == "invite-match"
 		and int(rematch.get("round", -1)) == 3
-		and int(rematch.get("expected_count", 0)) == 4,
+		and int(rematch.get("capacity", 0)) == 4
+		and int(rematch.get("selected_start_count", -1)) == 0,
 		"valid arranged rematch returns its named destination=%s" % rematch)
 	test._check(rematch_service.pf.multiplayer.join_calls == [exact_connection]
 		and rematch_service.pf.multiplayer.find_calls.is_empty(),
@@ -3895,10 +5167,29 @@ func _s8_invite_destinations(test: Node) -> void:
 		await _drain_clock(
 			test, refused_service.fake_clock, "S8 staging refusal " + String(refusal.label))
 
-	for phase: String in [
-		PartyService.ARRANGED_PHASE_BOOTSTRAP,
-		PartyService.ARRANGED_PHASE_GAMEPLAY,
+	for phase_case: Dictionary in [
+		{
+			"phase": PartyService.ARRANGED_PHASE_BOOTSTRAP,
+			"round": 0,
+			"generation": 0,
+			"selected": [],
+		},
+		{
+			"phase": PartyService.ARRANGED_PHASE_STARTING,
+			"round": 0,
+			"generation": 1,
+			"selected": [owner.entity_key, guest.entity_key],
+		},
+		{
+			"phase": PartyService.ARRANGED_PHASE_GAMEPLAY,
+			"round": 3,
+			"generation": 0,
+			"selected": [],
+		},
 	]:
+		var phase := String(phase_case.phase)
+		var phase_selected: Array[Dictionary] = []
+		phase_selected.assign(phase_case.selected)
 		var phase_service := Doubles.Party.new(ChatService.new())
 		phase_service.configure_clock(phase_service.fake_clock)
 		var phase_lobby := _arranged_lobby_fixture(
@@ -3906,7 +5197,11 @@ func _s8_invite_destinations(test: Node) -> void:
 		phase_lobby.search_properties[PartyService.LOBBY_KIND_KEY] = \
 			PartyService.LOBBY_KIND_ARRANGED
 		phase_lobby.properties.merge(PartyService.encode_arranged_control(
-			"invite-match", 3, phase), true)
+			"invite-match",
+			int(phase_case.round),
+			phase,
+			int(phase_case.generation),
+			phase_selected), true)
 		phase_lobby.properties[PartyService.DESCRIPTOR_KEY] = "phase-descriptor"
 		phase_lobby.members[0].properties = {
 			MatchmakingService.PROTOCOL_MEMBER_KEY: NRProtocol.version_string(),
@@ -3923,6 +5218,26 @@ func _s8_invite_destinations(test: Node) -> void:
 			and phase_lobby.leaves == 1,
 			"arranged %s invite is refused before Party" % phase)
 		await _drain_clock(test, phase_service.fake_clock, "S8 arranged " + phase)
+
+	var unknown_join := Doubles.Party.new(ChatService.new())
+	unknown_join.configure_clock(unknown_join.fake_clock)
+	unknown_join.pf.multiplayer.next_arranged_result = Doubles.Results.make(
+		false,
+		null,
+		"arranged_lobby_join_failed",
+		"Injected unproven arranged join failure.",
+		-2147467259)
+	var unknown_result: PartyService.PartyResult = await unknown_join.join_arranged(
+		guest,
+		"unknown-arrangement",
+		{},
+		MatchmakingService.SESSION_CAPACITY,
+		1,
+		499,
+		unknown_join.fake_clock.now_msec() + 1000)
+	test._check(not unknown_result.ok()
+		and unknown_result.reason_code == &"arranged_join_failed",
+		"B-LATE unproven native arranged failure keeps the stable unknown-cause code")
 
 	var protocol_service := Doubles.Party.new(ChatService.new())
 	protocol_service.configure_clock(protocol_service.fake_clock)
@@ -4013,6 +5328,7 @@ func _s9_multiplayer_invalidation(test: Node) -> void:
 		and current_attempt.is_pending(),
 		"late old-runtime callback neither cancels nor mutates new work")
 	matchmaking.retire(current_attempt)
+	current_ticket.publish_terminal(MatchmakingService.STATUS_CANCELLED)
 	await _frames(test, 2)
 	test._check(clock.armed_alarm_count() == 0,
 		"retiring the new attempt leaves no armed alarm")
@@ -4123,7 +5439,7 @@ func _s9_multiplayer_invalidation(test: Node) -> void:
 	Services._matchmaking = composed_matchmaking
 	Services.bind_party_signals()
 	var composed_ticket := Doubles.Ticket.new()
-	composed_ticket.block_cancel = true
+	composed_ticket.cancel_fault_unanswered = true
 	composed_matchmaking.sdk.queued_create_results.append(
 		Doubles.Results.make(true, composed_ticket))
 	var composed_attempt := composed_matchmaking.begin_create(
@@ -4488,6 +5804,117 @@ func _staging_lobby_fixture(
 	return lobby
 
 
+func _private_selected_group(
+	owner: Doubles.User,
+	prefix: String
+) -> Array[Dictionary]:
+	return [
+		owner.entity_key.duplicate(),
+		{"id": prefix + "-b", "type": "title_player_account"},
+		{"id": prefix + "-c", "type": "title_player_account"},
+		{"id": prefix + "-d", "type": "title_player_account"},
+	]
+
+
+func _private_staging_fixture(
+	service: Doubles.Party,
+	owner: Doubles.User,
+	label: String,
+	selected: Array[Dictionary]
+) -> Dictionary:
+	var opened: PartyService.PartyResult = await service.create_staging(
+		owner,
+		MatchmakingService.SESSION_CAPACITY,
+		"deathmatch",
+		1,
+		900,
+		service.fake_clock.now_msec() + 1000)
+	if not opened.ok():
+		return {}
+	var context: PartyService.LobbyContext = opened.context
+	var lobby: Doubles.Lobby = context.lobby
+	var network: Doubles.Network = context.network
+	var members: Array = []
+	for key: Dictionary in selected:
+		members.append(Doubles.Member.new(key, {
+			MatchmakingService.PROTOCOL_MEMBER_KEY:
+				NRProtocol.version_string(),
+			PartyService.MATCH_ORIGIN_MEMBER_KEY:
+				PartyService.MATCH_ORIGIN_VALUE,
+		}))
+	lobby.members = members
+	lobby.local_entity_key = owner.entity_key.duplicate()
+	lobby.membership_lock = PartyService.MEMBERSHIP_LOCK_LOCKED
+	lobby.properties[PartyService.SESSION_PHASE_KEY] = "private"
+	lobby.properties[PartyService.SEARCH_CONTROL_KEY] = \
+		PartyService.encode_search_control({
+			"epoch": 900,
+			"phase": "private",
+			"group": selected,
+		})
+	return {
+		"context": context,
+		"lobby": lobby,
+		"network": network,
+		"peer": context.peer,
+		"label": label,
+	}
+
+
+func _private_lobby_fixture(
+	owner_key: Dictionary,
+	local_key: Dictionary,
+	lobby_id: String,
+	session_id: String,
+	round: int,
+	phase: String,
+	selected: Array[Dictionary],
+	locked: bool
+) -> Doubles.Lobby:
+	var lobby := Doubles.Lobby.new()
+	lobby.lobby_id = lobby_id
+	lobby.connection_string = "connection-" + lobby_id
+	lobby.owner_entity_key = owner_key.duplicate()
+	lobby.local_entity_key = local_key.duplicate()
+	lobby.max_member_count = MatchmakingService.SESSION_CAPACITY
+	lobby.access_policy = PartyService.ACCESS_POLICY_PRIVATE
+	lobby.owner_migration_policy = PartyService.OWNER_MIGRATION_NONE
+	lobby.restrict_invites_to_lobby_owner = false
+	lobby.membership_lock = PartyService.MEMBERSHIP_LOCK_LOCKED \
+		if locked else PartyService.MEMBERSHIP_LOCK_UNLOCKED
+	lobby.search_properties = {
+		PartyService.LOBBY_KIND_KEY: PartyService.LOBBY_KIND_PRIVATE,
+		PartyService.GAME_MODE_KEY: "deathmatch",
+		NRProtocol.LOBBY_KEY: NRProtocol.version_string(),
+	}
+	lobby.properties = {
+		PartyService.DESCRIPTOR_KEY: "descriptor-" + lobby_id,
+	}
+	var control := PartyService.encode_private_control(
+		session_id,
+		round,
+		phase,
+		1 if round == 0 else 0,
+		selected)
+	lobby.properties.merge(control, true)
+	var member_keys: Array[Dictionary] = []
+	if selected.is_empty():
+		member_keys.append(owner_key.duplicate())
+		if owner_key != local_key:
+			member_keys.append(local_key.duplicate())
+	else:
+		member_keys.assign(selected)
+	for key: Dictionary in member_keys:
+		var properties := {
+			MatchmakingService.PROTOCOL_MEMBER_KEY:
+				NRProtocol.version_string(),
+		}
+		if selected.is_empty() and key == local_key:
+			properties = {}
+		lobby.members.append(Doubles.Member.new(key, properties))
+	return lobby
+
+
 func _mode_config(player_count: int) -> GameModeConfig:
 	var config := GameModeConfig.new()
 	config.mode_type = NRTypes.GameModeType.DEATHMATCH
@@ -4508,6 +5935,34 @@ func _capture_global_leave(service: Doubles.Party, results: Array) -> void:
 	results.append(true)
 
 
+func _capture_private_promotion(
+	service: Doubles.Party,
+	context: PartyService.LobbyContext,
+	session_id: String,
+	selected: Array[Dictionary],
+	deadline_msec: int,
+	results: Array
+) -> void:
+	results.append(await service.promote_staging_to_private(
+		context,
+		session_id,
+		selected,
+		deadline_msec))
+
+
+func _capture_connection_join(
+	service: Doubles.Party,
+	user: Doubles.User,
+	connection_string: String,
+	deadline_msec: int,
+	results: Array
+) -> void:
+	results.append(await service.join_by_connection_string(
+		user,
+		connection_string,
+		deadline_msec))
+
+
 func _capture_party_drain(
 	service: Doubles.Party,
 	deadline_msec: int,
@@ -4515,6 +5970,13 @@ func _capture_party_drain(
 ) -> void:
 	await service.drain_owned_work(deadline_msec)
 	results.append(true)
+
+
+func _capture_ticket_cancel(
+	ticket: Doubles.Ticket,
+	results: Array
+) -> void:
+	results.append(await ticket.cancel_async())
 
 
 func _capture_scoped_lobby_leave(
@@ -4681,7 +6143,7 @@ func _spec(
 	spec.account_generation = 1
 	spec.flow_epoch = epoch
 	spec.owner = true
-	spec.expected_match_count = 4
+	spec.capacity = MatchmakingService.SESSION_CAPACITY
 	spec.deadline_msec = Time.get_ticks_msec() + 600000
 	for member: Variant in members:
 		spec.frozen_members.append((member as Dictionary).duplicate())
@@ -4754,3 +6216,20 @@ func _drain_clock(test: Node, clock: Doubles.Clock, label: String) -> void:
 	test._check(clock.armed_alarm_count() == 0,
 		"%s: no deadline alarm remains armed (count=%d)" % [
 			label, clock.armed_alarm_count()])
+
+
+func _assert_matchmaking_case_clean(
+	test: Node,
+	service: Doubles.Matchmaking,
+	clock: Doubles.Clock,
+	label: String
+) -> void:
+	test._check(service.sdk.pending_cancel_waiters() == 0,
+		"%s: no native cancel observer remains pending (waiters=%d)" % [
+			label, service.sdk.pending_cancel_waiters()])
+	test._check(service.sdk.retained_cancel_results() == 0,
+		"%s: no cancel result retains a Ticket (retained=%d)" % [
+			label, service.sdk.retained_cancel_results()])
+	test._check(not service.has_pending_cleanup(),
+		"%s: MatchmakingService owns no pending cleanup" % label)
+	await _drain_clock(test, clock, label)

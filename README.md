@@ -80,12 +80,16 @@ identity and store. PC and console use the same `GameSaveService` / `GDK.game_sa
 backend; historical shared or `--pf-user` token files are never read, imported, moved or deleted.
 
 Hosted matches use **PlayFab Lobby discovery**. **Quick Match** uses **PlayFab Matchmaking**: the
-**Matchmaking** row above Host Match gathers a group of one to four in its own lobby, which readies
-up and searches the `godotnr_q` queue together, then plays the matched four-player game in a fresh
-private arranged session and stays together there for hosted rematches. When the queue, the
-PlayFab addon's matchmaking support or the four-player Deathmatch profile is missing, the row shows
-that reason and starts nothing. A full group of four is refused by the queue; see
-[Known issues](docs/known-issues.md#a-full-group-of-four-cannot-use-quick-match) and
+**Matchmaking** row above Host Match gathers a group of one to four in its own lobby. A group of
+one to three readies up and searches the `godotnr_q` queue together for a match of two to four
+players (capacity four), then plays the matched game in a fresh private arranged session and stays
+together there for hosted rematches. The matched game starts with the players who have arrived;
+one who arrives after it has started cannot join that round. A full group of four does not search:
+when all four are ready it starts a private match in the same lobby and stays together there for
+rematches in the same way; see [Private Start](docs/matchmaking.md#private-start). When the queue,
+the PlayFab addon's matchmaking support or the four-player Deathmatch profile is missing, the row
+shows that reason and starts nothing. See
+[Known issues](docs/known-issues.md#a-full-group-of-four-starts-a-private-match) and
 [Matchmaking](docs/matchmaking.md).
 Voice mute and typed-text privacy are separate. Text is in-match only: four recent messages,
 100 characters each, no persistence or scrollback, and no speech-to-text, text-to-speech or
