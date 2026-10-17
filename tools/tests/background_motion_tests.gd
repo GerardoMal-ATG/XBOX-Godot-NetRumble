@@ -1,7 +1,8 @@
 extends RefCounted
 
-## UIBackgroundMotion with the real Waves and Glow adapters: covered warm-up and retry, clocks, the
-## re-enable ramp, pauses, the F8/View shortcut and the exact static Off path.
+## UIBackgroundMotion with the real Waves and Glow adapters: covered warm-up and when it may retry,
+## clocks, the re-enable ramp, pauses including suspend, the F8/View shortcut and the exact static
+## Off path.
 ##
 ## Headless has no GPU frames, so after checking that the real renderer checks never wait for one,
 ## the suite turns on the controller's test_force_gpu seam and plays the renderer itself by
@@ -13,6 +14,8 @@ extends RefCounted
 ## screen-fixed noise, periodicity and hotspot range.
 
 const MainProbe := preload("res://tools/tests/review_main.gd")
+const Doubles := preload("res://tools/tests/doubles.gd")
+const Review := preload("res://tools/tests/review_lifecycle.gd")
 const WavesBackground := preload("res://scripts/ui/backgrounds/waves_background.gd")
 const GlowBackground := preload("res://scripts/ui/backgrounds/glow_background.gd")
 const GLOW_SHADER := "res://scripts/ui/backgrounds/glow.gdshader"
@@ -64,6 +67,16 @@ const HOTSPOT_RANGE_TOLERANCE := 0.25
 ## Monotonic budget for a windowed run to draw the frames each glow render needs.
 const FRAME_TIMEOUT_MSEC := 5000
 
+
+## Records, for every save write, whether background motion was already suspended.
+class SuspendOrderSaves extends Doubles.Saves:
+	var suspended_at_writes: Array[bool] = []
+
+	func write_now(user: Variant, generation: int, file_name: String, data: Variant) -> Dictionary:
+		suspended_at_writes.append(UIBackgroundMotion.is_suspended())
+		return super.write_now(user, generation, file_name, data)
+
+
 var _test: Node
 ## Stands in for a screen: ScreenManager hides a screen, or keeps it visible but disabled under a
 ## dialog, and the adapters underneath follow.
@@ -83,8 +96,10 @@ func run(test: Node) -> void:
 	_screen.name = "BackgroundMotionScreen"
 	_screen.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	test.add_child(_screen)
-	# Earlier suites leave the title constrained (a focus loss without its focus return).
+	# Earlier suites leave the title constrained or suspended (a focus loss or a suspend without its
+	# return).
 	UIBackgroundMotion.set_constrained(false)
+	UIBackgroundMotion.set_suspended(false)
 	UIBackgroundMotion.session_paused = false
 	UIBackgroundMotion.time_override = -1.0
 	PlayerProfile.animate_backgrounds = true
@@ -107,12 +122,14 @@ func run(test: Node) -> void:
 		await _dialog_and_hide_hold_the_clock()
 		await _nested_pause_reasons(waves, glow)
 		await _toggle_action(waves, glow)
+		await _suspend_freezes_motion(waves, glow)
 		await _motion_hint_follows_shortcut()
 
 	UIBackgroundMotion.test_force_gpu = false
 	UIBackgroundMotion.time_override = -1.0
 	UIBackgroundMotion.session_paused = false
 	UIBackgroundMotion.set_constrained(false)
+	UIBackgroundMotion.set_suspended(false)
 	PlayerProfile.animate_backgrounds = true
 	PlayerProfile.notify_settings_changed()
 	test.remove_child(_screen)
@@ -167,16 +184,17 @@ func _timeout_stays_static(waves: TextureRect, glow: ColorRect) -> void:
 
 
 func _focus_return_restores_motion(waves: TextureRect, glow: ColorRect) -> void:
-	print("CASE: after a timeout, focus (even a first one, never preceded by a focus loss) retries under a fresh opaque cover")
 	UIBackgroundMotion.seek_family_for_tests(UIBackgroundMotion.WAVES, 0.0)
 	UIBackgroundMotion.seek_family_for_tests(UIBackgroundMotion.GLOW, 0.0)
 	var old_container: Node = ScreenManager._container
 	var app: Node = preload("res://scenes/main.tscn").instantiate()
 	app.set_script(MainProbe)
 	_test.add_child(app)
-	# The probe skips main.gd's startup; mark that startup's (timed-out) warm-up as finished. A title
-	# launched minimised never had focus, so its first focus event is a FOCUS_IN with no FOCUS_OUT.
+	# The probe skips main.gd's startup; mark that startup's (timed-out) warm-up as finished.
 	app.set(&"_startup_background_prepare_complete", true)
+	await _retry_needs_front_end_background(app)
+	print("CASE: after a timeout, focus (even one never preceded by a focus loss) retries under a fresh opaque cover")
+	# A title launched minimised never had focus, so its focus events are FOCUS_IN with no FOCUS_OUT.
 	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
 	_check(not UIBackgroundMotion.is_constrained(), "a first focus leaves motion unconstrained")
 	await _frames(1)
@@ -218,6 +236,42 @@ func _focus_return_restores_motion(waves: TextureRect, glow: ColorRect) -> void:
 	_test.remove_child(app)
 	app.queue_free()
 	ScreenManager.set_container(old_container)
+
+
+## main.gd retries a failed warm-up under its cover only while a front-end background shows and no
+## gameplay is on the stack, so the cover never blacks out a match. It checks again when the
+## deferred retry runs, and a post-startup attempt that finds gameplay keeps its one try for later.
+func _retry_needs_front_end_background(app: Node) -> void:
+	print("CASE: a failed warm-up retries under a cover only over a front-end background, never over gameplay")
+	var gameplay := NRScreen.new()
+	gameplay.scene_file_path = ScreenManager.GAMEPLAY
+	ScreenManager._stack.append(gameplay)
+	_screen.visible = false
+	_check(not UIBackgroundMotion.front_end_background_visible(), "fixture: gameplay shows no front-end background")
+	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
+	await _frames(2)
+	_check(_retry_skipped(app), "focus during gameplay adds no cover and starts no warm-up")
+	app.call(&"_schedule_background_warm_up_retry", true)
+	await _frames(3)
+	_check(_retry_skipped(app) and app.get(&"_post_startup_background_retry_used") == false,
+		"a post-startup retry during gameplay adds no cover and keeps its one attempt")
+	# Even while a front-end background shows, gameplay anywhere on the stack blocks the retry.
+	_screen.visible = true
+	_check(UIBackgroundMotion.front_end_background_visible(), "fixture: a front-end background shows over gameplay")
+	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
+	await _frames(2)
+	_check(_retry_skipped(app), "gameplay anywhere on the stack blocks the retry, even under a front-end background")
+	ScreenManager._stack.erase(gameplay)
+	# Eligible when focus schedules the retry; gameplay replaces the front end before it runs.
+	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
+	ScreenManager._stack.append(gameplay)
+	_screen.visible = false
+	await _frames(2)
+	_check(_retry_skipped(app), "the retry checks again when it runs: no cover once gameplay has replaced the front end")
+	ScreenManager._stack.erase(gameplay)
+	gameplay.queue_free()
+	_screen.visible = true
+	await _frames(1)
 
 
 func _time_override_pins_pose(waves: TextureRect, glow: ColorRect) -> void:
@@ -517,6 +571,110 @@ func _toggle_action(waves: TextureRect, glow: ColorRect) -> void:
 	await _frames(1)
 
 
+## Suspension is its own pause reason. main.gd sets it once the suspend save is done and resume
+## clears only it: with no other reason, motion continues from the frozen pose without catching up
+## the suspended time, while a focus loss or an F8 pause still holds motion until it ends too.
+func _suspend_freezes_motion(waves: TextureRect, glow: ColorRect) -> void:
+	print("CASE: suspend saves first, then freezes both clocks and ramps until resume, with no focus change")
+	# The suspend and resume handlers stop and restart music; the headless test audio has no player.
+	var audio_script: Script = AudioManager.get_script()
+	AudioManager.set_script(Review.QuietAudio)
+	await _test._reset()
+	var store := SuspendOrderSaves.new()
+	Services._game_saves = store
+	_test._select("background-motion-suspend", _test._folder())
+	_check(await Services.sign_in(), "a ready account, so the suspend handler really saves")
+	var old_container: Node = ScreenManager._container
+	var app: Node = preload("res://scenes/main.tscn").instantiate()
+	app.set_script(MainProbe)
+	_test.add_child(app)
+	var seeked := Time.get_ticks_usec()
+	UIBackgroundMotion.seek_envelope_for_tests(UIBackgroundMotion.WAVES, RAMP_SECONDS * 0.5)
+	UIBackgroundMotion.seek_envelope_for_tests(UIBackgroundMotion.GLOW, RAMP_SECONDS * 0.25)
+	await _frames(1)
+	_check(_running_both() and _envelope(UIBackgroundMotion.WAVES) < 1.0 and _envelope(UIBackgroundMotion.GLOW) < 1.0,
+		"both families run, part-way up their ramps, before the suspend")
+	store.suspended_at_writes.clear()
+	app.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	var suspended := Time.get_ticks_usec()
+	_check(store.suspended_at_writes.size() >= 3 and not store.suspended_at_writes.has(true)
+		and UIBackgroundMotion.is_suspended(), "the suspend handler saves every payload before it suspends motion")
+	var waves_held := UIBackgroundMotion.time_for(UIBackgroundMotion.WAVES)
+	var glow_held := UIBackgroundMotion.time_for(UIBackgroundMotion.GLOW)
+	var waves_ramp := _envelope(UIBackgroundMotion.WAVES)
+	var glow_ramp := _envelope(UIBackgroundMotion.GLOW)
+	var waves_pose := _param(waves, &"t_phase")
+	var glow_pose := _param(glow, &"strength")
+	_check(_paused_both() and not UIBackgroundMotion.is_constrained() and not UIBackgroundMotion.session_paused
+		and waves.get_child_count() == 1 and not waves.is_processing()
+		and _param(glow, &"dither") == 1.0 and not glow.is_processing(),
+		"suspension alone, with no focus loss, freezes both families in their current pose")
+	await _wait(0.15)
+	_check(UIBackgroundMotion.time_for(UIBackgroundMotion.WAVES) == waves_held
+		and UIBackgroundMotion.time_for(UIBackgroundMotion.GLOW) == glow_held
+		and _param(waves, &"t_phase") == waves_pose and _param(glow, &"strength") == glow_pose,
+		"neither clock nor the drawn pose moves while the title is suspended")
+	_check(_envelope(UIBackgroundMotion.WAVES) == waves_ramp and _envelope(UIBackgroundMotion.GLOW) == glow_ramp,
+		"neither part-way ramp moves while the title is suspended")
+	var resumed := Time.get_ticks_usec()
+	app.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	_check(not UIBackgroundMotion.is_suspended()
+		and _resumed_from(UIBackgroundMotion.time_for(UIBackgroundMotion.WAVES), waves_held, resumed)
+		and _resumed_from(UIBackgroundMotion.time_for(UIBackgroundMotion.GLOW), glow_held, resumed),
+		"resume, with no focus change, clears suspension and both clocks continue from their frozen phases")
+	await _frames(1)
+	_check(_running_both() and waves.is_processing() and glow.is_processing(),
+		"with no other pause reason, both families run again after resume")
+	_check(await _advances(UIBackgroundMotion.WAVES, waves_held, resumed)
+		and await _advances(UIBackgroundMotion.GLOW, glow_held, resumed),
+		"both clocks really advance after resume")
+	# Each ramp ran from its seek until the suspend and again since the resume, never in between.
+	var before_suspend := float(suspended - seeked) / 1000000.0
+	var waves_bound := _smooth((RAMP_SECONDS * 0.5 + before_suspend + _elapsed(resumed)) / RAMP_SECONDS)
+	var glow_bound := _smooth((RAMP_SECONDS * 0.25 + before_suspend + _elapsed(resumed)) / RAMP_SECONDS)
+	_check(_envelope(UIBackgroundMotion.WAVES) > waves_ramp
+		and _envelope(UIBackgroundMotion.WAVES) <= waves_bound + UNIFORM_EPSILON
+		and _envelope(UIBackgroundMotion.GLOW) > glow_ramp
+		and _envelope(UIBackgroundMotion.GLOW) <= glow_bound + UNIFORM_EPSILON,
+		"both ramps continue from where the suspend froze them, without the suspended time")
+
+	print("CASE: resume clears only suspension; the F8 pause and a focus loss still hold motion until focus returns")
+	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_OUT)
+	UIBackgroundMotion.session_paused = true
+	app.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	var held := UIBackgroundMotion.time_for(UIBackgroundMotion.WAVES)
+	app.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	await _wait(0.1)
+	_check(not UIBackgroundMotion.is_suspended() and UIBackgroundMotion.is_constrained()
+		and UIBackgroundMotion.session_paused and _paused_both()
+		and UIBackgroundMotion.time_for(UIBackgroundMotion.WAVES) == held,
+		"resume leaves the focus loss and the session pause in place, so motion stays paused")
+	UIBackgroundMotion.session_paused = false
+	await _wait(0.05)
+	_check(UIBackgroundMotion.is_constrained() and _paused_both()
+		and UIBackgroundMotion.time_for(UIBackgroundMotion.WAVES) == held,
+		"after resume and the end of the session pause, the focus loss alone still holds the clock")
+	var focused := Time.get_ticks_usec()
+	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
+	await _frames(1)
+	_check(not UIBackgroundMotion.is_constrained() and _running_both()
+		and await _advances(UIBackgroundMotion.WAVES, held, focused),
+		"focus return, the last pause reason, runs motion again from the held phase")
+	# Each resume routed the probe to the sign-in screen; it goes with the probe.
+	ScreenManager.clear()
+	await _frames(1)
+	_test.remove_child(app)
+	app.queue_free()
+	ScreenManager.set_container(old_container)
+	UIBackgroundMotion.set_suspended(false)
+	UIBackgroundMotion.set_constrained(false)
+	UIBackgroundMotion.session_paused = false
+	await _test._reset()
+	AudioManager.set_script(audio_script)
+	PlayerProfile.apply_dict(PlayerProfile.to_dict())
+	await _frames(1)
+
+
 func _motion_hint_follows_shortcut() -> void:
 	print("CASE: the F8 / View hint on loading and the title shows exactly while the shortcut can act")
 	var old_container: Node = ScreenManager._container
@@ -776,6 +934,17 @@ func _has_warm_up_nodes() -> bool:
 		if _screen.get_node_or_null(path) != null:
 			return true
 	return false
+
+
+## True when main.gd added no retry cover and no warm-up runs or remains anywhere in the app, so
+## motion is still cold.
+func _retry_skipped(app: Node) -> bool:
+	if app.get_node_or_null(COVER_NAME) != null or UIBackgroundMotion.is_preparing() or UIBackgroundMotion.is_warmed():
+		return false
+	for path: NodePath in WARM_UP_NODES:
+		if app.find_child(String(path), true, false) != null:
+			return false
+	return true
 
 
 ## True once RenderingServer reports `count` drawn frames, false when `timeout_msec` passes on the

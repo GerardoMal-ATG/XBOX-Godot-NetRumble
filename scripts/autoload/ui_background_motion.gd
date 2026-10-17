@@ -45,6 +45,7 @@ var session_paused: bool = false:
 var test_force_gpu := false
 
 var _constrained := false
+var _suspended := false
 var _pipelines_warmed := false
 var _family_elapsed: Dictionary[StringName, float] = {}
 var _family_last_usec: Dictionary[StringName, int] = {}
@@ -115,6 +116,7 @@ func state_for(family: StringName) -> int:
 		time_override >= 0.0
 		or session_paused
 		or _constrained
+		or _suspended
 		or not _family_has_eligible_adapter(family)
 	):
 		return STATE_PAUSED
@@ -169,6 +171,19 @@ func is_constrained() -> bool:
 	return _constrained
 
 
+func set_suspended(value: bool) -> void:
+	if _suspended == value:
+		return
+	_sync_all_clocks()
+	_suspended = value
+	_recompute_all_clocks()
+	state_changed.emit()
+
+
+func is_suspended() -> bool:
+	return _suspended
+
+
 func is_warmed() -> bool:
 	return _pipelines_warmed
 
@@ -179,6 +194,10 @@ func is_preparing() -> bool:
 
 func shortcut_available() -> bool:
 	return _has_visible_enabled_background()
+
+
+func front_end_background_visible() -> bool:
+	return _has_visible_ui_background()
 
 
 func seek_family_for_tests(family: StringName, seconds: float) -> void:
@@ -394,6 +413,7 @@ func _recompute_family(family: StringName) -> void:
 		and time_override < 0.0
 		and not session_paused
 		and not _constrained
+		and not _suspended
 		and _family_has_eligible_adapter(family)
 	)
 	_family_last_usec[family] = Time.get_ticks_usec()

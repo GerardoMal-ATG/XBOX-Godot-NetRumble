@@ -117,16 +117,7 @@ func _remove_startup_cover(cover: CanvasLayer) -> void:
 
 
 func _retry_background_warm_up() -> void:
-	if (
-		_background_warmup_retrying
-		or UIBackgroundMotion.is_preparing()
-		or UIBackgroundMotion.is_warmed()
-		or _constrained
-		or _quit_pending
-		or _account_route_pending
-		or not _window_can_draw()
-		or (Services != null and Services.is_shutting_down())
-	):
+	if not _background_warm_up_retry_eligible():
 		return
 	_background_warmup_retrying = true
 	var retry_cover := _create_startup_cover()
@@ -151,10 +142,29 @@ func _run_scheduled_background_retry(post_startup: bool) -> void:
 		await get_tree().process_frame
 	_background_warmup_retry_scheduled = false
 	if post_startup:
-		if _post_startup_background_retry_used or not _window_can_draw():
+		if _post_startup_background_retry_used:
 			return
+	if not _background_warm_up_retry_eligible():
+		return
+	if post_startup:
 		_post_startup_background_retry_used = true
 	await _retry_background_warm_up()
+
+
+func _background_warm_up_retry_eligible() -> bool:
+	return (
+		not _background_warmup_retrying
+		and not UIBackgroundMotion.is_preparing()
+		and not UIBackgroundMotion.is_warmed()
+		and not UIBackgroundMotion.is_suspended()
+		and not _constrained
+		and not _quit_pending
+		and not _account_route_pending
+		and _window_can_draw()
+		and UIBackgroundMotion.front_end_background_visible()
+		and not ScreenManager.has_screen(ScreenManager.GAMEPLAY)
+		and (Services == null or not Services.is_shutting_down())
+	)
 
 
 func _window_can_draw() -> bool:
@@ -278,6 +288,9 @@ func _on_suspending() -> void:
 	var saved := false
 	if Services != null:
 		saved = Services.persist_for_suspend()
+	# Freeze presentation clocks only after the deadline-bound save has completed. Suspension is
+	# independent of Guide/focus constrain and resume clears only this reason.
+	UIBackgroundMotion.set_suspended(true)
 	# Then drop the session. Holding an open Party network and a bound MultiplayerPeer
 	# across a suspend leaves a peer that never reconnects and an RPC storm against a
 	# dead network; the match is not worth either.
@@ -292,6 +305,7 @@ func _on_suspending() -> void:
 ## awaiting them.
 func _on_resumed() -> void:
 	print("[Lifecycle] Resumed.")
+	UIBackgroundMotion.set_suspended(false)
 	if Services.is_shutting_down():
 		return
 	Services.invalidate_saves_for_resume()
