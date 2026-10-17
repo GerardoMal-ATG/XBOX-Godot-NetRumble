@@ -1,3 +1,5 @@
+// The subtract pass removes every atlas dot at its rest position. The add pass draws the same
+// patch after wave displacement, so both passes cancel when displacement and lighting are neutral.
 shader_type canvas_item;
 render_mode blend_sub;
 

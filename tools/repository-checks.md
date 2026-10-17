@@ -152,9 +152,16 @@ cannot fail it. Every resume or continue check waits briefly and requires real a
 the clock, or the ramp, must be strictly past its frozen value and within the measured elapsed
 time. A clock that stays frozen therefore fails. It covers:
 - the warm-up timeout falling back to static, with no cold activation afterwards;
-- the retry on a first focus, which needs no prior focus loss, through `main.gd`. Its cover must be
-  effectively visible, cover the whole viewport, be opaque #050505 and sit on a canvas layer above
-  every background and warm-up draw.
+- when `main.gd` retries a failed warm-up. A retry needs a visible front-end background and no
+  gameplay screen on the stack when it runs: focus during gameplay, or with gameplay under a
+  front-end background, adds no cover and starts no warm-up; a retry scheduled before gameplay
+  replaces the front end is refused when it runs; and a refused post-startup retry keeps its one
+  attempt. A first focus retries with no prior focus loss. A resume with no focus change routes to
+  the title and then retries: it waits under the one cover while an earlier warm-up is still in
+  flight and retries under a fresh cover once that warm-up fails, and its retry is refused over
+  gameplay or while the title is still constrained. Each cover must be effectively visible, cover
+  the whole viewport, be opaque #050505 and sit on a canvas layer above every background and
+  warm-up draw.
 - the deterministic `time_override` pose, and the glow's breath repeating exactly every 12 s;
 - Off as the exact static path;
 - the 3 s re-enable ramp. It starts at 0 after Off-to-On and after a sign-out reset, freezes while
@@ -167,16 +174,28 @@ time. A clock that stays frozen therefore fails. It covers:
 - phase continuity across swaps, with no rest-frame flash;
 - constrain, dialog and hidden-screen freezes without a jump;
 - nested pause reasons;
-- F8/View: it pauses and resumes without touching account data, does nothing without a visible
-  background, and leaves the session pause unchanged while motion is disabled.
-- `MotionHintLabel` on the loading and title screens, pushed through `ScreenManager`: visible while
-  running and while paused, hidden after Options Off, and visible again after On.
+- Ctrl+Shift+M / View: each pauses and resumes without touching account data, a held key repeat
+  does not toggle again, the shortcut does nothing without a visible background, and it leaves the
+  session pause unchanged while motion is disabled. Only the exact combination toggles: F8, M,
+  Shift+M, Ctrl+M and Ctrl+Shift+Alt+M do not, and m and Shift+M type into the focused join-code
+  field while motion keeps running.
+- suspend, through `main.gd`: every payload is saved before motion is suspended. Across a suspend
+  and a resume with no focus change, both clocks, both part-way ramps and the drawn poses hold
+  exactly, then continue without the suspended time. Resume clears only suspension, so the session
+  pause and a focus loss keep motion paused until focus returns.
+- `MotionHintLabel` on the loading and title screens, pushed through `ScreenManager`: it reads
+  "Ctrl+Shift+M / View pauses background motion", and is visible while running and while paused,
+  hidden after Options Off, and visible again after On.
 
-The UI suite checks that the title and loading screens carry `MotionHintLabel` ("F8 / View pauses
-background motion"), hidden while motion is disabled, and that on the title, F8 or View with motion
-disabled neither pauses anything nor starts sign-in.
+The UI suite checks that the title and loading screens carry `MotionHintLabel` with the PC wording
+("Ctrl+Shift+M / View pauses background motion"), hidden while motion is disabled. The hint uses
+the `MotionHint` theme type, opaque text of at least 26 px with no translucent modulate, and stays
+inside the 90 % title-safe area at the nine window sizes above. On the title, Ctrl+Shift+M or View
+with motion disabled neither pauses anything nor starts sign-in. The main menu's Options shows the
+note "Ctrl+Shift+M / View pauses background motion for this session." within the list's width.
 
-`save_tests.gd` covers the presentation sidecar and the Options row with its F8/View note:
+`save_tests.gd` covers the presentation sidecar and the Options row with its Ctrl+Shift+M / View
+note:
 - default, reset, round trip and account isolation;
 - missing (On), damaged (Off, with core settings kept and the sidecar replaced by the next save),
   and failed writes (reported, then retried);
@@ -220,10 +239,12 @@ With `-ScreenshotDirectory`, the suite also renders the glow on the GPU at 1920x
 - **Hotspot range.** On a 32x32 window at the hotspot, t = 3 s minus t = 9 s matches the
   breathing range of the design's float composite within 0.25 code values per channel.
 
-Three checks stay manual because they need the design files or a GPU profiler: the ship card's
-match with the design, banding while the backgrounds animate, and the added GPU cost of
-background motion, which must stay within 0.25 ms at 1080p and 0.75 ms at 4K. No automated check
-covers them.
+Four checks stay manual because they need the design files, renders or a GPU profiler: the ship
+card's match with the design, banding while the backgrounds animate, the hint's contrast against
+the animated backdrop (at least 4.5:1), and the added GPU cost of background motion, which must
+stay within 0.25 ms at 1080p and 0.75 ms at 4K. No automated check covers them. The
+[manual test plan](../docs/manual-test-plan.md#background-motion) lists them with the editor and
+console checks.
 
 The Waves per-dot data (`Waves_DotData.res`, `Waves_DotMultiMesh.res`) was baked once from the
 design's dot positions and is committed as data; it must load in Godot 4.6.2 and 4.7.2, and

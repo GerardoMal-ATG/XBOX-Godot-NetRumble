@@ -1,3 +1,5 @@
+// The base pass draws the raster and replaces its rest strand contribution with an
+// inverse-mapped, wave-displaced sample. The subtract/add dot passes cancel exactly at rest.
 shader_type canvas_item;
 
 #include "res://scripts/ui/backgrounds/wave_field.gdshaderinc"

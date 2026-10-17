@@ -1,4 +1,5 @@
-// Three-wave surface field. Time arrives only through explicit uniforms.
+// Shared by the strand and dot-add passes: returns design-space displacement and lighting for a
+// three-wave surface. Time arrives only through explicit uniforms.
 uniform float t_phase = 0.0;
 uniform float ease = 0.0;
 const float WF_AMAX = 24.0;

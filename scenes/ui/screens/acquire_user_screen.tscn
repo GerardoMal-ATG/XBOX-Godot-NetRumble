@@ -115,16 +115,13 @@ row_separation = 6
 
 [node name="MotionHintLabel" type="Label" parent="."]
 layout_mode = 1
-anchor_top = 1.0
-anchor_bottom = 1.0
-offset_left = 80.0
-offset_top = -52.0
-offset_right = 650.0
-offset_bottom = -20.0
+anchor_left = 0.05
+anchor_top = 0.95
+anchor_right = 0.95
+anchor_bottom = 0.95
+offset_top = -40.0
 grow_vertical = 0
 mouse_filter = 2
-modulate = Color(1, 1, 1, 0.55)
-theme_type_variation = &"TitleDetail"
-text = "F8 / View pauses background motion"
+theme_type_variation = &"MotionHint"
 vertical_alignment = 1
 script = ExtResource("3_motion_hint")

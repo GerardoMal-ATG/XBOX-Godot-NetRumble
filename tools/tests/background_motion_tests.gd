@@ -1,8 +1,8 @@
 extends RefCounted
 
 ## UIBackgroundMotion with the real Waves and Glow adapters: covered warm-up and when it may retry,
-## clocks, the re-enable ramp, pauses including suspend, the F8/View shortcut and the exact static
-## Off path.
+## clocks, the re-enable ramp, pauses including suspend, the Ctrl+Shift+M / View shortcut and the
+## exact static Off path.
 ##
 ## Headless has no GPU frames, so after checking that the real renderer checks never wait for one,
 ## the suite turns on the controller's test_force_gpu seam and plays the renderer itself by
@@ -16,6 +16,7 @@ extends RefCounted
 const MainProbe := preload("res://tools/tests/review_main.gd")
 const Doubles := preload("res://tools/tests/doubles.gd")
 const Review := preload("res://tools/tests/review_lifecycle.gd")
+const JOIN_CODE_ENTRY := preload("res://scenes/ui/elements/nr_join_code_entry.tscn")
 const WavesBackground := preload("res://scripts/ui/backgrounds/waves_background.gd")
 const GlowBackground := preload("res://scripts/ui/backgrounds/glow_background.gd")
 const GLOW_SHADER := "res://scripts/ui/backgrounds/glow.gdshader"
@@ -91,6 +92,11 @@ func run(test: Node) -> void:
 	var render_ui_assets: bool = Assets.render_ui_assets
 	# The Waves adapter validates the real dot atlas and strand textures.
 	Assets.render_ui_assets = true
+	# The suspend and resume handlers stop and restart music; the headless test audio has no player.
+	var audio_script: Script = AudioManager.get_script()
+	AudioManager.set_script(Review.QuietAudio)
+	# No account is ready, so a resume routes to the title.
+	await _test._reset()
 	ScreenManager.clear()
 	_screen = Control.new()
 	_screen.name = "BackgroundMotionScreen"
@@ -122,6 +128,7 @@ func run(test: Node) -> void:
 		await _dialog_and_hide_hold_the_clock()
 		await _nested_pause_reasons(waves, glow)
 		await _toggle_action(waves, glow)
+		await _shortcut_needs_exact_keys()
 		await _suspend_freezes_motion(waves, glow)
 		await _motion_hint_follows_shortcut()
 
@@ -135,6 +142,8 @@ func run(test: Node) -> void:
 	test.remove_child(_screen)
 	_screen.queue_free()
 	Assets.render_ui_assets = render_ui_assets
+	AudioManager.set_script(audio_script)
+	PlayerProfile.apply_dict(PlayerProfile.to_dict())
 	await _frames(1)
 
 
@@ -158,10 +167,10 @@ func _timeout_stays_static(waves: TextureRect, glow: ColorRect) -> void:
 		and not UIBackgroundMotion.is_warmed() and not _has_warm_up_nodes(),
 		"without drawn frames the warm-up times out, removes its draws and stays cold")
 	_assert_static(waves, glow, "after the warm-up timeout")
-	_press_key(KEY_F8)
+	_press_shortcut()
 	_press_joy(JOY_BUTTON_BACK)
 	_check(not UIBackgroundMotion.session_paused,
-		"F8 and View leave the session pause alone while motion is disabled (not warmed)")
+		"Ctrl+Shift+M and View leave the session pause alone while motion is disabled (not warmed)")
 
 	print("CASE: after a timeout nothing starts motion cold")
 	for frame in 5:
@@ -193,6 +202,7 @@ func _focus_return_restores_motion(waves: TextureRect, glow: ColorRect) -> void:
 	# The probe skips main.gd's startup; mark that startup's (timed-out) warm-up as finished.
 	app.set(&"_startup_background_prepare_complete", true)
 	await _retry_needs_front_end_background(app)
+	await _resume_retry_avoids_gameplay(app)
 	print("CASE: after a timeout, focus (even one never preceded by a focus loss) retries under a fresh opaque cover")
 	# A title launched minimised never had focus, so its focus events are FOCUS_IN with no FOCUS_OUT.
 	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
@@ -202,6 +212,12 @@ func _focus_return_restores_motion(waves: TextureRect, glow: ColorRect) -> void:
 	_check(not UIBackgroundMotion.is_warmed() and _state(UIBackgroundMotion.WAVES) == UIBackgroundMotion.STATE_DISABLED,
 		"the retried warm-up runs behind the cover while backgrounds stay static")
 	_assert_static(waves, glow, "while the retry warms")
+	await _resume_waits_for_warm_up(app)
+	print("CASE: focus return after that resume retries under a fresh cover, and drawn frames complete it")
+	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
+	_check(not UIBackgroundMotion.is_constrained(), "focus return lifts the constrain")
+	await _frames(1)
+	_assert_cover(app, "the retry on focus return")
 	var before_warm := Time.get_ticks_usec()
 	var warmed := await _draw_until_warmed()
 	_check(warmed and app.get_node_or_null(COVER_NAME) == null,
@@ -233,9 +249,61 @@ func _focus_return_restores_motion(waves: TextureRect, glow: ColorRect) -> void:
 	await _frames(1)
 	_check(not UIBackgroundMotion.is_constrained() and app.get_node_or_null(COVER_NAME) == null and _running_both(),
 		"once warmed, focus return resumes motion without another covered warm-up")
+	# Each resume routed the probe to the title; it goes with the probe.
+	ScreenManager.clear()
+	await _frames(1)
 	_test.remove_child(app)
 	app.queue_free()
 	ScreenManager.set_container(old_container)
+
+
+## A resume routes to the title or menu and then retries a failed warm-up, but the retry still
+## refuses a stack that holds gameplay when it runs.
+func _resume_retry_avoids_gameplay(app: Node) -> void:
+	print("CASE: resume without a focus change retries a failed warm-up only off gameplay")
+	var gameplay := NRScreen.new()
+	gameplay.scene_file_path = ScreenManager.GAMEPLAY
+	# Gameplay joins the stack as soon as resume's route lands, before the retry it schedules runs.
+	var add_gameplay := func(_pushed: NRScreen) -> void:
+		if not ScreenManager._stack.has(gameplay):
+			ScreenManager._stack.append(gameplay)
+	ScreenManager.screen_pushed.connect(add_gameplay)
+	app.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	app.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	await _frames(4)
+	ScreenManager.screen_pushed.disconnect(add_gameplay)
+	_check(ScreenManager.has_screen(ScreenManager.ACQUIRE_USER) and _retry_skipped(app),
+		"with gameplay on the stack, the retry after resume adds no cover and starts no warm-up")
+	ScreenManager._stack.erase(gameplay)
+	gameplay.queue_free()
+	await _frames(1)
+
+
+## Resume schedules its retry only once a warm-up still in flight has finished, so it neither stacks
+## a second cover nor loses the retry. The retry still checks, when it runs, that the title is not
+## constrained.
+func _resume_waits_for_warm_up(app: Node) -> void:
+	print("CASE: resume without a focus change waits for the warm-up in flight, then retries under a fresh cover")
+	app.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	app.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	await _frames(4)
+	_check(ScreenManager.has_screen(ScreenManager.ACQUIRE_USER) and UIBackgroundMotion.is_preparing()
+		and _covers(app) == 1, "resume routes to the title and waits under the one cover while the earlier warm-up runs")
+	_fail_warm_up(app)
+	await _frames(4)
+	_assert_cover(app, "the retry after resume")
+	_check(UIBackgroundMotion.is_preparing() and not UIBackgroundMotion.is_warmed() and _covers(app) == 1
+		and _warm_up_drawing(app), "once that warm-up fails, resume retries under a fresh cover")
+
+	print("CASE: resume without a focus change refuses its retry while the title is still constrained")
+	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_OUT)
+	app.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	app.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	await _frames(4)
+	_fail_warm_up(app)
+	await _frames(4)
+	_check(UIBackgroundMotion.is_constrained() and _retry_skipped(app),
+		"while the Guide still constrains the title, the warm-up that fails after resume is followed by no retry")
 
 
 ## main.gd retries a failed warm-up under its cover only while a front-end background shows and no
@@ -312,8 +380,8 @@ func _off_is_exact_static(waves: TextureRect, glow: ColorRect) -> void:
 	_assert_static(waves, glow, "with Animated Backgrounds Off")
 	await _frames(2)
 	_assert_static(waves, glow, "two frames after Off")
-	_press_key(KEY_F8)
-	_check(not UIBackgroundMotion.session_paused, "F8 leaves the session pause alone while Off")
+	_press_shortcut()
+	_check(not UIBackgroundMotion.session_paused, "Ctrl+Shift+M leaves the session pause alone while Off")
 	PlayerProfile.animate_backgrounds = true
 	PlayerProfile.notify_settings_changed()
 	await _frames(1)
@@ -541,22 +609,24 @@ func _nested_pause_reasons(waves: TextureRect, glow: ColorRect) -> void:
 
 
 func _toggle_action(waves: TextureRect, glow: ColorRect) -> void:
-	print("CASE: F8 / View pauses and resumes motion for the session with a frozen pose")
+	print("CASE: Ctrl+Shift+M / View pauses and resumes motion for the session with a frozen pose")
 	var profile := PlayerProfile.to_dict()
-	_press_key(KEY_F8)
-	_check(UIBackgroundMotion.session_paused and _paused_both(), "F8 pauses background motion")
+	_press_shortcut()
+	_check(UIBackgroundMotion.session_paused and _paused_both(), "Ctrl+Shift+M pauses background motion")
 	var held := UIBackgroundMotion.time_for(UIBackgroundMotion.WAVES)
 	await _wait(0.1)
 	_check(UIBackgroundMotion.time_for(UIBackgroundMotion.WAVES) == held and waves.get_child_count() == 1
 		and not waves.is_processing() and _param(glow, &"dither") == 1.0 and not glow.is_processing(),
-		"the F8 pause holds a frozen pose, not the static design")
+		"the Ctrl+Shift+M pause holds a frozen pose, not the static design")
 	var echo := InputEventKey.new()
-	echo.keycode = KEY_F8
-	echo.physical_keycode = KEY_F8
+	echo.keycode = KEY_M
+	echo.physical_keycode = KEY_M
+	echo.ctrl_pressed = true
+	echo.shift_pressed = true
 	echo.pressed = true
 	echo.echo = true
 	_test.get_viewport().push_input(echo, true)
-	_check(UIBackgroundMotion.session_paused, "a held F8 (key repeat) does not toggle again")
+	_check(UIBackgroundMotion.session_paused, "a held Ctrl+Shift+M (key repeat) does not toggle again")
 	var resumed := Time.get_ticks_usec()
 	_press_joy(JOY_BUTTON_BACK)
 	_check(not UIBackgroundMotion.session_paused, "View resumes background motion")
@@ -565,20 +635,58 @@ func _toggle_action(waves: TextureRect, glow: ColorRect) -> void:
 	_check(await _advances(UIBackgroundMotion.WAVES, held, resumed), "the Waves clock really advances after View")
 	_check(PlayerProfile.to_dict() == profile, "the session pause never changes account settings")
 	_screen.visible = false
-	_press_key(KEY_F8)
-	_check(not UIBackgroundMotion.session_paused, "F8 does nothing while no UI background is visible")
+	_press_shortcut()
+	_check(not UIBackgroundMotion.session_paused, "Ctrl+Shift+M does nothing while no UI background is visible")
 	_screen.visible = true
 	await _frames(1)
 
 
+## The keyboard shortcut is exactly Ctrl+Shift+M: any other key or set of modifiers passes through,
+## so the letter typed into a text field still reaches it.
+func _shortcut_needs_exact_keys() -> void:
+	print("CASE: only exactly Ctrl+Shift+M, or View, toggles the pause; typing M into the join code is unaffected")
+	_press_shortcut()
+	_check(UIBackgroundMotion.session_paused, "Ctrl+Shift+M toggles the session pause on")
+	_press_shortcut()
+	_check(not UIBackgroundMotion.session_paused, "Ctrl+Shift+M toggles the session pause off again")
+	_press_joy(JOY_BUTTON_BACK)
+	_check(UIBackgroundMotion.session_paused, "View toggles the session pause on")
+	_press_joy(JOY_BUTTON_BACK)
+	_check(not UIBackgroundMotion.session_paused, "View toggles the session pause off again")
+	# Each entry: key, Ctrl, Shift, Alt.
+	var near_misses := {
+		"F8": [KEY_F8, false, false, false],
+		"M": [KEY_M, false, false, false],
+		"Shift+M": [KEY_M, false, true, false],
+		"Ctrl+M": [KEY_M, true, false, false],
+		"Ctrl+Shift+Alt+M": [KEY_M, true, true, true],
+	}
+	for combo: String in near_misses:
+		var keys: Array = near_misses[combo]
+		_press_key(keys[0], keys[1], keys[2], keys[3])
+		_check(not UIBackgroundMotion.session_paused, combo + " does not toggle the pause")
+	var entry := JOIN_CODE_ENTRY.instantiate() as Control
+	_screen.add_child(entry)
+	await _frames(2)
+	var field := entry.find_child("LineEdit", true, false) as LineEdit
+	_check(field != null and field.has_focus() and field.is_editing(), "fixture: the join-code field is focused for typing")
+	_press_key(KEY_M, false, false, false, "m".unicode_at(0))
+	_press_key(KEY_M, false, true, false, "M".unicode_at(0))
+	_check(not UIBackgroundMotion.session_paused, "m and Shift+M in the join-code field never toggle the session pause")
+	# LineEdit reports the edit on the next frame, when the entry upper-cases the code.
+	await _frames(1)
+	_check(field != null and field.text == "MM", "m and Shift+M type into the join-code field")
+	_free(entry)
+	await _frames(1)
+	_check(not UIBackgroundMotion.session_paused and _running_both(),
+		"after typing into the join-code field, both families still run with no session pause")
+
+
 ## Suspension is its own pause reason. main.gd sets it once the suspend save is done and resume
 ## clears only it: with no other reason, motion continues from the frozen pose without catching up
-## the suspended time, while a focus loss or an F8 pause still holds motion until it ends too.
+## the suspended time, while a focus loss or the session pause still holds motion until it ends too.
 func _suspend_freezes_motion(waves: TextureRect, glow: ColorRect) -> void:
 	print("CASE: suspend saves first, then freezes both clocks and ramps until resume, with no focus change")
-	# The suspend and resume handlers stop and restart music; the headless test audio has no player.
-	var audio_script: Script = AudioManager.get_script()
-	AudioManager.set_script(Review.QuietAudio)
 	await _test._reset()
 	var store := SuspendOrderSaves.new()
 	Services._game_saves = store
@@ -638,7 +746,7 @@ func _suspend_freezes_motion(waves: TextureRect, glow: ColorRect) -> void:
 		and _envelope(UIBackgroundMotion.GLOW) <= glow_bound + UNIFORM_EPSILON,
 		"both ramps continue from where the suspend froze them, without the suspended time")
 
-	print("CASE: resume clears only suspension; the F8 pause and a focus loss still hold motion until focus returns")
+	print("CASE: resume clears only suspension; the session pause and a focus loss still hold motion until focus returns")
 	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_OUT)
 	UIBackgroundMotion.session_paused = true
 	app.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
@@ -670,13 +778,11 @@ func _suspend_freezes_motion(waves: TextureRect, glow: ColorRect) -> void:
 	UIBackgroundMotion.set_constrained(false)
 	UIBackgroundMotion.session_paused = false
 	await _test._reset()
-	AudioManager.set_script(audio_script)
-	PlayerProfile.apply_dict(PlayerProfile.to_dict())
 	await _frames(1)
 
 
 func _motion_hint_follows_shortcut() -> void:
-	print("CASE: the F8 / View hint on loading and the title shows exactly while the shortcut can act")
+	print("CASE: the Ctrl+Shift+M / View hint on loading and the title shows exactly while the shortcut can act")
 	var old_container: Node = ScreenManager._container
 	ScreenManager.set_container(_screen)
 	for path: String in [ScreenManager.LOADING, ScreenManager.ACQUIRE_USER]:
@@ -687,12 +793,12 @@ func _motion_hint_follows_shortcut() -> void:
 		var hint: Label = null
 		if screen != null:
 			hint = screen.find_child("MotionHintLabel", true, false) as Label
-		_check(hint != null and UIBackgroundMotion.shortcut_available() and hint.is_visible_in_tree(),
-			label + " shows the hint while motion runs")
+		_check(hint != null and UIBackgroundMotion.shortcut_available() and hint.is_visible_in_tree()
+			and hint.text == "Ctrl+Shift+M / View pauses background motion", label + " shows the hint while motion runs")
 		if hint == null:
 			continue
 		UIBackgroundMotion.session_paused = true
-		_check(hint.is_visible_in_tree(), label + " keeps the hint while paused, so F8 / View can resume")
+		_check(hint.is_visible_in_tree(), label + " keeps the hint while paused, so Ctrl+Shift+M / View can resume")
 		UIBackgroundMotion.session_paused = false
 		PlayerProfile.animate_backgrounds = false
 		PlayerProfile.notify_settings_changed()
@@ -947,6 +1053,30 @@ func _retry_skipped(app: Node) -> bool:
 	return true
 
 
+## The warm-up covers main.gd has in place; a second one would take a generated name.
+func _covers(app: Node) -> int:
+	var count := 0
+	for child: Node in app.get_children():
+		if child is CanvasLayer and String(child.name).contains(String(COVER_NAME)):
+			count += 1
+	return count
+
+
+## Ends the warm-up in flight as a failure on its next frame, as if its draws never reached the
+## screen: the controller only counts frames while its warm-up nodes stay visible.
+func _fail_warm_up(app: Node) -> void:
+	var warm_up := app.find_child(String(WARM_UP_NODES[0]), true, false) as CanvasItem
+	_check(warm_up != null, "fixture: a warm-up is in flight")
+	if warm_up != null:
+		warm_up.hide()
+
+
+## True while a warm-up's Waves draw is in the app and visible, as a newly started warm-up's is.
+func _warm_up_drawing(app: Node) -> bool:
+	var warm_up := app.find_child(String(WARM_UP_NODES[0]), true, false) as CanvasItem
+	return warm_up != null and warm_up.is_visible_in_tree()
+
+
 ## True once RenderingServer reports `count` drawn frames, false when `timeout_msec` passes on the
 ## monotonic clock first. It never awaits frame_post_draw itself, so a window that stops drawing
 ## fails the case instead of hanging the suite, and the counter is always disconnected.
@@ -1067,15 +1197,26 @@ func _shader_path(item: CanvasItem) -> String:
 	return shader_material.shader.resource_path
 
 
-func _press_key(key: Key) -> void:
+## A press and release of `key` with the given modifiers, as a keyboard reports them; `unicode` is
+## the character the press types, or 0.
+func _press_key(key: Key, ctrl := false, shift := false, alt := false, unicode := 0) -> void:
 	var event := InputEventKey.new()
 	event.keycode = key
 	event.physical_keycode = key
+	event.ctrl_pressed = ctrl
+	event.shift_pressed = shift
+	event.alt_pressed = alt
+	event.unicode = unicode
 	event.pressed = true
 	_test.get_viewport().push_input(event, true)
 	var release := event.duplicate() as InputEventKey
 	release.pressed = false
 	_test.get_viewport().push_input(release, true)
+
+
+## The keyboard pause shortcut, Ctrl+Shift+M.
+func _press_shortcut() -> void:
+	_press_key(KEY_M, true, true)
 
 
 func _press_joy(button: JoyButton) -> void:

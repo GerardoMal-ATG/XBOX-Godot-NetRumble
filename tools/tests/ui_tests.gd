@@ -92,7 +92,14 @@ const GLOW_ADAPTER := "res://scripts/ui/backgrounds/glow_background.gd"
 const GLOW_SHADER := "res://scripts/ui/backgrounds/glow.gdshader"
 const SHIP_CARD_SHADER := "res://assets/ui/ship_card.gdshader"
 const UI_THEME := "res://assets/ui/netrumble.tres"
-const MOTION_HINT_TEXT := "F8 / View pauses background motion"
+## The PC wording; on console the hint and the Options note name only View.
+const MOTION_HINT_TEXT := "Ctrl+Shift+M / View pauses background motion"
+const OPTIONS_MOTION_NOTE := "Ctrl+Shift+M / View pauses background motion for this session."
+const MOTION_HINT_MIN_FONT_SIZE := 26
+## Title-safe area: the middle 90 % of the viewport on each axis.
+const TITLE_SAFE_MARGIN := 0.05
+## Sub-pixel slack for a hint aligned exactly on the title-safe edge.
+const TITLE_SAFE_SLACK := 0.5
 ## Monotonic budget for a windowed run to draw the frame a screenshot needs.
 const FRAME_TIMEOUT_MSEC := 5000
 
@@ -156,15 +163,15 @@ func _acquisition(test: Node) -> void:
 	await _capture(test, "title")
 	await _branding(test, screen, "title", TITLE_BRANDING)
 	await _glow_background(test, screen, "title")
-	_motion_hint(test, screen, "title")
-	# Nothing warms motion in this suite, so it is disabled: F8 and View are consumed without
-	# pausing anything, and neither reaches the press prompt as a sign-in key.
+	await _motion_hint(test, screen, "title")
+	# Nothing warms motion in this suite, so it is disabled: Ctrl+Shift+M and View are consumed
+	# without pausing anything, and neither reaches the press prompt as a sign-in key.
 	test._check(not UIBackgroundMotion.effective_enabled(), "background motion is disabled in this suite")
-	await _key(test, KEY_F8)
+	await _key(test, KEY_M, true, true)
 	await _joy(test, JOY_BUTTON_BACK)
 	test._check(screen._state == screen.State.WAITING_FOR_INPUT and not Services.is_signing_in()
 		and not UIBackgroundMotion.session_paused,
-		"F8 and View neither pause disabled motion nor start sign-in from the title")
+		"Ctrl+Shift+M and View neither pause disabled motion nor start sign-in from the title")
 	await _key(test, KEY_SHIFT)
 	test._check(screen._state == screen.State.WAITING_FOR_INPUT,
 		"a modifier alone cannot raise the account picker")
@@ -267,6 +274,14 @@ func _main_menu(test: Node) -> void:
 	test._check(menu._in_options and not menu._secondary_actions.visible,
 		"Options has its own focus scope without hidden footer targets")
 	_inside(test, menu._menu_scroll, "Options scroll region")
+	var motion_note: Label = null
+	for note: Node in menu._menu_list.find_children("*", "Label", true, false):
+		if (note as Label).text == OPTIONS_MOTION_NOTE:
+			motion_note = note as Label
+	test._check(motion_note != null and motion_note.focus_mode == Control.FOCUS_NONE
+		and motion_note.get_global_rect().position.x >= menu._menu_scroll.get_global_rect().position.x
+		and motion_note.get_global_rect().end.x <= menu._menu_scroll.get_global_rect().end.x,
+		"Options names Ctrl+Shift+M / View as the session pause, within the list's width")
 	await _capture(test, "options")
 	await _key(test, KEY_ESCAPE)
 	await _settle(test)
@@ -288,7 +303,7 @@ func _loading(test: Node) -> void:
 	await _capture(test, "loading")
 	await _branding(test, loading, "loading", LOADING_BRANDING, "RingsRoot/Ring")
 	await _waves_background(test, loading, "loading")
-	_motion_hint(test, loading, "loading")
+	await _motion_hint(test, loading, "loading")
 	var cancellations: Array[bool] = []
 	loading.cancelled.connect(func() -> void: cancellations.append(true))
 	await _key(test, KEY_ESCAPE)
@@ -1034,10 +1049,12 @@ func _settle(test: Node) -> void:
 	await test.get_tree().process_frame
 
 
-func _key(test: Node, key: Key) -> void:
+func _key(test: Node, key: Key, ctrl := false, shift := false) -> void:
 	var event := InputEventKey.new()
 	event.keycode = key
 	event.physical_keycode = key
+	event.ctrl_pressed = ctrl
+	event.shift_pressed = shift
 	event.pressed = true
 	test.get_viewport().push_input(event, true)
 	event = event.duplicate()
@@ -1075,17 +1092,48 @@ func _drawn_frames(test: Node, count: int, timeout_msec: int) -> bool:
 	return drawn[0] >= count
 
 
-## Acquisition and loading name the session pause shortcut, unobtrusively and without input. The
-## hint shows only while the shortcut can act; nothing warms motion in this suite, so it is hidden.
+## Acquisition and loading name the session pause shortcut in a hint that takes no input, stays
+## legible over the animated backdrop and sits inside title-safe at every window shape. The hint
+## shows only while the shortcut can act; nothing warms motion in this suite, so it is hidden here.
 func _motion_hint(test: Node, screen: Control, name: String) -> void:
+	print("CASE: %s motion hint names Ctrl+Shift+M / View in its MotionHint style inside title-safe" % name)
 	var hint := screen.find_child("MotionHintLabel", true, false) as Label
 	test._check(hint != null and hint.text == MOTION_HINT_TEXT
+		and UIBackgroundMotion.pause_shortcut_label() == "Ctrl+Shift+M / View"
 		and hint.mouse_filter == Control.MOUSE_FILTER_IGNORE and hint.focus_mode == Control.FOCUS_NONE,
-		name + " names the F8 / View motion pause without taking input or focus")
+		name + " names the PC shortcut, Ctrl+Shift+M / View, without taking input or focus")
 	test._check(hint != null and not UIBackgroundMotion.shortcut_available() and not hint.is_visible_in_tree(),
 		name + " hides the motion hint while the shortcut cannot act (motion disabled)")
-	if hint != null:
-		_inside(test, hint, name + " motion hint")
+	if hint == null:
+		return
+	test._check(hint.theme_type_variation == &"MotionHint" and _opaque_in_tree(hint)
+		and hint.get_theme_color(&"font_color").a == 1.0
+		and hint.get_theme_font_size(&"font_size") >= MOTION_HINT_MIN_FONT_SIZE,
+		"%s motion hint uses MotionHint: opaque text of at least %d px with no translucent modulate"
+			% [name, MOTION_HINT_MIN_FONT_SIZE])
+	var window := test.get_tree().root
+	for dimensions: Vector2i in BRANDING_WINDOWS:
+		window.size = dimensions
+		await _settle(test)
+		var viewport_rect := test.get_viewport().get_visible_rect()
+		var inset := viewport_rect.size * TITLE_SAFE_MARGIN
+		var safe := viewport_rect.grow_individual(-inset.x, -inset.y, -inset.x, -inset.y)
+		test._check(safe.grow(TITLE_SAFE_SLACK).encloses(hint.get_global_rect()),
+			"%s motion hint stays inside the 90 %% title-safe area at %dx%d" % [name, dimensions.x, dimensions.y])
+	window.size = Vector2i(1920, 1080)
+	await _settle(test)
+
+
+## True when neither the item nor any CanvasItem above it is translucent.
+func _opaque_in_tree(item: CanvasItem) -> bool:
+	if item.self_modulate.a < 1.0:
+		return false
+	var node: Node = item
+	while node is CanvasItem:
+		if (node as CanvasItem).modulate.a < 1.0:
+			return false
+		node = node.get_parent()
+	return true
 
 
 func _capture(test: Node, name: String, expected_size := Vector2i.ZERO) -> void:

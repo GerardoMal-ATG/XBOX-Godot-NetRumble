@@ -218,10 +218,10 @@ There is no periodic autosave or new Constrain/settings/session-exit checkpoint 
 
 | Event | Behavior |
 |---|---|
-| Suspend (`NOTIFICATION_APPLICATION_PAUSED`) | `Services.persist_for_suspend()`, `NetManager.abandon_for_suspend()`, then stop game audio. Session/chat state is invalidated synchronously. |
-| Resume (`NOTIFICATION_APPLICATION_RESUMED`) | Restart music; invalidate the old save provider/generation, account-dialog guards and active invite claim, retaining newer buffered invites. Start owner-bound activity retirement and route to acquisition for synchronization and all three loads. After handoff, an abandoned-match notice yields to invite routing; never resume a match. |
-| Constrain (`NOTIFICATION_APPLICATION_FOCUS_OUT`) | Mute game audio and call `MatchDirector.set_externally_paused(true)`; retain session/identity. |
-| Unconstrain (`NOTIFICATION_APPLICATION_FOCUS_IN`) | Restore game audio and local simulation/phase-clock advancement. |
+| Suspend (`NOTIFICATION_APPLICATION_PAUSED`) | `Services.persist_for_suspend()`, then suspend background motion, `NetManager.abandon_for_suspend()`, then stop game audio. Session/chat state is invalidated synchronously. |
+| Resume (`NOTIFICATION_APPLICATION_RESUMED`) | Clear the background-motion suspension and restart music; invalidate the old save provider/generation, account-dialog guards and active invite claim, retaining newer buffered invites. Start owner-bound activity retirement and route to acquisition for synchronization and all three loads, then retry a failed background warm-up. After handoff, an abandoned-match notice yields to invite routing; never resume a match. |
+| Constrain (`NOTIFICATION_APPLICATION_FOCUS_OUT`) | Mute game audio, freeze background motion and call `MatchDirector.set_externally_paused(true)`; retain session/identity. |
+| Unconstrain (`NOTIFICATION_APPLICATION_FOCUS_IN`) | Restore game audio and local simulation/phase-clock advancement; lift the background-motion freeze and retry a failed warm-up. |
 
 **Maintainer invariant: suspend must remain straight-line:** no `await`, timers or deferred
 persistence. The platform may freeze or terminate the process as soon as the handler returns.
@@ -337,7 +337,7 @@ Each family is in one of three states:
 | State | When | What draws |
 |---|---|---|
 | Disabled | Options › Animated Backgrounds is Off; the renderer is unsupported (headless, HDR 2D, transparent viewport); or no covered warm-up has succeeded | The exact static design: Waves is the designer `TextureRect` alone (no material, no dot layers); Glow is its shader's undithered design state |
-| Paused | F8/View session pause; constrain (focus loss, the Guide); `time_override`; or no visible, processing background of that family (a hidden screen, or one under a dialog) | The current pose, frozen: materials stay, while the clock and uniform updates stop |
+| Paused | The session pause (Ctrl+Shift+M / View); suspension; constrain (focus loss, the Guide); `time_override`; or no visible, processing background of that family (a hidden screen, or one under a dialog) | The current pose, frozen: materials stay, while the clock and uniform updates stop |
 | Running | Otherwise | The uniforms follow the family clock every frame |
 
 `effective_enabled()` combines three things:
@@ -352,6 +352,11 @@ next Waves screen continues the motion instead of restarting it. An adapter read
 it builds its materials, so a newly shown background never flashes its rest pose. Every pose is a
 pure function of the clock, and time reaches the shaders only through explicit uniforms (never
 `TIME`).
+
+**Suspend.** Suspension is a pause reason of its own. `main.gd` sets it once the suspend handler's
+save has run, and clears it on resume, so both clocks and both ramps hold still in between and then
+continue without a jump. Resume clears only suspension: a focus loss (the Guide) or the session
+pause still holds motion until it ends.
 
 **Re-enable ramp.** Turning motion back on never jumps from the static design to a moving pose.
 - **When it starts.** Every change from Disabled to enabled restarts a 3 s ramp at 0 for both
@@ -371,22 +376,36 @@ Pipelines compile before any animated frame is presented:
    frames. The warm-up starts no clock.
 3. Headless runs never wait for frames.
 4. If no frames arrive within 2 s (a minimised start), motion stays disabled and the title shows
-   the static backgrounds. The next focus event retries under a fresh cover. That includes the
-   first focus of a title launched minimised, which never had focus to lose.
+   the static backgrounds. `main.gd` then retries under a fresh cover: once after startup, on each
+   focus event (including the first focus of a title launched minimised, which never had focus to
+   lose), and after a resume has routed to the title or menu, once any warm-up still in flight has
+   finished.
+5. A retry only ever covers the front end. When it runs, it needs a visible front-end background
+   and no gameplay screen on the stack, and the title must be neither constrained nor suspended.
+   An attempt refused this way does not use up the one retry after startup.
 
 Nothing starts motion without a successful covered warm-up.
 
 Accessibility (motion is slow and continuous, with no flashes):
 - **Off.** Options › Animated Backgrounds Off is the saved, exact static design, so players can
   stop moving content (XAG 117).
-- **F8 / View.** F8, or the controller's View button, pauses motion for the session on any
-  front-end screen with a background, including before sign-in. It writes no account data and does
-  nothing in gameplay. While motion is disabled the key is consumed and changes nothing, so it
-  never reaches the title's press-any-button prompt.
+- **Ctrl+Shift+M / View.** Ctrl+Shift+M, with exactly those modifiers, or the controller's View
+  button pauses motion for the session on any front-end screen with a background, including before
+  sign-in. It writes no account data and does nothing in gameplay. Any other key or set of
+  modifiers passes through, so typing M into a text field such as the join code is unaffected.
+  While motion is disabled the shortcut is consumed and changes nothing, so it never reaches the
+  title's press-any-button prompt. Voice and chat apps can bind the same keys (Discord's Toggle
+  Mute, for example); View and the Options setting are unaffected.
 - **Where it is shown.** Options states the shortcut under the row. The acquisition and loading
-  screens show an unobtrusive `MotionHintLabel` ("F8 / View pauses background motion") only while
-  the shortcut can act, meaning a visible background is running or paused. The hint is hidden
-  while motion is Off, unsupported or not warmed.
+  screens show a `MotionHintLabel` ("Ctrl+Shift+M / View pauses background motion", or "View
+  pauses background motion" on console) only while the shortcut can act, meaning a visible
+  background is running or paused. The hint is hidden while motion is Off, unsupported or not
+  warmed.
+- **Legibility.** The hint uses the `MotionHint` theme type: 26 px text in opaque 0.8 grey, with no
+  translucent modulate, inside the 90 % title-safe area at every window shape. Against the
+  brightest pixel the animated backdrop draws behind the hint, at every measured pose and aspect
+  (16:9, 16:10 and 2560x1080 ultrawide), the text keeps at least 5.4:1 contrast, about 9:1 at
+  16:9, above the 4.5:1 minimum.
 - **On.** Choosing On in Options also lifts the session pause.
 
 **Waves** moves the designer's own 1591 dots on a slow three-wave surface: a 60 s loop, with a 3 s

@@ -1,3 +1,5 @@
+// The add pass draws every atlas dot at its wave-displaced position and applies surface lighting.
+// Together with the rest-position subtract pass, it reproduces the source raster at rest.
 shader_type canvas_item;
 render_mode blend_add;
 

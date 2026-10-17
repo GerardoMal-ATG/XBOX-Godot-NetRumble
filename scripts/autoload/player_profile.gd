@@ -24,7 +24,7 @@ var power_up_frequency: float = 0.9
 ## Front-end background motion (Options > Animated Backgrounds). Off is the exact static art.
 ## A presentation setting: saved in the account's optional presentation sidecar, never in
 ## profile.json, whose schema older builds must keep reading. UIBackgroundMotion's session-only
-## F8/View pause is never saved at all.
+## pause (Ctrl+Shift+M, or View on a controller) is never saved at all.
 var animate_backgrounds: bool = true
 
 var _defaults: Dictionary = {}

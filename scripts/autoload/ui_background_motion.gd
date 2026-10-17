@@ -9,6 +9,8 @@ const WAVES := &"waves"
 const GLOW := &"glow"
 const BACKGROUND_GROUP := &"ui_background_motion"
 const TOGGLE_ACTION := &"toggle_background_motion"
+const DESKTOP_PAUSE_SHORTCUT := "Ctrl+Shift+M / View"
+const CONSOLE_PAUSE_SHORTCUT := "View"
 
 const STATE_DISABLED := 0
 const STATE_PAUSED := 1
@@ -76,14 +78,9 @@ func _ready() -> void:
 
 
 ## True only when the persisted preference, renderer support and covered warm-up all allow motion.
-## Session pause and constrain are PAUSED states, not disabled states.
+## Session pause, constrain and suspension are PAUSED states, not disabled states.
 func effective_enabled() -> bool:
-	var profile_enabled := true
-	if PlayerProfile != null:
-		var stored_value: Variant = PlayerProfile.get(&"animate_backgrounds")
-		if stored_value != null:
-			profile_enabled = bool(stored_value)
-	return profile_enabled and _renderer_supported() and _pipelines_warmed
+	return PlayerProfile.animate_backgrounds and _renderer_supported() and _pipelines_warmed
 
 
 func time_for(family: StringName) -> float:
@@ -190,6 +187,15 @@ func is_warmed() -> bool:
 
 func is_preparing() -> bool:
 	return _preparing
+
+
+func wait_for_prepare() -> void:
+	if _preparing:
+		await _prepare_finished
+
+
+func pause_shortcut_label() -> String:
+	return CONSOLE_PAUSE_SHORTCUT if NRScreen.is_console() else DESKTOP_PAUSE_SHORTCUT
 
 
 func shortcut_available() -> bool:
@@ -305,7 +311,7 @@ func prepare(container: Node) -> void:
 
 
 func _input(event: InputEvent) -> void:
-	if not event.is_action_pressed(TOGGLE_ACTION):
+	if not event.is_action_pressed(TOGGLE_ACTION, false, true):
 		return
 	if event is InputEventKey and event.echo:
 		return

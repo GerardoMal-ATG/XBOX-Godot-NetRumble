@@ -1,6 +1,6 @@
 extends Label
 
-## The shortcut is shown only while F8/View can actually pause or resume a background family.
+## The platform shortcut is shown only while it can pause or resume a background family.
 
 
 func _enter_tree() -> void:
@@ -15,4 +15,5 @@ func _exit_tree() -> void:
 
 
 func _sync_visibility() -> void:
+	text = "%s pauses background motion" % UIBackgroundMotion.pause_shortcut_label()
 	visible = UIBackgroundMotion.shortcut_available()

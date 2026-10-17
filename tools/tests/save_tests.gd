@@ -952,11 +952,11 @@ func _background_motion_setting() -> void:
 	for child: Node in list.get_children():
 		if child is NRSpinner and (child as NRSpinner).label_text == "Animated Backgrounds":
 			row = child as NRSpinner
-		elif child is Label and (child as Label).text == "F8 / View pauses background motion for this session.":
+		elif child is Label and (child as Label).text == "Ctrl+Shift+M / View pauses background motion for this session.":
 			note = child as Label
 	_check(row != null and row.current_value() == true, "Options offers Animated Backgrounds, On by default")
 	_check(note != null and note.focus_mode == Control.FOCUS_NONE,
-		"Options explains the F8 / View session pause without adding a focus stop")
+		"Options explains the Ctrl+Shift+M / View session pause without adding a focus stop")
 	if row == null:
 		list.queue_free()
 		await _reset()
@@ -975,7 +975,7 @@ func _background_motion_setting() -> void:
 	UIBackgroundMotion.session_paused = true
 	row._step(1)
 	_check(PlayerProfile.animate_backgrounds and not UIBackgroundMotion.session_paused,
-		"explicitly choosing On also lifts an F8 / View session pause")
+		"explicitly choosing On also lifts a Ctrl+Shift+M / View session pause")
 	UIBackgroundMotion.session_paused = true
 	_check(NROptionsRows.save() and _sidecar(folder) == {"animateBackgrounds": true},
 		"On is saved, and a session pause is never saved with it")

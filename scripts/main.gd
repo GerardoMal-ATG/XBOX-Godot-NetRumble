@@ -328,8 +328,17 @@ func _route_after_suspend(generation: int) -> void:
 		return
 	if not Services.is_account_ready():
 		ScreenManager.replace_all(ScreenManager.ACQUIRE_USER)
+		_schedule_background_warm_up_after_resume.call_deferred()
 		return
 	ScreenManager.replace_all(ScreenManager.MAIN_MENU)
+	_schedule_background_warm_up_after_resume.call_deferred()
+
+
+func _schedule_background_warm_up_after_resume() -> void:
+	await UIBackgroundMotion.wait_for_prepare()
+	if not is_inside_tree():
+		return
+	_schedule_background_warm_up_retry.call_deferred()
 
 
 func _on_resume_screen_pushed(screen: NRScreen) -> void:

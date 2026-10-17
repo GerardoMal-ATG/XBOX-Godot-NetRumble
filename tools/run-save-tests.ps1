@@ -271,7 +271,7 @@ func _walk(path: String, failures: PackedStringArray, counts: Dictionary) -> voi
         throw 'Godot exited without completing the behavioral suite.'
     }
     if ($Suite -eq 'All') {
-        Assert-SuspendDiagnostics $output 41
+        Assert-SuspendDiagnostics $output 44
         Write-Host 'CASE: suspend diagnostics contain only ordered category outcomes and measured elapsed time'
     }
 }
