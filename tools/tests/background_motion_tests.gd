@@ -24,7 +24,9 @@ const GLOW_SHADER := "res://scripts/ui/backgrounds/glow.gdshader"
 const DESIGNER_GLOW := "res://tools/tests/fixtures/Background_Glow_designer.png"
 const BASE := Color(0.019607844, 0.019607844, 0.019607844, 1.0)
 const COVER_NAME := ^"BackgroundMotionStartupCover"
-const WARM_UP_NODES := [^"WavesPipelineWarmUp", ^"GlowPipelineWarmUp", ^"ShipCardPipelineWarmUp"]
+const WARM_UP_NODES := [
+	^"WavesPipelineWarmUp", ^"GlowPipelineWarmUp", ^"ShipCardPipelineWarmUp", ^"ShipPreviewPipelineWarmUp",
+]
 ## Glow breathing: a 12 s sine, strength +/-15 % and size +/-1.5 %.
 const GLOW_LOOP := 12.0
 const GLOW_STRENGTH := 0.15

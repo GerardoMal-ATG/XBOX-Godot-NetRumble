@@ -19,6 +19,7 @@ const STATE_RUNNING := 2
 const WAVES_SCRIPT_PATH := "res://scripts/ui/backgrounds/waves_background.gd"
 const GLOW_SCRIPT_PATH := "res://scripts/ui/backgrounds/glow_background.gd"
 const SHIP_CARD_SHADER_PATH := "res://assets/ui/ship_card.gdshader"
+const SHIP_PREVIEW_SHADER_PATH := "res://assets/ui/ship_preview.gdshader"
 const WARM_UP_TIME := 13.0
 const WARM_UP_FRAMES := 3
 const WARM_UP_TIMEOUT_USEC := 2000000
@@ -60,6 +61,7 @@ var _adapter_eligible: Dictionary[int, bool] = {}
 var _waves_script: Script
 var _glow_script: Script
 var _ship_card_shader: Shader
+var _ship_preview_shader: Shader
 var _preparing := false
 var _prepare_warning_sent := false
 var _draw_serial := 0
@@ -226,8 +228,9 @@ func seek_envelope_for_tests(family: StringName, seconds: float) -> void:
 	state_changed.emit()
 
 
-## Preloads and retains all three shader families, then verifies three animated main-viewport draws
-## under the caller's opaque cover. A timeout never enables motion; a later covered call may retry.
+## Preloads and retains the Waves, Glow, ship card and ship preview shaders, then verifies three
+## animated main-viewport draws under the caller's opaque cover. A timeout never enables motion;
+## a later covered call may retry.
 func prepare(container: Node) -> void:
 	if _pipelines_warmed:
 		return
@@ -276,10 +279,20 @@ func prepare(container: Node) -> void:
 	card_material.shader = _ship_card_shader
 	card.material = card_material
 
+	var ship := TextureRect.new()
+	ship.name = "ShipPreviewPipelineWarmUp"
+	ship.texture = Assets.ship_texture(0, "Base")
+	ship.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ship.size = Vector2(64.0, 64.0)
+	var ship_material := ShaderMaterial.new()
+	ship_material.shader = _ship_preview_shader
+	ship.material = ship_material
+
 	var warm_nodes: Array[CanvasItem] = []
 	warm_nodes.append(waves)
 	warm_nodes.append(glow)
 	warm_nodes.append(card)
+	warm_nodes.append(ship)
 	for node: CanvasItem in warm_nodes:
 		container.add_child(node)
 		container.move_child(node, 0)
@@ -328,14 +341,21 @@ func _load_warm_up_resources() -> bool:
 		not ResourceLoader.exists(WAVES_SCRIPT_PATH)
 		or not ResourceLoader.exists(GLOW_SCRIPT_PATH)
 		or not ResourceLoader.exists(SHIP_CARD_SHADER_PATH)
+		or not ResourceLoader.exists(SHIP_PREVIEW_SHADER_PATH)
 	):
-		_warn_prepare_once("a background or card shader is missing")
+		_warn_prepare_once("a background or lobby shader is missing")
 		return false
 	_waves_script = ResourceLoader.load(WAVES_SCRIPT_PATH) as Script
 	_glow_script = ResourceLoader.load(GLOW_SCRIPT_PATH) as Script
 	_ship_card_shader = ResourceLoader.load(SHIP_CARD_SHADER_PATH) as Shader
-	if _waves_script == null or _glow_script == null or _ship_card_shader == null:
-		_warn_prepare_once("a background or card shader could not be loaded")
+	_ship_preview_shader = ResourceLoader.load(SHIP_PREVIEW_SHADER_PATH) as Shader
+	if (
+		_waves_script == null
+		or _glow_script == null
+		or _ship_card_shader == null
+		or _ship_preview_shader == null
+	):
+		_warn_prepare_once("a background or lobby shader could not be loaded")
 		return false
 	var waves_result: Variant = _waves_script.call(&"preload_shared")
 	var glow_result: Variant = _glow_script.call(&"preload_shared")

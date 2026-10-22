@@ -371,9 +371,9 @@ pause still holds motion until it ends.
 
 Pipelines compile before any animated frame is presented:
 1. `main.gd` puts an opaque #050505 cover over the window and awaits `prepare()`.
-2. `prepare()` loads and validates the shared resources. It then draws three warm-up nodes under
-   the cover (Waves, Glow and a 589x427 ship card) at a fixed pose, and waits for three drawn
-   frames. The warm-up starts no clock.
+2. `prepare()` loads and validates the shared resources. It then draws four warm-up nodes under
+   the cover (Waves, Glow, a 589x427 ship card and a ship preview sprite) at a fixed pose, and
+   waits for three drawn frames. The warm-up starts no clock.
 3. Headless runs never wait for frames.
 4. If no frames arrive within 2 s (a minimised start), motion stays disabled and the title shows
    the static backgrounds. `main.gd` then retries under a fresh cover: once after startup, on each
@@ -458,6 +458,13 @@ gradients are fractions of the card. The Panel keeps `clip_contents` for the rot
 and one rounded scissor trims the fill and the outline alike. Over the shader fill, the Panel's
 StyleBoxFlat draws only the outline. Without the shader, the theme's opaque `LobbyShipPreview`
 fill is the card.
+
+**The ship preview** draws the 64x64 ship sprites at 300x300 through
+`assets\ui\ship_preview.gdshader`. Bilinear filtering at that scale blurs every edge and shows the
+source pixels as stair-steps. The sprites are hard shapes with anti-aliased edges, so the shader
+takes coverage from a cubic B-spline of the sprite's alpha, re-thresholded at 0.5 with a
+one-screen-pixel edge, and colour from a Catmull-Rom sample of the same texels: the outline stays
+smooth and crisp, and the shading gradients stay smooth.
 
 ## Project layout
 

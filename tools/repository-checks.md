@@ -140,6 +140,12 @@ The lobby ship card check requires all of the following:
   the outline's corner settings.
 - Over that fill, the Panel draws only the white 15 % outline with 12 px bottom corners.
 - With the shader turned off, the opaque theme fill returns.
+- Both enlarged ship layers draw through `ship_preview.gdshader`.
+
+The lobby check also requires the selected colour's tile to stop where its accent strip starts, so
+the strip's cut corner shows the page. Both Options lists (main menu and in-match) must inset every
+spinner and slider row's text and controls from the row's edge, where the focus outline is drawn,
+and every row value must fit without clipping.
 
 `background_motion_tests.gd` checks `UIBackgroundMotion` with the real Waves and Glow adapters. It
 runs in `All` and `-Suite UI`. Headless, it first proves that the real renderer checks never await a

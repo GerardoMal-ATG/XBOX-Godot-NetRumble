@@ -91,6 +91,11 @@ const WAVES_ADAPTER := "res://scripts/ui/backgrounds/waves_background.gd"
 const GLOW_ADAPTER := "res://scripts/ui/backgrounds/glow_background.gd"
 const GLOW_SHADER := "res://scripts/ui/backgrounds/glow.gdshader"
 const SHIP_CARD_SHADER := "res://assets/ui/ship_card.gdshader"
+const SHIP_PREVIEW_SHADER := "res://assets/ui/ship_preview.gdshader"
+## Clearance between an Options row's edge, where its focus outline is drawn, and the row's text
+## and controls.
+const OPTION_ROW_MIN_LEFT_INSET := 24.0
+const OPTION_ROW_MIN_RIGHT_INSET := 12.0
 const UI_THEME := "res://assets/ui/netrumble.tres"
 ## The PC wording; on console the hint and the Options note name only View.
 const MOTION_HINT_TEXT := "Ctrl+Shift+M / View pauses background motion"
@@ -274,6 +279,7 @@ func _main_menu(test: Node) -> void:
 	test._check(menu._in_options and not menu._secondary_actions.visible,
 		"Options has its own focus scope without hidden footer targets")
 	_inside(test, menu._menu_scroll, "Options scroll region")
+	_option_rows_inset(test, menu._menu_list, "Options")
 	var motion_note: Label = null
 	for note: Node in menu._menu_list.find_children("*", "Label", true, false):
 		if (note as Label).text == OPTIONS_MOTION_NOTE:
@@ -343,6 +349,11 @@ func _practice_lobby(test: Node) -> void:
 		test._check(NetManager.local_player().ship_color_id == chosen
 			and lobby._ship_texture.modulate == Assets.player_color(chosen),
 			"colour selection updates the player and preview")
+	var selected_tab: Control = lobby._color_tab_buttons[NetManager.local_player().ship_color_id]
+	var tile := selected_tab.get_node("Background") as Control
+	var accent := selected_tab.get_node("Accent") as Control
+	test._check(tile.visible and is_equal_approx(tile.position.y + tile.size.y, accent.position.y),
+		"the selected colour's tile stops where its accent strip starts, so the strip's cut corner shows the page")
 	test._check(lobby._opponents_panel.visible and not lobby._join_code_panel.visible,
 		"practice retains the opponent picker instead of advertising a join code")
 	NetManager.bot_players()[0].is_ready = false
@@ -635,6 +646,7 @@ func _gameplay_surfaces(test: Node) -> void:
 	pause._build_options_rows()
 	await _settle(test)
 	_inside(test, pause._panel._panel, "in-match Options panel")
+	_option_rows_inset(test, pause._menu, "In-match Options")
 	await _capture(test, "pause-options")
 	await _key(test, KEY_ESCAPE)
 	test._check(ScreenManager.current_screen() == pause and not pause._in_options,
@@ -968,6 +980,37 @@ func _ship_card(test: Node, lobby: Control) -> void:
 		"without the shader the card keeps the opaque theme fill")
 	card.use_shader = true
 	test._check(card.is_shader_fill() and fill.visible, "the shader fill returns when it is available")
+	var sprites_smoothed := true
+	for layer_name: String in ["ShipTexture", "ShipOverlay"]:
+		var layer := card.get_node_or_null(layer_name) as TextureRect
+		var layer_material := layer.material as ShaderMaterial if layer != null else null
+		sprites_smoothed = sprites_smoothed and layer_material != null and layer_material.shader != null \
+			and layer_material.shader.resource_path == SHIP_PREVIEW_SHADER
+	test._check(sprites_smoothed, "both enlarged ship layers draw through the ship preview shader")
+
+
+## Spinner and slider rows inset their text and controls from the row's edge, where the focus
+## outline is drawn, and the slider row leaves its value room even in the narrower in-match panel.
+func _option_rows_inset(test: Node, list: NRMenuList, label: String) -> void:
+	var rows := 0
+	var inset := true
+	var values_fit := true
+	for row: Control in list.rows():
+		if not (row is NRSpinner or row is NRSlider):
+			continue
+		rows += 1
+		var bounds := row.get_global_rect()
+		var content := row.get_node("Row") as HBoxContainer
+		var first := content.get_child(0) as Control
+		var last := content.get_child(content.get_child_count() - 1) as Control
+		inset = inset and first.get_global_rect().position.x >= bounds.position.x + OPTION_ROW_MIN_LEFT_INSET \
+			and last.get_global_rect().end.x <= bounds.end.x - OPTION_ROW_MIN_RIGHT_INSET
+		var value := row.get_node("%ValueLabel") as Label
+		var needed := value.get_theme_font(&"font").get_string_size(value.text, HORIZONTAL_ALIGNMENT_LEFT, -1,
+			value.get_theme_font_size(&"font_size")).x
+		values_fit = values_fit and needed <= value.size.x + 0.5
+	test._check(rows > 0 and inset, label + " rows keep their text and controls inside the focus outline")
+	test._check(rows > 0 and values_fit, label + " row values fit without clipping")
 
 
 func _script_path(node: Object) -> String:

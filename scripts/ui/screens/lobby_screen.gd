@@ -299,6 +299,9 @@ func _build_color_tabs() -> void:
 		background.name = "Background"
 		background.theme_type_variation = &"LobbyColorTile"
 		background.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		# The tile stops where the accent strip begins, so the strip's cut corner shows the
+		# page behind it rather than the tile.
+		background.offset_bottom = -_COLOR_ACCENT_SIZE.y
 		background.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		background.show_behind_parent = true
 		tab.add_child(background)
