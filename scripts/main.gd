@@ -44,6 +44,8 @@ var _startup_background_prepare_complete := false
 var _background_warmup_retrying := false
 var _background_warmup_retry_scheduled := false
 var _post_startup_background_retry_used := false
+## The opaque cover of the warm-up in flight, at startup or on a retry; null when none is up.
+var _warm_up_cover: CanvasLayer = null
 
 
 func _ready() -> void:
@@ -104,16 +106,29 @@ func _create_startup_cover() -> CanvasLayer:
 	cover.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	layer.add_child(cover)
 	add_child(layer)
+	_warm_up_cover = layer
 	return layer
 
 
 func _remove_startup_cover(cover: CanvasLayer) -> void:
 	if not is_instance_valid(cover):
 		return
+	if cover == _warm_up_cover:
+		_warm_up_cover = null
 	cover.hide()
 	if cover.get_parent() != null:
 		cover.get_parent().remove_child(cover)
 	cover.queue_free()
+
+
+## A match never starts under a warm-up cover. The lobby starts gameplay with a push, so a warm-up
+## still in flight then, at startup or on a retry, is cancelled at once and its cover leaves in the
+## same frame. Motion stays static until a later retry over the front end.
+func _cancel_warm_up_for_gameplay(screen: NRScreen) -> void:
+	if screen == null or screen.scene_file_path != ScreenManager.GAMEPLAY:
+		return
+	UIBackgroundMotion.cancel_prepare()
+	_remove_startup_cover(_warm_up_cover)
 
 
 func _retry_background_warm_up() -> void:
@@ -178,6 +193,7 @@ func _connect_lifecycle_signals() -> void:
 	Services.account_lost.connect(_on_account_lost)
 	Services.save_failed.connect(_on_save_failed)
 	ScreenManager.screen_pushed.connect(_on_resume_screen_pushed)
+	ScreenManager.screen_pushed.connect(_cancel_warm_up_for_gameplay)
 
 
 func _reset_account_dialogs() -> void:

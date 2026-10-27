@@ -63,6 +63,8 @@ var _glow_script: Script
 var _ship_card_shader: Shader
 var _ship_preview_shader: Shader
 var _preparing := false
+var _prepare_cancelled := false
+var _warm_up_nodes: Array[CanvasItem] = []
 var _prepare_warning_sent := false
 var _draw_serial := 0
 var _last_effective_enabled := false
@@ -196,6 +198,16 @@ func wait_for_prepare() -> void:
 		await _prepare_finished
 
 
+## Ends a warm-up in flight at once and leaves motion static: its draws leave the tree now, and the
+## awaiting prepare() returns on its next frame without counting any further draws. A later covered
+## call may retry.
+func cancel_prepare() -> void:
+	if not _preparing:
+		return
+	_prepare_cancelled = true
+	_remove_warm_up_nodes(_warm_up_nodes)
+
+
 func pause_shortcut_label() -> String:
 	return CONSOLE_PAUSE_SHORTCUT if NRScreen.is_console() else DESKTOP_PAUSE_SHORTCUT
 
@@ -229,8 +241,8 @@ func seek_envelope_for_tests(family: StringName, seconds: float) -> void:
 
 
 ## Preloads and retains the Waves, Glow, ship card and ship preview shaders, then verifies three
-## animated main-viewport draws under the caller's opaque cover. A timeout never enables motion;
-## a later covered call may retry.
+## animated main-viewport draws under the caller's opaque cover. A timeout or cancel_prepare() never
+## enables motion; a later covered call may retry.
 func prepare(container: Node) -> void:
 	if _pipelines_warmed:
 		return
@@ -238,6 +250,7 @@ func prepare(container: Node) -> void:
 		await _prepare_finished
 		return
 	_preparing = true
+	_prepare_cancelled = false
 
 	if not _load_warm_up_resources():
 		_complete_prepare(false)
@@ -296,6 +309,7 @@ func prepare(container: Node) -> void:
 	for node: CanvasItem in warm_nodes:
 		container.add_child(node)
 		container.move_child(node, 0)
+	_warm_up_nodes = warm_nodes
 
 	var waves_ready: Variant = waves.call(&"preparation_draw_ready")
 	var glow_ready: Variant = glow.call(&"preparation_draw_ready")
@@ -309,13 +323,16 @@ func prepare(container: Node) -> void:
 	var deadline_usec := Time.get_ticks_usec() + WARM_UP_TIMEOUT_USEC
 	while verified_draws < WARM_UP_FRAMES and Time.get_ticks_usec() < deadline_usec:
 		await get_tree().process_frame
-		if not is_instance_valid(container) or not _warm_up_nodes_valid(warm_nodes):
+		if _prepare_cancelled or not is_instance_valid(container) or not _warm_up_nodes_valid(warm_nodes):
 			break
 		if _draw_serial > observed_serial:
 			verified_draws += _draw_serial - observed_serial
 			observed_serial = _draw_serial
 
 	_remove_warm_up_nodes(warm_nodes)
+	if _prepare_cancelled:
+		_complete_prepare(false)
+		return
 	if verified_draws < WARM_UP_FRAMES:
 		_warn_prepare_once("pipeline warm-up timed out; motion remains static")
 		_complete_prepare(false)
@@ -531,5 +548,7 @@ func _complete_prepare(success: bool) -> void:
 	_update_effective_transition()
 	_recompute_all_clocks()
 	_preparing = false
+	_prepare_cancelled = false
+	_warm_up_nodes = []
 	state_changed.emit()
 	_prepare_finished.emit()

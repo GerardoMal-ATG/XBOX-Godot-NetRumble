@@ -165,9 +165,10 @@ time. A clock that stays frozen therefore fails. It covers:
   attempt. A first focus retries with no prior focus loss. A resume with no focus change routes to
   the title and then retries: it waits under the one cover while an earlier warm-up is still in
   flight and retries under a fresh cover once that warm-up fails, and its retry is refused over
-  gameplay or while the title is still constrained. Each cover must be effectively visible, cover
-  the whole viewport, be opaque #050505 and sit on a canvas layer above every background and
-  warm-up draw.
+  gameplay or while the title is still constrained. Gameplay pushed while a retry warms cancels
+  it: its cover and draws leave in that frame, and draws arriving afterwards cannot complete it.
+  Each cover must be effectively visible, cover the whole viewport, be opaque #050505 and sit on a
+  canvas layer above every background and warm-up draw.
 - the deterministic `time_override` pose, and the glow's breath repeating exactly every 12 s;
 - Off as the exact static path;
 - the 3 s re-enable ramp. It starts at 0 after Off-to-On and after a sign-out reset, freezes while

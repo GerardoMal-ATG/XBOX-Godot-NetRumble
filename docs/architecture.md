@@ -382,7 +382,9 @@ Pipelines compile before any animated frame is presented:
    finished.
 5. A retry only ever covers the front end. When it runs, it needs a visible front-end background
    and no gameplay screen on the stack, and the title must be neither constrained nor suspended.
-   An attempt refused this way does not use up the one retry after startup.
+   An attempt refused this way does not use up the one retry after startup. If gameplay is pushed
+   while a warm-up is still running, `main.gd` cancels it: its cover and draws leave in that frame,
+   and motion stays static until a later retry.
 
 Nothing starts motion without a successful covered warm-up.
 

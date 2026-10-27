@@ -215,6 +215,7 @@ func _focus_return_restores_motion(waves: TextureRect, glow: ColorRect) -> void:
 		"the retried warm-up runs behind the cover while backgrounds stay static")
 	_assert_static(waves, glow, "while the retry warms")
 	await _resume_waits_for_warm_up(app)
+	await _gameplay_cancels_warm_up(app)
 	print("CASE: focus return after that resume retries under a fresh cover, and drawn frames complete it")
 	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
 	_check(not UIBackgroundMotion.is_constrained(), "focus return lifts the constrain")
@@ -306,6 +307,33 @@ func _resume_waits_for_warm_up(app: Node) -> void:
 	await _frames(4)
 	_check(UIBackgroundMotion.is_constrained() and _retry_skipped(app),
 		"while the Guide still constrains the title, the warm-up that fails after resume is followed by no retry")
+
+
+## A match never starts under a warm-up cover. When the lobby pushes gameplay while a retry is still
+## warming, main.gd cancels the warm-up: its cover and draws leave in that same frame, and draws that
+## arrive afterwards cannot complete it, so motion stays cold for a later retry over the front end.
+func _gameplay_cancels_warm_up(app: Node) -> void:
+	print("CASE: gameplay pushed while a retry warms cancels it at once, removing its cover and draws")
+	app.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
+	await _frames(1)
+	_assert_cover(app, "the retry that gameplay interrupts")
+	_check(UIBackgroundMotion.is_preparing() and _warm_up_drawing(app), "fixture: a retried warm-up is in flight")
+	var gameplay := NRScreen.new()
+	gameplay.scene_file_path = ScreenManager.GAMEPLAY
+	# What replace_all(GAMEPLAY) does when the lobby starts the match: gameplay joins the stack and
+	# screen_pushed announces it.
+	ScreenManager._stack.append(gameplay)
+	ScreenManager.screen_pushed.emit(gameplay)
+	_check(_covers(app) == 0 and not _warm_up_in_app(app),
+		"the cover and every warm-up draw leave in the frame gameplay arrives")
+	for frame in UIBackgroundMotion.WARM_UP_FRAMES + 1:
+		RenderingServer.frame_post_draw.emit()
+	await _frames(2)
+	_check(_retry_skipped(app),
+		"draws that arrive afterwards cannot complete the cancelled warm-up, and no retry starts over gameplay")
+	ScreenManager._stack.erase(gameplay)
+	gameplay.queue_free()
+	await _frames(1)
 
 
 ## main.gd retries a failed warm-up under its cover only while a front-end background shows and no
@@ -775,6 +803,9 @@ func _suspend_freezes_motion(waves: TextureRect, glow: ColorRect) -> void:
 	await _frames(1)
 	_test.remove_child(app)
 	app.queue_free()
+	# The account reset below signs out. The probe must be gone by then, or its account-loss route
+	# pushes the sign-in screen into whatever container is current.
+	await _frames(1)
 	ScreenManager.set_container(old_container)
 	UIBackgroundMotion.set_suspended(false)
 	UIBackgroundMotion.set_constrained(false)
@@ -1049,10 +1080,15 @@ func _has_warm_up_nodes() -> bool:
 func _retry_skipped(app: Node) -> bool:
 	if app.get_node_or_null(COVER_NAME) != null or UIBackgroundMotion.is_preparing() or UIBackgroundMotion.is_warmed():
 		return false
+	return not _warm_up_in_app(app)
+
+
+## True while any warm-up draw is anywhere in the app's tree.
+func _warm_up_in_app(app: Node) -> bool:
 	for path: NodePath in WARM_UP_NODES:
 		if app.find_child(String(path), true, false) != null:
-			return false
-	return true
+			return true
+	return false
 
 
 ## The warm-up covers main.gd has in place; a second one would take a generated name.
